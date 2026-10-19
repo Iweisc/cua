@@ -133,16 +133,43 @@ int main() {
     check(route == InputRoute::primary_foreground);
     route = InputRoute::independent;
     check(!bind_input_route(route, InputRoute::primary_foreground));
+    check(bind_input_route(route, InputRoute::primary_background));
+    check(route == InputRoute::primary_background);
+    check(bind_input_route(route, InputRoute::independent));
+    check(route == InputRoute::independent);
+    route = InputRoute::primary_background;
+    check(!bind_input_route(route, InputRoute::primary_foreground));
+    route = InputRoute::primary_foreground;
+    check(!bind_input_route(route, InputRoute::primary_background));
+    check(route == InputRoute::primary_foreground);
 
-    // Background input uses the agent seat's private keymap. The primary
-    // layout matters only for foreground keyboard delivery.
+    // The agent seats carry their own keymap. Both primary routes type through
+    // the human's keymap, so only they need it to be US-equivalent.
     for (const bool primary_layout : {false, true}) {
         check(input_layout_qualified(InputRoute::independent, false, primary_layout));
         check(input_layout_qualified(InputRoute::independent, true, primary_layout));
         check(input_layout_qualified(InputRoute::primary_foreground, false, primary_layout));
+        check(input_layout_qualified(InputRoute::primary_background, false, primary_layout));
     }
     check(!input_layout_qualified(InputRoute::primary_foreground, true, false));
     check(input_layout_qualified(InputRoute::primary_foreground, true, true));
+    check(!input_layout_qualified(InputRoute::primary_background, true, false));
+    check(input_layout_qualified(InputRoute::primary_background, true, true));
+
+    PrimaryBackgroundGuard background;
+    check(background.failure().empty());
+    background.constraint = true;
+    check(background.failure() == "primary_constraint");
+    background.dnd = true;
+    check(background.failure() == "primary_dnd");
+    background.grab = true;
+    check(background.failure() == "primary_grab");
+    background.peer_conflict = true;
+    check(background.failure() == "agent_target_busy");
+    background.human_on_client = true;
+    check(background.failure() == "primary_target_busy");
+    background.primary_binding = false;
+    check(background.failure() == "primary_binding");
     check(kAgentKeymap.rules == "evdev");
     check(kAgentKeymap.model == "pc105");
     check(kAgentKeymap.layout == "us");

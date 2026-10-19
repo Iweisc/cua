@@ -37,6 +37,7 @@ void check(bool value, const char* message) {
 namespace cua::hyprland {
 struct InputExperiment::Impl {};
 struct InputExperiment::DesktopListeners {};
+struct InputExperiment::ReactionGuards {};
 class PrimaryTrace {};
 InputExperiment::InputExperiment(const std::string&, void*) { ++created; }
 InputExperiment::~InputExperiment() { ++destroyed; }

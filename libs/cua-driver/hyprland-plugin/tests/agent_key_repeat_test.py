@@ -202,7 +202,7 @@ def production_fixture(source):
     methods = '\n'.join(method(source, name) for name in (
         'sync_key_repeat', 'add_keyboard', 'keyboard_enter', 'key', 'leave_keyboard', 'complete_action'))
     # The independent-route KEY branch of request(), not the foreground one.
-    branch = re.search(r'            foreground_request\(c, f, cap\);\n            return;\n        }\n'
+    branch = re.search(r'            primary_background_request\(c, f, cap\);\n            return;\n        }\n'
                        r'        if \(command == "KEY"\) \{\n(.*?)^        } else \{', source, re.M | re.S)
     if not branch:
         raise AssertionError('production independent KEY branch not found')
@@ -217,7 +217,7 @@ class AgentKeyRepeatTest(unittest.TestCase):
         # Fail if the tested pieces are disconnected from the production paths.
         self.assertIn('sync_key_repeat(keyboard);', method(source, 'sync_keymap'))
         self.assertIn('leave_keyboard();', method(source, 'complete_action'))
-        self.assertRegex(source, r'\+\+dispatches;\n[^\n]*\n        if \(kProduction\) complete_action\(\);\n'
+        self.assertRegex(source, r'\+\+dispatches;\n(?:[^\n]*\n){1,2}        if \(kProduction\) complete_action\(\);\n'
                                  r'        send\(c, kDelivered\);')
         compiler = shlex.split(os.environ.get('CXX', '')) or [
             shutil.which('clang++-18') or shutil.which('clang++') or 'c++']

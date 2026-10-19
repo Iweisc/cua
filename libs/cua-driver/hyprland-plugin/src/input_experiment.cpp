@@ -24,6 +24,8 @@
 #include <src/protocols/core/Seat.hpp>
 #include <src/protocols/core/DataDevice.hpp>
 #include <src/layout/LayoutManager.hpp>
+#include <src/plugins/PluginAPI.hpp>
+#include <src/protocols/XDGShell.hpp>
 #include <linux/input-event-codes.h>
 #include <wayland.hpp>
 #include <wayland-server-core.h>
@@ -65,6 +67,10 @@ using Clock = std::chrono::steady_clock;
 constexpr std::size_t kMaxPacket = 2048;
 constexpr std::size_t kMaxClients = 8;
 constexpr std::size_t kMaxResources = 512;
+// Clients react to a click within a few frames. Two seconds also covers a
+// renderer process that is briefly descheduled, without leaving a refusal
+// window long enough to block the human's own later use of that app.
+constexpr auto kReactionWindow = std::chrono::seconds(2);
 #ifdef CUA_HYPRLAND_INPUT
 constexpr bool kProduction = true;
 #else
@@ -150,6 +156,7 @@ std::string refusal(std::string_view code, ForegroundFailure failure) {
 }
 constexpr auto kDelivered = R"({"ok":true,"effect":"unverifiable","route":"synthetic_events"})";
 constexpr auto kForegroundDelivered = R"({"ok":true,"effect":"unverifiable","route":"primary_foreground"})";
+constexpr auto kPrimaryBackgroundDelivered = R"({"ok":true,"effect":"unverifiable","route":"primary_background"})";
 } // namespace
 
 struct InputExperiment::Impl {
@@ -237,6 +244,16 @@ struct InputExperiment::Impl {
     std::vector<WP<CWLPointerResource>> foreground_pointers;
     std::vector<WP<CWLKeyboardResource>> foreground_keyboards;
     std::array<std::uint32_t, 4> foreground_modifiers{};
+    // Primary-seat resources borrowed by the background primary route for one
+    // action. The compositor's own focus never points at them.
+    std::vector<WP<CWLPointerResource>> borrowed_pointers;
+    std::vector<WP<CWLKeyboardResource>> borrowed_keyboards;
+    WP<CWLSurfaceResource> borrowed_surface;
+    WP<CWLSeatResource> borrowed_seat;
+    // The last client this lane delivered to. A popup grab or drag start that
+    // client sends shortly afterwards is a reaction to agent input.
+    WP<CWLSurfaceResource> recent_target;
+    Clock::time_point recent_dispatch{};
 
     explicit Impl(const std::string& directory, unsigned index) : lane(index) {
 #ifdef CUA_HYPRLAND_TEST_INPUT
@@ -658,6 +675,29 @@ struct InputExperiment::Impl {
         leave_keyboard();
         retire_grant();
     }
+    // Hyprland honours xdg_popup.grab and wl_data_device.start_drag without
+    // checking the seat or serial, then moves the human's focus to the popup
+    // or ties the drop to the human's next button release. Refuse either for a
+    // client this lane is driving or has just driven, unless the human is
+    // already interacting with that client.
+    // Background dispatch only. A foreground action already moved human focus
+    // to its target, so that client's popups and drags are the human's own.
+    void note_dispatch(const Client& c) {
+        recent_target = c.surface;
+        recent_dispatch = Clock::now();
+    }
+    bool owns_reaction(wl_client* client) const {
+        if (!client) return false;
+        const auto pointer = g_pSeatManager->m_state.pointerFocus.lock();
+        const auto keyboard = g_pSeatManager->m_state.keyboardFocus.lock();
+        if ((pointer && pointer->client() == client) || (keyboard && keyboard->client() == client)) return false;
+        if (lease && lease->route != InputRoute::primary_foreground)
+            if (const auto s = lease->surface.lock(); s && s->client() == client) return true;
+        if (drag && drag->client && drag->client->route != InputRoute::primary_foreground)
+            if (const auto s = drag->client->surface.lock(); s && s->client() == client) return true;
+        const auto recent = recent_target.lock();
+        return recent && recent->client() == client && Clock::now() - recent_dispatch < kReactionWindow;
+    }
     void revoke(std::string_view reason, bool retain_pointer = false, ForegroundFailure failure = {ForegroundFailureReason::none}) {
         if (lease && trace && reason != "completed") trace->mark("agent_cancel", lane + 1);
         if (drag && drag->client && !drag->client->dead)
@@ -666,6 +706,7 @@ struct InputExperiment::Impl {
                 refusal(foreground_started ? "foreground_partial_unknown" : reason, failure));
         drag.reset();
         finish_foreground();
+        return_primary();
         if (retain_pointer) release_pointer_button(); else leave_pointer();
         leave_keyboard(); retire_grant();
     }
@@ -828,6 +869,95 @@ struct InputExperiment::Impl {
         if (!seat || seat != foreground_seat.lock()) return false;
         return foreground_resources_match(seat->m_pointers, foreground_pointers) &&
             foreground_resources_match(seat->m_keyboards, foreground_keyboards);
+    }
+    PrimaryBackgroundGuard primary_background_guard(const Client& c) const {
+        const auto root = c.surface.lock();
+        return {
+            .primary_binding = root && unique_primary_seat(root->client()),
+            .human_on_client = primary_conflict(root),
+            .peer_conflict = agent_conflict(c),
+            // A grab or drag routes the human's pointer through the compositor
+            // regardless of focus; borrowing resources under it would race.
+            .grab = bool(g_pSeatManager->m_seatGrab) || bool(g_layoutManager->dragController()->target()),
+            .dnd = PROTO::data && PROTO::data->dndActive(),
+            .constraint = g_pInputManager->isConstrained(),
+        };
+    }
+    void borrow_primary(Client& c, bool needs_pointer, bool needs_keyboard) {
+        const auto root = c.surface.lock();
+        const auto seat = root ? g_pSeatManager->seatResourceForClient(root->client()) : nullptr;
+        borrowed_pointers.clear(); borrowed_keyboards.clear();
+        if (!seat || !seat->good()) return;
+        if (needs_pointer)
+            for (const auto& p : seat->m_pointers) if (p && p->good()) borrowed_pointers.push_back(p);
+        if (needs_keyboard)
+            for (const auto& k : seat->m_keyboards) if (k && k->good()) borrowed_keyboards.push_back(k);
+        borrowed_surface = root;
+        borrowed_seat = seat;
+    }
+    // Every borrowed resource still belongs to a client that has no human
+    // focus, so CSeatManager will not send it anything until we finish.
+    bool borrowed_live(Client& c) const {
+        const auto root = borrowed_surface.lock();
+        return root && root == c.surface.lock() && root->good() && primary_background_guard(c).failure().empty();
+    }
+    void borrowed_pointer_enter(const SP<CWLSurfaceResource>& root, const Vector2D& local) {
+        for (const auto& weak : borrowed_pointers)
+            if (const auto p = weak.lock(); p && p->good()) { p->sendEnter(root, local); p->sendMotion(event_ms(), local); p->sendFrame(); }
+    }
+    void borrowed_button(std::uint32_t code, bool pressed) {
+        if (pressed) held_button = code;
+        for (const auto& weak : borrowed_pointers)
+            if (const auto p = weak.lock(); p && p->good()) {
+                p->sendButton(event_ms(), code, pressed ? WL_POINTER_BUTTON_STATE_PRESSED : WL_POINTER_BUTTON_STATE_RELEASED);
+                p->sendFrame();
+            }
+        // sendButton records the press as a move/resize serial for this seat.
+        // An agent press must never let the client start a compositor
+        // move/resize that follows the human's pointer, so drop it at once.
+        if (pressed)
+            if (const auto seat = borrowed_seat.lock(); seat && seat->good())
+                g_pSeatManager->clearPointerButtonSerials(seat, borrowed_surface.lock(), code);
+        if (!pressed) held_button = 0;
+    }
+    void borrowed_key(std::uint32_t code, bool pressed) {
+        xkb_state_update_key(physical_keyboard_state, code + 8, pressed ? XKB_KEY_DOWN : XKB_KEY_UP);
+        if (pressed) held_keys.push_back(code); else std::erase(held_keys, code);
+        for (const auto& weak : borrowed_keyboards)
+            if (const auto k = weak.lock(); k && k->good()) {
+                k->sendKey(event_ms(), code, pressed ? WL_KEYBOARD_KEY_STATE_PRESSED : WL_KEYBOARD_KEY_STATE_RELEASED);
+                k->sendMods(xkb_state_serialize_mods(physical_keyboard_state, XKB_STATE_MODS_DEPRESSED),
+                    xkb_state_serialize_mods(physical_keyboard_state, XKB_STATE_MODS_LATCHED),
+                    xkb_state_serialize_mods(physical_keyboard_state, XKB_STATE_MODS_LOCKED),
+                    xkb_state_serialize_layout(physical_keyboard_state, XKB_STATE_LAYOUT_EFFECTIVE));
+            }
+    }
+    // Leave exactly what we entered. Once human focus reaches this client,
+    // CSeatManager has already left these resources and re-entered the human's
+    // surface on them; they are no longer ours to release or leave.
+    void return_primary() {
+        const auto root = borrowed_surface.lock();
+        if (root && root->good()) {
+            const auto pointer = g_pSeatManager->m_state.pointerFocus.lock();
+            const auto keyboard = g_pSeatManager->m_state.keyboardFocus.lock();
+            if (!pointer || pointer->client() != root->client())
+                for (const auto& weak : borrowed_pointers)
+                    if (const auto p = weak.lock(); p && p->good()) {
+                        if (held_button) p->sendButton(event_ms(), held_button, WL_POINTER_BUTTON_STATE_RELEASED);
+                        p->sendLeave(); p->sendFrame();
+                    }
+            if (!keyboard || keyboard->client() != root->client())
+                for (const auto& weak : borrowed_keyboards)
+                    if (const auto k = weak.lock(); k && k->good()) {
+                        for (auto code : held_keys) k->sendKey(event_ms(), code, WL_KEYBOARD_KEY_STATE_RELEASED);
+                        k->sendMods(0, 0, 0, 0);
+                        k->sendLeave();
+                    }
+        }
+        borrowed_pointers.clear(); borrowed_keyboards.clear(); borrowed_surface.reset(); borrowed_seat.reset();
+        held_button = 0; held_keys.clear();
+        if (physical_keyboard_state) xkb_state_unref(physical_keyboard_state);
+        physical_keyboard_state = physical_keymap ? xkb_state_new(physical_keymap) : nullptr;
     }
     ForegroundGuard foreground_guard(const Client& c) const {
         const auto root = c.surface.lock();
@@ -1092,7 +1222,7 @@ struct InputExperiment::Impl {
             if (f.size() != 1 || c.hello) { send(c, refusal("invalid_request")); return; }
             c.hello = true;
             if (kProduction)
-                send(c, std::format(R"({{"ok":true,"protocol":3,"epoch":"{}","foreground_target":true}})", epoch));
+                send(c, std::format(R"({{"ok":true,"protocol":3,"epoch":"{}","foreground_target":true,"primary_background":true}})", epoch));
             else
                 send(c, std::format(R"({{"ok":true,"protocol":0,"epoch":"{}","challenge":"{}"}})", epoch, c.challenge));
             return;
@@ -1128,9 +1258,10 @@ struct InputExperiment::Impl {
         if (command == "APPROVE") { approve(c, f); return; }
 #endif
         if (reservation != &c) { send(c, refusal("lane_not_claimed")); return; }
-        if (command == "TARGET" || (kProduction && command == "FOREGROUND_TARGET")) {
+        if (command == "TARGET" || (kProduction && (command == "FOREGROUND_TARGET" || command == "PRIMARY_TARGET"))) {
             if (drag) { send(c, refusal("invalid_request")); return; }
-            const auto route = command == "FOREGROUND_TARGET" ? InputRoute::primary_foreground : InputRoute::independent;
+            const auto route = command == "FOREGROUND_TARGET" ? InputRoute::primary_foreground :
+                command == "PRIMARY_TARGET" ? InputRoute::primary_background : InputRoute::independent;
             if (!bind_input_route(c.route, route)) { invalidate(c); send(c, refusal("route_mismatch")); return; }
             if (f.size() != (kProduction ? 4u : 3u)) {
                 if (kProduction) invalidate(c);
@@ -1178,7 +1309,12 @@ struct InputExperiment::Impl {
                         invalidate(c); send(c, refusal("primary_target_busy", ForegroundFailure{failure})); return;
                     }
                 }
-                if (route == InputRoute::primary_foreground) leave_pointer();
+                if (route == InputRoute::primary_background) {
+                    if (const auto failure = primary_background_guard(c).failure(); !failure.empty()) {
+                        invalidate(c); send(c, refusal(failure)); return;
+                    }
+                }
+                if (uses_primary_seat(route)) leave_pointer();
                 c.foreground_attempted = false;
                 c.token = nonce();
                 grant.arm(requested_cap, Clock::now());
@@ -1190,7 +1326,21 @@ struct InputExperiment::Impl {
                 send(c, std::format(R"({{"ok":true,"target":"{}","revision":{},"width":{},"height":{},"route":"primary_foreground"}})",
                     c.token, c.revision, c.geometry[2], c.geometry[3])); return;
             }
-            send(c, std::format(R"({{"ok":true,"target":"{}","revision":{},"width":{},"height":{}}})", c.token, c.revision, c.geometry[2], c.geometry[3])); return;
+            if (route == InputRoute::primary_background) {
+                send(c, std::format(R"({{"ok":true,"target":"{}","revision":{},"width":{},"height":{},"route":"primary_background"}})",
+                    c.token, c.revision, c.geometry[2], c.geometry[3])); return;
+            }
+            // Clients that bind one wl_seat never hold agent resources. Driver
+            // uses this to select PRIMARY_TARGET explicitly; the plugin never
+            // changes route on its own.
+            const auto client = c.surface.lock()->client();
+            const bool agent_bound = std::ranges::any_of(pointers, [&](const auto& p) {
+                return !p->dead && p->wl->resource() && p->wl->client() == client;
+            }) || std::ranges::any_of(keyboards, [&](const auto& k) {
+                return !k->dead && k->wl->resource() && k->wl->client() == client;
+            });
+            send(c, std::format(R"({{"ok":true,"target":"{}","revision":{},"width":{},"height":{},"agent_bound":{}}})",
+                c.token, c.revision, c.geometry[2], c.geometry[3], agent_bound)); return;
         }
         const std::uint64_t cap = command == "CLICK" ? 1 : command == "KEY" ? 2 : command == "SCROLL" ? 4 : command == "DRAG" ? 8 :
             command == "ACTIVATE" && kProduction && c.route == InputRoute::primary_foreground ? 16 : 0;
@@ -1225,6 +1375,10 @@ struct InputExperiment::Impl {
         }
         if (c.route == InputRoute::primary_foreground) {
             foreground_request(c, f, cap);
+            return;
+        }
+        if (c.route == InputRoute::primary_background) {
+            primary_background_request(c, f, cap);
             return;
         }
         if (command == "KEY") {
@@ -1271,6 +1425,7 @@ struct InputExperiment::Impl {
         }
         ++dispatches;
         if (trace) trace->mark("agent_action_end", lane + 1);
+        note_dispatch(c);
         if (kProduction) complete_action();
         send(c, kDelivered);
     }
@@ -1335,6 +1490,88 @@ struct InputExperiment::Impl {
         complete_action();
         send(c, kForegroundDelivered);
     }
+    // Background delivery through the target's primary-seat resources. Click,
+    // key, and scroll borrow, send, and return within this one handler, so the
+    // compositor cannot interleave a human event or focus change mid-action.
+    void primary_background_request(Client& c, const std::vector<std::string>& f, std::uint64_t cap) {
+        const auto& command = f[0];
+        if (command == "ACTIVATE") { send(c, refusal("unsupported")); return; }
+        if (const auto failure = primary_background_guard(c).failure(); !failure.empty()) {
+            revoke(failure); send(c, refusal(failure)); return;
+        }
+        const auto root = c.surface.lock();
+        double x = 0, y = 0;
+        if (command != "KEY") {
+            x = real(f[4]); y = real(f[5]);
+            if (!point(c, x, y)) { send(c, refusal("invalid_request")); return; }
+        }
+        const Vector2D local{x + c.geometry[0] - c.geometry[4], y + c.geometry[1] - c.geometry[5]};
+        if (command != "KEY" && root->at(local, true).first != root) { send(c, refusal("subsurface_target")); return; }
+        if (command == "KEY") {
+            const auto code = number(f[4]); const auto mods = number(f[5]);
+            if (code == 0 || code > 247 || mods > 15 || code == 58 || code == 69 || code == 70) { send(c, refusal("unsupported")); return; }
+            // The client decodes with the human's keymap but only the neutral
+            // modifier state we send it; the human keyboard's locks never
+            // reach a client that the human has not focused.
+            if (foreground_chord_failure(physical_keymap, keymap, static_cast<std::uint32_t>(code),
+                    static_cast<std::uint32_t>(mods), {}) != ForegroundFailureReason::none) {
+                send(c, refusal("unsupported_layout")); return;
+            }
+            if (!consume_grant(c, cap)) return;
+            borrow_primary(c, false, true);
+            if (borrowed_keyboards.empty() || !physical_keyboard_state) { return_primary(); send(c, refusal("client_not_bound")); return; }
+            xkb_state_update_mask(physical_keyboard_state, 0, 0, 0, 0, 0, 0);
+            wl_array keys{};
+            for (const auto& weak : borrowed_keyboards)
+                if (const auto k = weak.lock(); k && k->good()) { k->sendEnter(root, &keys); k->sendMods(0, 0, 0, 0); }
+            const std::array<std::uint32_t, 4> chord{42, 29, 56, 125};
+            for (unsigned i = 0; i < 4; ++i) if ((mods & (1u << i)) && chord[i] != code) borrowed_key(chord[i], true);
+            borrowed_key(static_cast<std::uint32_t>(code), true); borrowed_key(static_cast<std::uint32_t>(code), false);
+            for (int i = 3; i >= 0; --i) if ((mods & (1u << i)) && chord[i] != code) borrowed_key(chord[i], false);
+        } else if (command == "CLICK") {
+            const auto btn = number(f[6]), clicks = number(f[7]);
+            if (btn < 272 || btn > 274 || clicks < 1 || clicks > 2) { send(c, refusal("invalid_request")); return; }
+            if (!consume_grant(c, cap)) return;
+            borrow_primary(c, true, false);
+            if (borrowed_pointers.empty()) { return_primary(); send(c, refusal("client_not_bound")); return; }
+            borrowed_pointer_enter(root, local);
+            for (unsigned i = 0; i < clicks; ++i) { borrowed_button(static_cast<std::uint32_t>(btn), true); borrowed_button(static_cast<std::uint32_t>(btn), false); }
+        } else if (command == "SCROLL") {
+            const auto axis = number(f[6]); const auto value = real(f[7]);
+            if (axis > 1 || value == 0 || std::abs(value) > 1000) { send(c, refusal("invalid_request")); return; }
+            if (!consume_grant(c, cap)) return;
+            borrow_primary(c, true, false);
+            if (borrowed_pointers.empty()) { return_primary(); send(c, refusal("client_not_bound")); return; }
+            borrowed_pointer_enter(root, local);
+            for (const auto& weak : borrowed_pointers)
+                if (const auto p = weak.lock(); p && p->good()) {
+                    p->sendAxisSource(WL_POINTER_AXIS_SOURCE_WHEEL);
+                    p->sendAxis(event_ms(), static_cast<wl_pointer_axis>(axis), value); p->sendFrame();
+                }
+        } else {
+            const auto x2 = real(f[6]), y2 = real(f[7]); const auto duration = number(f[8]);
+            if (!point(c, x2, y2) || duration < 50 || duration > 2000) { send(c, refusal("invalid_request")); return; }
+            if (Clock::now() + std::chrono::milliseconds(duration + 50) >= expires) { send(c, refusal("lease_expired")); return; }
+            if (!consume_grant(c, cap)) return;
+            borrow_primary(c, true, false);
+            if (borrowed_pointers.empty()) { return_primary(); send(c, refusal("client_not_bound")); return; }
+            borrowed_pointer_enter(root, local);
+            borrowed_button(272, true);
+            drag.emplace(Drag{&c, x, y, x2, y2, Clock::now(), static_cast<unsigned>(duration), DragGeometry{c.revision}});
+            send(c, R"({"ok":true,"phase":"started"})"); return;
+        }
+        return_primary();
+        ++dispatches;
+        note_dispatch(c);
+        complete_action();
+        send(c, kPrimaryBackgroundDelivered);
+    }
+    void primary_background_motion(Client& c, double x, double y) {
+        if (!borrowed_live(c)) { revoke("cancelled"); return; }
+        const Vector2D local{x + c.geometry[0] - c.geometry[4], y + c.geometry[1] - c.geometry[5]};
+        for (const auto& weak : borrowed_pointers)
+            if (const auto p = weak.lock(); p && p->good()) { p->sendMotion(event_ms(), local); p->sendFrame(); }
+    }
     bool consume_grant(Client& c, std::uint64_t capability) {
         if (!kProduction) return true;
         capabilities = 0;
@@ -1384,10 +1621,17 @@ struct InputExperiment::Impl {
                     foreground_button(*d.client, 272, false); drag.reset(); ++dispatches;
                     complete_action(); send(*d.client, kForegroundDelivered);
                 }
+            } else if (d.client->route == InputRoute::primary_background) {
+                primary_background_motion(*d.client, d.x1 + (d.x2 - d.x1) * progress, d.y1 + (d.y2 - d.y1) * progress);
+                if (drag && progress >= 1) {
+                    borrowed_button(272, false); drag.reset(); return_primary(); ++dispatches;
+                    note_dispatch(*d.client); complete_action(); send(*d.client, kPrimaryBackgroundDelivered);
+                }
             } else if (!pointer_enter(*d.client, d.x1 + (d.x2 - d.x1) * progress, d.y1 + (d.y2 - d.y1) * progress)) revoke("client_not_bound");
             else if (progress >= 1) {
                 button(272, false); drag.reset(); ++dispatches;
                 if (trace) trace->mark("agent_drag_end", lane + 1);
+                note_dispatch(*d.client);
                 if (kProduction) complete_action();
                 send(*d.client, kDelivered);
             }
@@ -1471,6 +1715,66 @@ struct InputExperiment::DesktopListeners {
     }
 };
 
+// Popup grabs and drag starts are client requests the compositor accepts from
+// any seat. These hooks keep a client reacting to agent input from taking the
+// human's focus or pointer. They forward everything else unchanged.
+struct InputExperiment::ReactionGuards {
+    using Grab = void (*)(CXDGShellProtocol*, SP<CXDGPopupResource>);
+    using Drag = void (*)(CWLDataDeviceProtocol*, WP<CWLDataSourceResource>, SP<CWLSurfaceResource>, SP<CWLSurfaceResource>);
+    static inline ReactionGuards* live = nullptr;
+    InputExperiment& owner;
+    void* plugin;
+    CFunctionHook* grab = nullptr;
+    CFunctionHook* drag = nullptr;
+    std::uint64_t refused_grabs = 0, refused_drags = 0;
+
+    ReactionGuards(InputExperiment& input, void* handle) : owner(input), plugin(handle) {
+        if (live) throw std::runtime_error("input reaction guards already installed");
+        live = this;
+        grab = install("_ZN17CXDGShellProtocol14addOrStartGrabEN9Hyprutils6Memory14CSharedPointerI17CXDGPopupResourceEE",
+            reinterpret_cast<void*>(guarded_grab));
+        drag = install("_ZN21CWLDataDeviceProtocol12initiateDragEN9Hyprutils6Memory12CWeakPointerI21CWLDataSourceResourceEENS1_14CSharedPointerI18CWLSurfaceResourceEES7_",
+            reinterpret_cast<void*>(guarded_drag));
+    }
+    ~ReactionGuards() {
+        if (drag) HyprlandAPI::removeFunctionHook(plugin, drag);
+        if (grab) HyprlandAPI::removeFunctionHook(plugin, grab);
+        live = nullptr;
+    }
+    CFunctionHook* install(const std::string& symbol, void* destination) {
+        // Exact mangled names pin these hooks to the audited 0.56.2 signatures.
+        const auto matches = HyprlandAPI::findFunctionsByName(plugin, symbol);
+        if (matches.size() != 1) throw std::runtime_error("input reaction hook target unavailable");
+        auto* hook = HyprlandAPI::createFunctionHook(plugin, matches.front().address, destination);
+        if (!hook || !hook->hook()) throw std::runtime_error("input reaction hook refused");
+        return hook;
+    }
+    bool agent_reaction(wl_client* client) const {
+        return std::ranges::any_of(owner.lanes_, [&](const auto& lane) { return lane->owns_reaction(client); });
+    }
+    // `live` is cleared only after both hooks are removed, so a call that
+    // reaches these functions always has its original trampoline.
+    static void guarded_grab(CXDGShellProtocol* self, SP<CXDGPopupResource> popup) {
+        auto& guards = *live;
+        const auto surface = popup && popup->m_surface ? popup->m_surface->m_surface.lock() : nullptr;
+        // The popup stays mapped and still receives agent input. Only the
+        // compositor-global grab, which would move human focus, is withheld.
+        if (surface && guards.agent_reaction(surface->client())) { ++guards.refused_grabs; return; }
+        reinterpret_cast<Grab>(guards.grab->m_original)(self, popup);
+    }
+    static void guarded_drag(CWLDataDeviceProtocol* self, WP<CWLDataSourceResource> source,
+                             SP<CWLSurfaceResource> icon, SP<CWLSurfaceResource> origin) {
+        auto& guards = *live;
+        // Hyprland would drop this drag on the human's next button release.
+        if (origin && guards.agent_reaction(origin->client())) {
+            ++guards.refused_drags;
+            if (const auto s = source.lock()) s->cancelled();
+            return;
+        }
+        reinterpret_cast<Drag>(guards.drag->m_original)(self, source, icon, origin);
+    }
+};
+
 InputExperiment::InputExperiment(const std::string& directory, void* plugin) {
     SeatLifetime lifetime(directory);
     for (unsigned i = 0; i < lanes_.size(); ++i) lanes_[i] = std::make_unique<Impl>(directory, i);
@@ -1488,9 +1792,13 @@ InputExperiment::InputExperiment(const std::string& directory, void* plugin) {
     (void)plugin;
 #endif
     desktop_listeners_ = std::make_unique<DesktopListeners>(*this);
+#ifdef CUA_HYPRLAND_INPUT
+    reaction_guards_ = std::make_unique<ReactionGuards>(*this, plugin);
+#endif
     lifetime.publish();
 }
 InputExperiment::~InputExperiment() {
+    reaction_guards_.reset();
     desktop_listeners_.reset();
     for (auto& lane : lanes_) { lane->retire(); lane->trace = nullptr; lane->peers = {}; }
     trace_.reset();
@@ -1522,9 +1830,10 @@ std::string InputExperiment::status_json() const {
             lane->held_button, lane->held_keys.size(), lane->drag.has_value(), pointer_focus, keyboard_focus);
     }
     // Aggregate legacy fields remain available to existing test probes.
-    return std::format(R"({{"protocol":{},"test_only":{},"seat_lifetime":"compositor","upgrade":"desktop_restart","transport_ready":{},"epoch":"{}","lease_active":{},"seat_resources":{},"pointer_resources":{},"keyboard_resources":{},"dispatches":{},"lanes":[{}]}})",
+    return std::format(R"({{"protocol":{},"test_only":{},"seat_lifetime":"compositor","upgrade":"desktop_restart","transport_ready":{},"epoch":"{}","lease_active":{},"seat_resources":{},"pointer_resources":{},"keyboard_resources":{},"dispatches":{},"primary_background":{},"refused_popup_grabs":{},"refused_drag_starts":{},"lanes":[{}]}})",
         kProduction ? 3 : 0, !kProduction, !lanes_[0]->suspended && !lanes_[1]->suspended, lanes_[0]->epoch, lanes_[0]->lease != nullptr || lanes_[1]->lease != nullptr,
         lanes_[0]->seats.size() + lanes_[1]->seats.size(), lanes_[0]->pointers.size() + lanes_[1]->pointers.size(),
-        lanes_[0]->keyboards.size() + lanes_[1]->keyboards.size(), lanes_[0]->dispatches + lanes_[1]->dispatches, states);
+        lanes_[0]->keyboards.size() + lanes_[1]->keyboards.size(), lanes_[0]->dispatches + lanes_[1]->dispatches,
+        kProduction, reaction_guards_ ? reaction_guards_->refused_grabs : 0, reaction_guards_ ? reaction_guards_->refused_drags : 0, states);
 }
 } // namespace cua::hyprland
