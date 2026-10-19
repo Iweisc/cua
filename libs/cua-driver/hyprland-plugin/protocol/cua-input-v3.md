@@ -46,9 +46,10 @@ its original seat names.
 The request sequence for every Driver-admitted action is:
 
 1. Send `HELLO` once per connection. The response is
-   `{"ok":true,"protocol":3,"epoch":"<epoch>","foreground_target":true}`
-   for a production plugin implementing the foreground extension. Driver must
-   require that explicit capability before using the foreground route.
+   `{"ok":true,"protocol":3,"epoch":"<epoch>","foreground_target":true,"primary_background":true}`
+   for a production plugin implementing the foreground and primary-background
+   extensions. Driver must require each explicit capability before using its
+   route.
 2. Send `CLAIM`. The response is `{"ok":true,"lane":0}` or lane `1`.
 3. For background input, send `TARGET <pid> <hex-address> <capability>`.
    For foreground input, send
@@ -56,6 +57,9 @@ The request sequence for every Driver-admitted action is:
    one of `1` (click), `2` (key), `4` (scroll), or `8` (drag); foreground selection
    also permits `16` (activate). Combined masks refuse.
    The response includes `ok`, `target`, `revision`, `width`, and `height`.
+   A `TARGET` response also includes `agent_bound`, which is `false` when the
+   target client holds no pointer or keyboard on this lane's agent seat. Such a
+   client can only be reached through `PRIMARY_TARGET`, described below.
 4. Send the one matching bounded operation using that token and revision.
    A subsequent action requires fresh route-specific target selection, even on
    a cached connection. The binding fixes the route; an operation cannot turn
@@ -162,6 +166,54 @@ include `lane_busy`, `lane_not_claimed`, `stale_target`, `stale_geometry`,
 `session_unavailable`, `unsupported_layout`, `primary_target_busy`,
 `agent_target_busy`, `lease_expired`, `action_not_admitted`, `lease_busy`,
 `client_not_bound`, `replay`, `unsupported`, and `invalid_request`.
+
+## Primary-seat background extension
+
+Chromium/Ozone and Electron bind only the first `wl_seat`, so they never see
+the agent seats and `TARGET` reports `agent_bound:false`. `PRIMARY_TARGET
+<pid> <hex-address> <capability>` binds the same exact live surface to
+`primary_background`. Click, key, scroll, and drag are delivered to the target
+client's own primary-seat pointer and keyboard resources without changing the
+compositor's pointer focus, keyboard focus, or cursor position. `ACTIVATE`
+refuses with `unsupported`. Driver chooses this route explicitly after
+`agent_bound:false`; the plugin never changes route on its own. A connection
+may alternate `TARGET` and `PRIMARY_TARGET`, but never either with
+`FOREGROUND_TARGET`.
+
+Admission and every dispatch refuse with these codes:
+
+- `primary_binding`: the client does not hold exactly one primary seat binding.
+- `primary_target_busy`: human pointer or keyboard focus is on that client.
+- `agent_target_busy`: another lane targets that client.
+- `primary_grab`, `primary_dnd`, `primary_constraint`: a seat grab, layout
+  drag, drag-and-drop, or pointer constraint is active.
+- `subsurface_target`: the point lands on a subsurface.
+- `unsupported_layout`: a key chord means something different under the human's
+  keymap than on a neutral US keyboard. Keys are sent with neutral modifiers, so
+  the human's Num Lock does not refuse.
+
+The borrowed resources are left and released after each action, except when
+human focus has since reached that client: Hyprland has already moved them to
+the human's surface. Human focus reaching the target cancels the lease
+synchronously, as on the agent-seat route. An agent button press clears the
+seat's pointer-button serial at once, so the client cannot use it to start an
+interactive move or resize that would follow the human's pointer.
+
+Successful dispatch returns
+`{"ok":true,"effect":"unverifiable","route":"primary_background"}`.
+
+## Reactions to background input
+
+Hyprland accepts `xdg_popup.grab` and `wl_data_device.start_drag` without
+checking which seat the serial came from. A client reacting to agent input on
+either background route could therefore take the human's keyboard focus or tie
+a drop to the human's next button release. The plugin withholds the popup grab,
+leaving the popup mapped, and cancels the drag source when the requesting
+client is under an agent lease or drag, or received background dispatch in the
+last two seconds, and the human's focus is not on that client. Toolkits that
+require the grab to show a menu, such as GTK, then show no menu.
+`hyprctl -j cua:status` reports `input.primary_background`,
+`input.refused_popup_grabs`, and `input.refused_drag_starts`.
 
 ## Exact-target foreground extension
 
