@@ -32,6 +32,36 @@ enum DeliveryRoute {
     Foreground,
 }
 
+/// How one background action reached its target. The caller's route stays
+/// `Background`; this only records which plugin binding admitted the action.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TargetBinding {
+    AgentSeat,
+    // Chromium/Electron bind only the first wl_seat, so the agent seats never
+    // reach them. The plugin borrows their primary-seat resources instead,
+    // still without moving the human's focus or cursor.
+    PrimaryBackground,
+    Foreground,
+}
+
+impl TargetBinding {
+    fn command(self) -> &'static str {
+        match self {
+            Self::AgentSeat => "TARGET",
+            Self::PrimaryBackground => "PRIMARY_TARGET",
+            Self::Foreground => "FOREGROUND_TARGET",
+        }
+    }
+
+    fn acknowledgement(self) -> &'static str {
+        match self {
+            Self::AgentSeat => "synthetic_events",
+            Self::PrimaryBackground => "primary_background",
+            Self::Foreground => "primary_foreground",
+        }
+    }
+}
+
 impl DeliveryRoute {
     fn mode(self) -> &'static str {
         match self {
@@ -41,18 +71,23 @@ impl DeliveryRoute {
     }
 
     fn acknowledgement(self) -> &'static str {
+        self.binding().acknowledgement()
+    }
+
+    fn binding(self) -> TargetBinding {
         match self {
-            Self::Background => "synthetic_events",
-            Self::Foreground => "primary_foreground",
+            Self::Background => TargetBinding::AgentSeat,
+            Self::Foreground => TargetBinding::Foreground,
         }
     }
 }
 
-fn validate_target_route(target: &Value, route: DeliveryRoute) -> Result<()> {
-    if route == DeliveryRoute::Foreground {
+fn validate_target_route(target: &Value, binding: TargetBinding) -> Result<()> {
+    if binding != TargetBinding::AgentSeat {
         ensure!(
-            target["route"] == "primary_foreground",
-            "foreground target route mismatch"
+            target["route"] == binding.acknowledgement(),
+            "{} target route mismatch",
+            binding.command()
         );
     }
     Ok(())
@@ -259,7 +294,7 @@ pub fn enabled() -> bool {
 /// elsewhere.
 pub fn background_admission(pid: u32) -> std::result::Result<(), &'static str> {
     if protocol() == InputProtocol::Production {
-        super::hyprland_compatibility::qualify(pid)
+        super::hyprland_compatibility::qualify(pid).map(|_| ())
     } else {
         Ok(())
     }
@@ -335,6 +370,7 @@ struct Client {
     cancellation: ActionCancellation,
     protocol: InputProtocol,
     foreground_supported: bool,
+    primary_background_supported: bool,
     delivery_route: Option<DeliveryRoute>,
     // Assigned by the compositor to this connection, never by the local pool.
     lane: Option<usize>,
@@ -490,6 +526,7 @@ impl Client {
             cancellation,
             protocol: protocol(),
             foreground_supported: false,
+            primary_background_supported: false,
             delivery_route: None,
             lane: None,
             owner,
@@ -528,6 +565,8 @@ impl Client {
         self.epoch = hex_field(&hello, "epoch")?;
         self.foreground_supported =
             self.protocol == InputProtocol::Production && hello["foreground_target"] == true;
+        self.primary_background_supported =
+            self.protocol == InputProtocol::Production && hello["primary_background"] == true;
         if self.protocol == InputProtocol::Experiment {
             self.challenge = hex_field(&hello, "challenge")?;
         } else {
@@ -661,7 +700,7 @@ impl Client {
             if route == DeliveryRoute::Background || attempt > 0 {
                 attest(self)?;
             }
-            let target = self.bind_target(&action, route)?;
+            let (target, binding) = self.bind_target(&action, route)?;
             if target["ok"] == false {
                 return Ok(target);
             }
@@ -678,7 +717,7 @@ impl Client {
             self.sequence = self.sequence.checked_add(1).context("sequence exhausted")?;
             let packet = action.packet(self.sequence, &token, revision, width, height)?;
             let mut reply =
-                self.dispatch_routed_with_started(&packet, is_drag, &mut started, route)?;
+                self.dispatch_routed_with_started(&packet, is_drag, &mut started, route, binding)?;
             if self.protocol == InputProtocol::Production
                 && reply["ok"] == false
                 && reply["code"] == "stale_geometry"
@@ -708,6 +747,7 @@ impl Client {
         is_drag: bool,
         started: &mut Option<tokio::sync::oneshot::Sender<()>>,
         route: DeliveryRoute,
+        binding: TargetBinding,
     ) -> Result<Value> {
         let deadline = Instant::now() + TIMEOUT;
         self.send_packet(packet, deadline).map_err(|error| {
@@ -747,7 +787,7 @@ impl Client {
             ));
         }
         if reply["ok"] == true {
-            if reply["effect"] != "unverifiable" || reply["route"] != route.acknowledgement() {
+            if reply["effect"] != "unverifiable" || reply["route"] != binding.acknowledgement() {
                 return Err(unknown_dispatch(
                     anyhow::anyhow!("invalid action acknowledgement"),
                     u32::from(acknowledged),
@@ -769,21 +809,32 @@ impl Client {
         Ok(())
     }
 
-    fn bind_target(&self, action: &Action, route: DeliveryRoute) -> Result<Value> {
+    fn bind_target(&self, action: &Action, route: DeliveryRoute) -> Result<(Value, TargetBinding)> {
         self.check_route(route)?;
-        let target = self.request(&self.target_packet_routed(action, route))?;
-        if target["ok"] == true {
-            validate_target_route(&target, route)?;
+        let binding = route.binding();
+        let target = self.request(&self.target_packet(action, binding))?;
+        if target["ok"] != true {
+            return Ok((target, binding));
         }
-        Ok(target)
+        validate_target_route(&target, binding)?;
+        // The plugin reports the agent seats unbound before any input is sent.
+        // An older plugin omits the field, which keeps the agent-seat route.
+        if binding == TargetBinding::AgentSeat
+            && self.primary_background_supported
+            && target["agent_bound"] == false
+        {
+            let binding = TargetBinding::PrimaryBackground;
+            let target = self.request(&self.target_packet(action, binding))?;
+            if target["ok"] == true {
+                validate_target_route(&target, binding)?;
+            }
+            return Ok((target, binding));
+        }
+        Ok((target, binding))
     }
 
-    fn target_packet_routed(&self, action: &Action, route: DeliveryRoute) -> String {
-        let command = match route {
-            DeliveryRoute::Background => "TARGET",
-            DeliveryRoute::Foreground => "FOREGROUND_TARGET",
-        };
-        let target = format!("{command} {} {:x}", self.pid, self.address);
+    fn target_packet(&self, action: &Action, binding: TargetBinding) -> String {
+        let target = format!("{} {} {:x}", binding.command(), self.pid, self.address);
         if self.protocol == InputProtocol::Production {
             format!("{target} {}", action.capability())
         } else {
@@ -1219,11 +1270,15 @@ fn execute_actions_routed(
         route == DeliveryRoute::Background || protocol() == InputProtocol::Production,
         "foreground input requires production protocol; no downgrade is permitted"
     );
-    if route == DeliveryRoute::Background && protocol() == InputProtocol::Production {
-        if let Err(reason) = super::hyprland_compatibility::qualify(pid) {
-            return Ok(json!({"ok":false,"code":reason,"detail":reason}));
-        }
-    }
+    let qualification =
+        if route == DeliveryRoute::Background && protocol() == InputProtocol::Production {
+            match super::hyprland_compatibility::qualify(pid) {
+                Ok(qualification) => Some(qualification),
+                Err(reason) => return Ok(json!({"ok":false,"code":reason,"detail":reason})),
+            }
+        } else {
+            None
+        };
     let client = session_client(&owner)?;
     let mut slot = client.lock(&cancellation)?;
     if let Some(client) = slot.as_ref() {
@@ -1252,7 +1307,12 @@ fn execute_actions_routed(
     slot.as_mut()
         .context("missing input connection")?
         .cancellation = cancellation;
-    dispatch_actions_in_slot(&mut slot, actions, started, route, text, Client::attest)
+    let mut reply =
+        dispatch_actions_in_slot(&mut slot, actions, started, route, text, Client::attest)?;
+    if let Some(qualification) = qualification {
+        reply["qualified_by"] = json!(qualification.label());
+    }
+    Ok(reply)
 }
 
 fn dispatch_actions_in_slot(
@@ -1448,7 +1508,7 @@ mod tests {
         route: DeliveryRoute,
     ) -> Result<Value> {
         let mut started = started;
-        client.dispatch_routed_with_started(packet, is_drag, &mut started, route)
+        client.dispatch_routed_with_started(packet, is_drag, &mut started, route, route.binding())
     }
 
     fn dispatch_production_key(slot: &mut Option<Client>, route: DeliveryRoute) -> Result<Value> {
@@ -1851,6 +1911,145 @@ mod tests {
     }
 
     #[test]
+    fn unbound_background_target_rebinds_once_through_the_primary_seat() {
+        let (mut client, peer) = production_test_client();
+        client.primary_background_supported = true;
+        let server = std::thread::spawn(move || {
+            assert_eq!(read_packet(&peer), "TARGET 1 1 2");
+            peer.send(
+                json!({"ok":true,"target":TOKEN,"revision":1,"width":100,"height":100,
+                    "agent_bound":false})
+                .to_string()
+                .as_bytes(),
+            )
+            .unwrap();
+            assert_eq!(read_packet(&peer), "PRIMARY_TARGET 1 1 2");
+            peer.send(
+                json!({"ok":true,"route":"primary_background","target":TOKEN,"revision":2,
+                    "width":100,"height":100})
+                .to_string()
+                .as_bytes(),
+            )
+            .unwrap();
+            assert_eq!(read_packet(&peer), format!("KEY 1 {TOKEN} 2 30 0"));
+            // An agent-seat acknowledgement does not prove primary-seat delivery.
+            peer.send(br#"{"ok":true,"effect":"unverifiable","route":"synthetic_events"}"#)
+                .unwrap();
+            assert_eq!(read_packet(&peer), "TARGET 1 1 2");
+            peer.send(
+                json!({"ok":true,"target":TOKEN,"revision":3,"width":100,"height":100,
+                    "agent_bound":false})
+                .to_string()
+                .as_bytes(),
+            )
+            .unwrap();
+            assert_eq!(read_packet(&peer), "PRIMARY_TARGET 1 1 2");
+            peer.send(
+                json!({"ok":true,"route":"primary_background","target":TOKEN,"revision":4,
+                    "width":100,"height":100})
+                .to_string()
+                .as_bytes(),
+            )
+            .unwrap();
+            assert_eq!(read_packet(&peer), format!("KEY 2 {TOKEN} 4 30 0"));
+            peer.send(br#"{"ok":true,"effect":"unverifiable","route":"primary_background"}"#)
+                .unwrap();
+        });
+        let key = || Action::Key {
+            key: "a".into(),
+            modifiers: vec![],
+        };
+        let error = client
+            .execute_routed_with_attest(
+                key(),
+                None,
+                DeliveryRoute::Background,
+                record_test_attestation,
+            )
+            .unwrap_err();
+        assert!(error.is::<DispatchUnknown>());
+        let reply = client
+            .execute_routed_with_attest(
+                key(),
+                None,
+                DeliveryRoute::Background,
+                record_test_attestation,
+            )
+            .unwrap();
+        assert_eq!(reply["route"], "primary_background");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn unadvertised_primary_background_keeps_the_agent_seat_refusal() {
+        let (mut client, peer) = production_test_client();
+        let server = std::thread::spawn(move || {
+            assert_eq!(read_packet(&peer), "TARGET 1 1 2");
+            peer.send(
+                json!({"ok":true,"target":TOKEN,"revision":1,"width":100,"height":100,
+                    "agent_bound":false})
+                .to_string()
+                .as_bytes(),
+            )
+            .unwrap();
+            assert_eq!(read_packet(&peer), format!("KEY 1 {TOKEN} 1 30 0"));
+            peer.send(br#"{"ok":false,"code":"client_not_bound","detail":"client_not_bound"}"#)
+                .unwrap();
+        });
+        let reply = client
+            .execute_routed_with_attest(
+                Action::Key {
+                    key: "a".into(),
+                    modifiers: vec![],
+                },
+                None,
+                DeliveryRoute::Background,
+                record_test_attestation,
+            )
+            .unwrap();
+        assert_eq!(reply["code"], "client_not_bound");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn refused_primary_target_returns_its_code_without_an_action() {
+        let (mut client, peer) = production_test_client();
+        client.primary_background_supported = true;
+        let server = std::thread::spawn(move || {
+            assert_eq!(read_packet(&peer), "TARGET 1 1 2");
+            peer.send(
+                json!({"ok":true,"target":TOKEN,"revision":1,"width":100,"height":100,
+                    "agent_bound":false})
+                .to_string()
+                .as_bytes(),
+            )
+            .unwrap();
+            assert_eq!(read_packet(&peer), "PRIMARY_TARGET 1 1 2");
+            peer.send(br#"{"ok":false,"code":"primary_grab","detail":"primary_grab"}"#)
+                .unwrap();
+            let mut byte = [0u8];
+            assert_eq!(
+                unsafe { libc::recv(peer.as_raw_fd(), byte.as_mut_ptr().cast(), 1, 0) },
+                0
+            );
+        });
+        let reply = client
+            .execute_routed_with_attest(
+                Action::Key {
+                    key: "a".into(),
+                    modifiers: vec![],
+                },
+                None,
+                DeliveryRoute::Background,
+                record_test_attestation,
+            )
+            .unwrap();
+        assert_eq!(reply["code"], "primary_grab");
+        drop(client);
+        server.join().unwrap();
+    }
+
+    #[test]
     fn foreground_requires_advertisement_and_production_without_sending_target() {
         for protocol in [InputProtocol::Production, InputProtocol::Experiment] {
             let (mut client, peer) = test_connection();
@@ -2019,9 +2218,10 @@ mod tests {
         let server = std::thread::spawn(move || {
             assert_eq!(read_packet(&peer), "HELLO");
             peer.send(
-                json!({"ok":true,"protocol":3,"epoch":TOKEN,"foreground_target":true})
-                    .to_string()
-                    .as_bytes(),
+                json!({"ok":true,"protocol":3,"epoch":TOKEN,"foreground_target":true,
+                    "primary_background":true})
+                .to_string()
+                .as_bytes(),
             )
             .unwrap();
             assert_eq!(read_packet(&peer), "CLAIM");
@@ -2029,6 +2229,7 @@ mod tests {
         });
         assert!(client.handshake(0).unwrap());
         assert!(client.foreground_supported);
+        assert!(client.primary_background_supported);
         server.join().unwrap();
     }
 
@@ -2719,6 +2920,7 @@ mod tests {
                 cancellation: ActionCancellation::default(),
                 protocol: InputProtocol::Experiment,
                 foreground_supported: false,
+                primary_background_supported: false,
                 delivery_route: None,
                 lane: None,
                 owner: "input-unregistered-test-client".into(),
@@ -3189,12 +3391,13 @@ mod tests {
                 8,
             ),
         ] {
-            for (route, command) in [
-                (DeliveryRoute::Background, "TARGET"),
-                (DeliveryRoute::Foreground, "FOREGROUND_TARGET"),
+            for (binding, command) in [
+                (TargetBinding::AgentSeat, "TARGET"),
+                (TargetBinding::PrimaryBackground, "PRIMARY_TARGET"),
+                (TargetBinding::Foreground, "FOREGROUND_TARGET"),
             ] {
                 assert_eq!(
-                    client.target_packet_routed(&action, route),
+                    client.target_packet(&action, binding),
                     format!("{command} 1 1 {capability}")
                 );
             }
