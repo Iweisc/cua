@@ -39,8 +39,13 @@ tree and uninstrumented module hash at
 limited to native Calc from `libreoffice-fresh 26.2.5-3`, Inkscape `1.4.4-6`,
 the plain compiled `evdev`/`pc105`/`us` keymap, and the two seats `Cua-Agent`
 and `Cua-Agent-2`. The proof covers the recorded actions and observation
-intervals. Chromium, Electron, and XWayland raw background input remain
-unqualified; semantic AT-SPI actions are separate.
+intervals. Users can admit further apps in
+`$XDG_CONFIG_HOME/cua-driver/hyprland-apps.txt`; those results say the user
+qualified the app. Chromium and Electron reach background input through
+the `PRIMARY_TARGET` route described in
+[the protocol](protocol/cua-input-v3.md#primary-seat-background-extension).
+XWayland raw background input remains unqualified; semantic AT-SPI actions are
+separate.
 
 The exact-target foreground route intentionally changes primary focus and,
 for pointer actions, cursor position, without restoration. The canonical native

@@ -315,6 +315,15 @@ file listing, and rechecks process identity. Unknown or unavailable package
 identity refuses. Package eligibility does not certify every LibreOffice
 application or operation.
 
+To admit another app you have qualified yourself, list its absolute executable
+path, one per line, in `$XDG_CONFIG_HOME/cua-driver/hyprland-apps.txt`
+(usually `~/.config/cua-driver/hyprland-apps.txt`). Blank lines and `#`
+comments are ignored, and symlinks resolve to their real binary. Driver matches
+the entry against the canonical `/proc/<pid>/exe` and rechecks process identity
+as for packaged apps. The result summary for such an app says you qualified it
+in `hyprland-apps.txt`, because Cua has not run its operation matrix against it. Unlisted apps refuse
+with `client_not_qualified` as before.
+
 The plugin separately binds the exact live native surface and checks geometry,
 desktop availability, and primary-client and other-lane conflicts. Each
 background lane publishes a private canonical `evdev`/`pc105`/`us` keymap, so
@@ -322,8 +331,16 @@ user options such as Caps Lock remapped to Ctrl or Super do not alter agent key
 semantics. A physical keymap transition cancels existing authority; use a fresh
 action afterward. Multiple agent layout groups, Unicode, IME input, arbitrary
 held-key streams, and modified pointer gestures remain outside this scope.
-Chromium, Electron, and XWayland raw background input are outside this scope.
-AT-SPI routes retain their separate behavior.
+Chromium/Ozone and Electron bind only the first `wl_seat`, so they never see
+the agent seats. When the plugin reports that, Driver delivers through the
+target's own primary-seat resources instead, still without moving your focus or
+cursor. The result route remains `synthetic_events`. It refuses while your pointer or
+keyboard focus is on that app, and during a grab, drag-and-drop, or pointer
+constraint. The plugin also withholds popup grabs and cancels drag starts that a
+background app makes in reaction to agent input, so a dropdown cannot take your
+keyboard. GTK menus need that grab and do not open in the background. XWayland
+raw background input remains outside this scope; Xwayland routes keys to the X
+focus. AT-SPI routes retain their separate behavior.
 
 Two compositor seats, `Cua-Agent` and `Cua-Agent-2`, persist across configuration
 disable/re-enable. Each connection claims one lane, and each admitted action
