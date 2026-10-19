@@ -211,6 +211,12 @@ pub fn is_session() -> bool {
         && std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some_and(|s| !s.is_empty())
 }
 
+/// `hyprctl -j cua:status` from the attested compositor. `Err` when the plugin
+/// is not loaded, since Hyprland then reports an unknown request.
+pub fn plugin_status() -> Result<serde_json::Value> {
+    query("j/cua:status")
+}
+
 fn ipc_path() -> Result<PathBuf> {
     let runtime = std::env::var_os("XDG_RUNTIME_DIR").context("missing XDG_RUNTIME_DIR")?;
     let signature = std::env::var("HYPRLAND_INSTANCE_SIGNATURE")
@@ -357,7 +363,7 @@ fn query_with<T: serde::de::DeserializeOwned>(
     // dispatch commands. JSON output does not imply a read-only operation.
     let read_only = matches!(
         command,
-        "j/monitors" | "j/clients" | "j/activewindow" | "j/cursorpos"
+        "j/monitors" | "j/clients" | "j/activewindow" | "j/cursorpos" | "j/cua:status"
     );
     for attempt in 1..=QUERY_MAX_ATTEMPTS {
         query_time_remaining(deadline)?;

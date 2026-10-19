@@ -399,41 +399,79 @@ fn ui_automation_probe_from(result: Result<(), String>, degraded: bool) -> Probe
     }
 }
 
-/// Run `gdbus introspect` against the AT-SPI accessibility bus and report
-/// whether it returned success within `timeout`. Any of: spawn failure,
-/// timeout elapsed, non-zero exit — all collapse to `false` (the caller
-/// only cares about reachability, not the failure mode).
+/// Ask the session bus for the AT-SPI bus address, then reach the registry on
+/// that address. `org.a11y.Bus` alone answers even when the address it hands
+/// out is a dead socket, which leaves `get_window_state` with no tree.
 ///
 /// Kept separate from `append_platform_probes` so it's straightforward to
 /// unit-test the timeout path without invoking the full doctor run.
 #[cfg(target_os = "linux")]
-fn probe_at_spi_bus_via_gdbus(timeout: std::time::Duration) -> bool {
-    use std::process::{Command, Stdio};
-
-    let mut child = match Command::new("gdbus")
-        .args([
-            "introspect",
+fn probe_at_spi_registry(timeout: std::time::Duration) -> Result<String, String> {
+    let address = run_gdbus(
+        &[
+            "call",
             "--session",
             "--dest",
             "org.a11y.Bus",
             "--object-path",
             "/org/a11y/bus",
-        ])
-        .stdout(Stdio::null())
+            "--method",
+            "org.a11y.Bus.GetAddress",
+        ],
+        timeout,
+    )
+    .map_err(|error| format!("org.a11y.Bus did not answer GetAddress ({error})"))?;
+    let address = parse_gdbus_string(&address)
+        .ok_or_else(|| format!("unexpected GetAddress reply: {}", address.trim()))?;
+    run_gdbus(
+        &[
+            "introspect",
+            "--address",
+            &address,
+            "--dest",
+            "org.a11y.atspi.Registry",
+            "--object-path",
+            "/org/a11y/atspi/registry",
+        ],
+        timeout,
+    )
+    .map_err(|error| format!("registry unreachable at {address} ({error})"))?;
+    Ok(address)
+}
+
+/// gdbus prints a single string result as `('value',)`.
+#[cfg(target_os = "linux")]
+fn parse_gdbus_string(reply: &str) -> Option<String> {
+    let inner = reply.trim().strip_prefix("('")?.strip_suffix("',)")?;
+    (!inner.is_empty() && !inner.contains('\'')).then(|| inner.to_owned())
+}
+
+#[cfg(target_os = "linux")]
+fn run_gdbus(args: &[&str], timeout: std::time::Duration) -> Result<String, String> {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new("gdbus")
+        .args(args)
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-    {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
+        .map_err(|error| format!("gdbus: {error}"))?;
     match wait_for_child(&mut child, timeout) {
-        Ok(Some(status)) => status.success(),
+        Ok(Some(status)) if status.success() => {
+            let mut output = String::new();
+            if let Some(mut stdout) = child.stdout.take() {
+                let _ = stdout.read_to_string(&mut output);
+            }
+            Ok(output)
+        }
+        Ok(Some(status)) => Err(format!("exit {status}")),
         Ok(None) | Err(_) => {
             // Timed out or failed — kill the stuck child so we don't leave a
             // gdbus process hanging around after `doctor` exits.
             let _ = child.kill();
             let _ = child.wait();
-            false
+            Err("timed out".into())
         }
     }
 }
@@ -518,8 +556,8 @@ fn append_platform_probes(report: &mut Report) {
 
     // AT-SPI bus probe. We don't link D-Bus directly — instead, check for
     // the AT_SPI_BUS env var which the at-spi daemon advertises when
-    // running, and fall back to checking gdbus's view of the
-    // org.a11y.Bus name.
+    // running, and fall back to asking gdbus for the bus the launcher hands
+    // out and reaching the registry on it.
     let at_spi_env = std::env::var("AT_SPI_BUS").ok().filter(|v| !v.is_empty());
     match at_spi_env {
         Some(addr) => report.push(Probe::ok(
@@ -528,25 +566,76 @@ fn append_platform_probes(report: &mut Report) {
         )),
         None => {
             // Bounded wait — a hung session bus daemon would otherwise
-            // block `doctor` indefinitely. 3s is enough for a healthy
-            // gdbus introspect to complete (single round-trip on the
-            // session bus) and short enough that a stuck bus surfaces
+            // block `doctor` indefinitely. 3s per gdbus call is enough for a
+            // healthy round-trip and short enough that a stuck bus surfaces
             // as a warning instead of looking like the binary froze.
-            let bus_ok = probe_at_spi_bus_via_gdbus(std::time::Duration::from_secs(3));
-            if bus_ok {
-                report.push(Probe::ok(
+            match probe_at_spi_registry(std::time::Duration::from_secs(3)) {
+                Ok(address) => report.push(Probe::ok(
                     "AT-SPI",
-                    "org.a11y.Bus reachable via session bus",
-                ));
-            } else {
-                report.push(
-                    Probe::warn("AT-SPI", "accessibility bus not reachable")
-                        .with_detail(
-                            "install at-spi2-core and ensure the user session has D-Bus running for get_window_state to work.",
-                        ),
-                );
+                    format!("registry reachable at {address}"),
+                )),
+                Err(reason) => report.push(
+                    Probe::warn("AT-SPI", "accessibility registry not reachable")
+                        .with_detail(format!(
+                            "{reason}. get_window_state needs it: install at-spi2-core, or log out and back in if the bus socket was replaced."
+                        )),
+                ),
             }
         }
+    }
+
+    append_hyprland_probes(report);
+}
+
+#[cfg(target_os = "linux")]
+fn append_hyprland_probes(report: &mut Report) {
+    use platform_linux::wayland;
+
+    if !wayland::hyprland::is_session() {
+        return;
+    }
+    if !wayland::wayland_enabled() {
+        report.push(
+            Probe::warn("Hyprland input", "Wayland backend disabled")
+                .with_detail(format!(
+                    "start the daemon with {}=1; without it input falls back to X11 and cannot reach native Wayland windows.",
+                    wayland::ENABLE_WAYLAND_ENV
+                )),
+        );
+        return;
+    }
+    let status = match wayland::hyprland::plugin_status() {
+        Ok(status) => status,
+        Err(error) => {
+            report.push(
+                Probe::warn("Hyprland plugin", "cua-hyprland-plugin not loaded")
+                    .with_detail(format!(
+                        "{error}. Background input needs the plugin loaded with plugin:cua:enabled = true."
+                    )),
+            );
+            return;
+        }
+    };
+    let input = &status["input"];
+    if status["abi"]["match"] != true {
+        report.push(Probe::err(
+            "Hyprland plugin",
+            "plugin ABI does not match the running Hyprland; rebuild it for this version",
+        ));
+    } else if input["transport_ready"] != true {
+        report.push(
+            Probe::warn("Hyprland plugin", "loaded, background input not ready")
+                .with_detail("set plugin:cua:enabled = true and run hyprctl reload."),
+        );
+    } else {
+        report.push(Probe::ok(
+            "Hyprland plugin",
+            format!(
+                "background input ready (protocol {}, primary_background {})",
+                input["protocol"],
+                input["primary_background"] == true
+            ),
+        ));
     }
 }
 
@@ -689,6 +778,18 @@ mod tests {
         let json = r.to_json();
         // Warnings do not fail the run — exit-code-driving flag stays true.
         assert_eq!(json["ok"], serde_json::Value::Bool(true));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gdbus_address_reply_parses_only_a_single_string() {
+        assert_eq!(
+            parse_gdbus_string("('unix:path=/run/user/1000/at-spi/bus',)\n").as_deref(),
+            Some("unix:path=/run/user/1000/at-spi/bus")
+        );
+        assert_eq!(parse_gdbus_string("('',)"), None);
+        assert_eq!(parse_gdbus_string("(uint32 1,)"), None);
+        assert_eq!(parse_gdbus_string("('a', 'b',)"), None);
     }
 
     #[cfg(target_os = "linux")]
