@@ -237,9 +237,13 @@ disposable container, plus a nested instance:
   `delivery.mode: background`, `effect: unverifiable`, and its summary names
   the user list. `cua-driver doctor` reports
   `background input ready (protocol 3, primary_background true)`.
+- Code - OSS (Electron 42) in the background with Electron listed in
+  `hyprland-apps.txt`: Driver `type_text` put `agent ` into its editor
+  (`agent start`, tab marked modified) while the human typed `asdxc` into
+  Chromium B, and the active window and cursor stayed on B.
 
-Before acceptance, also record: VS Code and one other Electron app, and two
-lanes targeting different Chromium windows at once.
+Before acceptance, also record: one more Electron app, and two lanes
+targeting different Chromium windows at once.
 
 ## Unresolved questions
 
