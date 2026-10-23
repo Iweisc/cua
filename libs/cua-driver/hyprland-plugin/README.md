@@ -44,8 +44,10 @@ intervals. Users can admit further apps in
 qualified the app. Chromium and Electron reach background input through
 the `PRIMARY_TARGET` route described in
 [the protocol](protocol/cua-input-v3.md#primary-seat-background-extension).
-XWayland raw background input remains unqualified; semantic AT-SPI actions are
-separate.
+X windows reach background input through `XWAYLAND_TARGET` on stock
+XWayland, after Driver moves the agent seat onto its own X master pair; see
+[the protocol](protocol/cua-input-v3.md#xwayland-extension). Semantic AT-SPI
+actions are separate.
 
 The exact-target foreground route intentionally changes primary focus and,
 for pointer actions, cursor position, without restoration. The canonical native

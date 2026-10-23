@@ -46,10 +46,10 @@ its original seat names.
 The request sequence for every Driver-admitted action is:
 
 1. Send `HELLO` once per connection. The response is
-   `{"ok":true,"protocol":3,"epoch":"<epoch>","foreground_target":true,"primary_background":true}`
-   for a production plugin implementing the foreground and primary-background
-   extensions. Driver must require each explicit capability before using its
-   route.
+   `{"ok":true,"protocol":3,"epoch":"<epoch>","foreground_target":true,"primary_background":true,"xwayland_target":true}`
+   for a production plugin implementing the foreground, primary-background,
+   and XWayland extensions. Driver must require each explicit capability before
+   using its route.
 2. Send `CLAIM`. The response is `{"ok":true,"lane":0}` or lane `1`.
 3. For background input, send `TARGET <pid> <hex-address> <capability>`.
    For foreground input, send
@@ -60,6 +60,7 @@ The request sequence for every Driver-admitted action is:
    A `TARGET` response also includes `agent_bound`, which is `false` when the
    target client holds no pointer or keyboard on this lane's agent seat. Such a
    client can only be reached through `PRIMARY_TARGET`, described below.
+   `TARGET` refuses X windows with `stale_target`; they need `XWAYLAND_TARGET`.
 4. Send the one matching bounded operation using that token and revision.
    A subsequent action requires fresh route-specific target selection, even on
    a cached connection. The binding fixes the route; an operation cannot turn
@@ -215,6 +216,47 @@ require the grab to show a menu, such as GTK, then show no menu.
 `hyprctl -j cua:status` reports `input.primary_background`,
 `input.refused_popup_grabs`, and `input.refused_drag_starts`.
 
+## XWayland extension
+
+XWayland binds every Wayland seat, the agent seats included, and attaches each
+seat's X input devices to the human's core pointer and keyboard. Agent input to
+an X window would then move the human's X pointer and type into the human's X
+focus. `XWAYLAND_TARGET <pid> <hex-address> <capability>` binds an X window
+through this lane's agent seat. Driver sends it only after moving the seat's
+XWayland devices onto their own XInput2 master pair. The plugin cannot see X
+device state and relies on Driver for that step, which is why plain `TARGET`
+keeps refusing X windows.
+
+The response adds `"route":"xwayland"`, `seat`, and `xid`. `seat` is the agent
+seat's Wayland global name, which XWayland uses in its device names
+(`xwayland-pointer:<seat>`). `xid` is the X window. `client_not_bound` refuses
+when XWayland has not bound this lane's seat. Actions acknowledge with
+`"route":"synthetic_events"`.
+
+These rules differ from native targets:
+
+- Conflicts compare X processes, because XWayland is one Wayland client for
+  every X app. Human focus on another X app does not refuse.
+- Pointer actions enter the target at the action point and send no motion.
+  XWayland turns motion into XI2 raw motion, which every raw listener
+  receives, including a relative-mouse game the human is playing. Drags still
+  move while the button is held.
+- Scroll sends an empty axis event before the real one. XI2 clients take the
+  first scroll after an enter as their baseline.
+- Pointer actions refuse with `xwayland_focus_changed` when the human's keyboard
+  focus changed after `XWAYLAND_TARGET`. Hyprland restacks X windows on focus,
+  and X stacking decides which window a pointer event reaches. Driver checks
+  that the target is uncovered at the action point after admission.
+- Pointer actions refuse with `primary_constraint` while the human's pointer is
+  locked or confined. Every XI2 raw listener sees agent pointer events, and a
+  game holding such a constraint usually reads them.
+- Pointer coordinates are scaled by the window's X surface scale, as Hyprland
+  does for the human's pointer under `xwayland:force_zero_scaling`.
+- A new X window from an X process this lane leases, or delivered to in the
+  last two seconds, opens without initial focus unless the human is in that
+  process. X apps show menus and dialogs as new windows. `hyprctl -j
+  cua:status` counts these in `input.withheld_initial_focus`.
+
 ## Exact-target foreground extension
 
 `FOREGROUND_TARGET` binds an ordinary live native top-level surface to
@@ -307,12 +349,12 @@ of bounded cleanup latency.
 
 For background `TARGET`, Driver restricts app/package/version/operation
 eligibility before connecting. Its qualification scope remains native Calc and
-Inkscape. Foreground `FOREGROUND_TARGET` has no Calc/Inkscape package gate; its
+Inkscape. X windows need the user's own entry. Foreground `FOREGROUND_TARGET` has no Calc/Inkscape package gate; its
 scope is ordinary native top-level surfaces. Native GTK3, Electron, and Tauri
 foreground coverage is planned and still requires certification. The plugin checks
 native surface identity, geometry, client conflicts, and exact compiled XKB
 content against the default `evdev`/`pc105`/`us` keymap. Variants, options,
-remaps, multiple groups, missing keyboards, XWayland, Unicode, IME input,
+remaps, multiple groups, missing keyboards, Unicode, IME input,
 arbitrary held-key streams, and modified pointer gestures are outside this
 candidate. Layout names alone never establish eligibility. Existing semantic
 Driver routes retain their own behavior.

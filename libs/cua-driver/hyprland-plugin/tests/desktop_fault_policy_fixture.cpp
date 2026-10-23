@@ -15,7 +15,7 @@
 
 using namespace cua::hyprland;
 using Clock = InputGrant::Clock;
-struct Window {};
+struct Window { bool m_isX11 = false; };
 struct Surface { int client() const { return 1; } };
 using Target = PassivePointerTarget<std::weak_ptr<Window>, std::weak_ptr<Surface>>;
 struct Client {
@@ -84,7 +84,7 @@ struct Lane {
     template<typename T> bool primary_conflict(const T&) const { return primary_busy; }
     template<typename T> bool agent_conflict(const T&) const { return peer_busy; }
     std::optional<Target::Geometry> target_geometry(
-        const std::shared_ptr<Window>& w, const std::shared_ptr<Surface>& s) const {
+        const std::shared_ptr<Window>& w, const std::shared_ptr<Surface>& s, bool = false) const {
         if (!target_live || !w || !s) return {};
         return geometry;
     }

@@ -26,6 +26,7 @@
 #include <src/layout/LayoutManager.hpp>
 #include <src/plugins/PluginAPI.hpp>
 #include <src/protocols/XDGShell.hpp>
+#include <src/xwayland/XSurface.hpp>
 #include <linux/input-event-codes.h>
 #include <wayland.hpp>
 #include <wayland-server-core.h>
@@ -173,6 +174,12 @@ struct InputExperiment::Impl {
         // hover. Never reset on STOP/CANCEL, repeated CLAIM, or invalidation.
         bool has_bound_target = false;
         InputRoute route = InputRoute::unbound;
+        // Set only by XWAYLAND_TARGET. Driver attaches this lane's XWayland
+        // devices to their own X master before asking, so stock XWayland
+        // keeps agent input off the human's core pointer and keyboard.
+        bool xwayland = false;
+        // Human keyboard focus when XWAYLAND_TARGET admitted the target.
+        WP<CWLSurfaceResource> human_focus;
         bool foreground_attempted = false;
         std::string challenge, token;
         WP<Desktop::View::CWindow> window;
@@ -540,9 +547,9 @@ struct InputExperiment::Impl {
         touches.push_back(std::move(t));
     }
     static std::optional<std::array<double, 6>> target_geometry(
-        const PHLWINDOW& window, const SP<CWLSurfaceResource>& surface) {
+        const PHLWINDOW& window, const SP<CWLSurfaceResource>& surface, bool xwayland = false) {
         if (!window || !surface || !window->m_isMapped || window->isHidden() ||
-            window->m_isX11 || window->resource() != surface || !surface->m_mapped || !surface->good()) return std::nullopt;
+            window->m_isX11 != xwayland || window->resource() != surface || !surface->m_mapped || !surface->good()) return std::nullopt;
         // Match Driver's captured client surface, not the decorated window box
         // (which includes compositor borders and shifts clicks by their width).
         const auto box = window->surfaceLogicalBox(); const auto surface_box = box;
@@ -552,7 +559,7 @@ struct InputExperiment::Impl {
         return geometry;
     }
     bool refresh(Client& c) {
-        const auto geometry = target_geometry(c.window.lock(), c.surface.lock());
+        const auto geometry = target_geometry(c.window.lock(), c.surface.lock(), c.xwayland);
         if (!geometry) return false;
         if (*geometry != c.geometry) {
             if (c.revision == UINT64_MAX) return false;
@@ -565,13 +572,23 @@ struct InputExperiment::Impl {
             return foreground_started && !foreground_activating && !foreground_guard(c).can_dispatch(foreground_needs_pointer);
         return primary_conflict(c.surface.lock());
     }
+    // XWayland is a single Wayland client for every X app. Each input user has
+    // its own X master pair there, so only the same X process conflicts.
+    static bool same_app(const SP<CWLSurfaceResource>& a, const SP<CWLSurfaceResource>& b) {
+        if (!a || !b || a->client() != b->client()) return false;
+        PHLWINDOW window_a, window_b;
+        for (const auto& w : Desktop::windowState()->windows()) {
+            if (w->resource() == a) window_a = w;
+            if (w->resource() == b) window_b = w;
+        }
+        return !(window_a && window_b && window_a->m_isX11 && window_b->m_isX11 &&
+            window_a->getPID() > 0 && window_a->getPID() != window_b->getPID());
+    }
     bool primary_conflict(const SP<CWLSurfaceResource>& surface) const {
         if (!surface) return true;
-        const auto pointer = g_pSeatManager->m_state.pointerFocus.lock();
-        const auto keyboard = g_pSeatManager->m_state.keyboardFocus.lock();
         // Conservative per-client refusal avoids toolkit-global cross-window state.
-        return (pointer && pointer->client() == surface->client()) ||
-            (keyboard && keyboard->client() == surface->client());
+        return same_app(g_pSeatManager->m_state.pointerFocus.lock(), surface) ||
+            same_app(g_pSeatManager->m_state.keyboardFocus.lock(), surface);
     }
     bool agent_conflict(const Client& c) const {
         if (c.route == InputRoute::primary_foreground)
@@ -584,9 +601,8 @@ struct InputExperiment::Impl {
         for (const auto* peer : peers) {
             if (!peer || peer == this) continue;
             // Passive hover still participates after its transport owner dies.
-            if (peer->pointer_target.same_client(surface)) return true;
-            const auto other = peer->lease ? peer->lease->surface.lock() : nullptr;
-            if (other && other->client() == surface->client()) return true;
+            if (peer->pointer_target.entered() && same_app(peer->pointer_target.surface(), surface)) return true;
+            if (peer->lease && same_app(peer->lease->surface.lock(), surface)) return true;
         }
         return false;
     }
@@ -697,6 +713,15 @@ struct InputExperiment::Impl {
             if (const auto s = drag->client->surface.lock(); s && s->client() == client) return true;
         const auto recent = recent_target.lock();
         return recent && recent->client() == client && Clock::now() - recent_dispatch < kReactionWindow;
+    }
+    // X apps show menus and dialogs as new windows. One from an X app the
+    // agent just drove is a reaction, unless the human is in that app.
+    bool owns_x_reaction(const SP<CWLSurfaceResource>& surface) const {
+        if (!surface || same_app(g_pSeatManager->m_state.pointerFocus.lock(), surface) ||
+            same_app(g_pSeatManager->m_state.keyboardFocus.lock(), surface)) return false;
+        if (lease && lease->xwayland && same_app(lease->surface.lock(), surface)) return true;
+        const auto recent = recent_target.lock();
+        return recent && same_app(recent, surface) && Clock::now() - recent_dispatch < kReactionWindow;
     }
     void revoke(std::string_view reason, bool retain_pointer = false, ForegroundFailure failure = {ForegroundFailureReason::none}) {
         if (lease && trace && reason != "completed") trace->mark("agent_cancel", lane + 1);
@@ -1154,15 +1179,24 @@ struct InputExperiment::Impl {
         const Vector2D local{x + c.geometry[0] - c.geometry[4], y + c.geometry[1] - c.geometry[5]};
         const auto hit = root->at(local, true);
         if (hit.first != root) return false;
+        // With xwayland:force_zero_scaling, X surfaces use X pixels. Hyprland
+        // scales the human's pointer the same way.
+        const auto window = c.window.lock();
+        const auto sent = c.xwayland && window ? local * window->m_X11SurfaceScaledBy : local;
         unsigned count = 0;
         for (auto& p : pointers) {
             if (p->dead || !p->wl->resource() || p->wl->client() != root->client()) continue;
-            if (p->focus != root) {
+            // XWayland places the pointer on enter without a raw event. A motion
+            // event becomes XI2 raw motion, which every raw listener receives
+            // (a relative-mouse game the human is playing turns it into a jump).
+            // A drag still moves: XWayland releases held buttons on enter.
+            const bool reenter = c.xwayland && !held_button;
+            if (p->focus != root || reenter) {
                 if (const auto old = p->focus.lock(); old && old->good()) p->wl->sendLeave(serial(), old->getResource().get());
                 p->focus = root;
-                p->wl->sendEnter(serial(), root->getResource().get(), wl_fixed_from_double(local.x), wl_fixed_from_double(local.y));
+                p->wl->sendEnter(serial(), root->getResource().get(), wl_fixed_from_double(sent.x), wl_fixed_from_double(sent.y));
             }
-            p->wl->sendMotion(event_ms(), wl_fixed_from_double(local.x), wl_fixed_from_double(local.y));
+            if (!reenter) p->wl->sendMotion(event_ms(), wl_fixed_from_double(sent.x), wl_fixed_from_double(sent.y));
             if (p->wl->version() >= 5) p->wl->sendFrame();
             ++count;
         }
@@ -1222,7 +1256,7 @@ struct InputExperiment::Impl {
             if (f.size() != 1 || c.hello) { send(c, refusal("invalid_request")); return; }
             c.hello = true;
             if (kProduction)
-                send(c, std::format(R"({{"ok":true,"protocol":3,"epoch":"{}","foreground_target":true,"primary_background":true}})", epoch));
+                send(c, std::format(R"({{"ok":true,"protocol":3,"epoch":"{}","foreground_target":true,"primary_background":true,"xwayland_target":true}})", epoch));
             else
                 send(c, std::format(R"({{"ok":true,"protocol":0,"epoch":"{}","challenge":"{}"}})", epoch, c.challenge));
             return;
@@ -1258,7 +1292,8 @@ struct InputExperiment::Impl {
         if (command == "APPROVE") { approve(c, f); return; }
 #endif
         if (reservation != &c) { send(c, refusal("lane_not_claimed")); return; }
-        if (command == "TARGET" || (kProduction && (command == "FOREGROUND_TARGET" || command == "PRIMARY_TARGET"))) {
+        if (command == "TARGET" || (kProduction && (command == "FOREGROUND_TARGET" || command == "PRIMARY_TARGET" ||
+            command == "XWAYLAND_TARGET"))) {
             if (drag) { send(c, refusal("invalid_request")); return; }
             const auto route = command == "FOREGROUND_TARGET" ? InputRoute::primary_foreground :
                 command == "PRIMARY_TARGET" ? InputRoute::primary_background : InputRoute::independent;
@@ -1279,18 +1314,20 @@ struct InputExperiment::Impl {
             PHLWINDOW window;
             for (const auto& w : Desktop::windowState()->windows())
                 if (reinterpret_cast<std::uintptr_t>(w.get()) == address && static_cast<std::uint64_t>(w->getPID()) == pid) window = w;
-            if (!window || window->m_isX11 || !window->m_isMapped || window->isHidden() || !window->resource()) {
+            const bool xwayland = command == "XWAYLAND_TARGET";
+            if (!window || window->m_isX11 != xwayland || !window->m_isMapped || window->isHidden() || !window->resource() ||
+                (xwayland && !window->m_xwaylandSurface)) {
                 invalidate(c); send(c, refusal("stale_target")); return;
             }
             // Retire the old target before rebinding: even if the new target's
             // geometry validation fails, a reserved lane must not strand it.
             if (pointer_target.entered() && !pointer_target.same_target(window, window->resource()))
                 revoke("stale_target");
-            if (c.window != window || c.surface != window->resource() || c.token.empty()) {
+            if (c.window != window || c.surface != window->resource() || c.xwayland != xwayland || c.token.empty()) {
                 // Rebinding authority (including a new socket owner) may reuse
                 // unchanged passive hover. Compare the actual target below.
                 invalidate(c, false); c.unmap.reset(); c.destroy.reset();
-                c.window = window; c.surface = window->resource(); c.token = nonce(); c.revision = 1;
+                c.window = window; c.surface = window->resource(); c.xwayland = xwayland; c.token = nonce(); c.revision = 1;
                 c.unmap = window->m_events.unmap.listen([this, &c] { invalidate(c); });
                 c.destroy = window->m_events.destroy.listen([this, &c] { invalidate(c); });
             }
@@ -1300,6 +1337,16 @@ struct InputExperiment::Impl {
             // Only a valid fresh TARGET can retire an orphan on another lane.
             // Dispatch/conflict checks never evict peer state or replay input.
             if (available() && !primary_conflict(c)) retire_orphan_hover(c);
+            // Clients that bind one wl_seat never hold agent resources. Driver
+            // uses this to select PRIMARY_TARGET explicitly; the plugin never
+            // changes route on its own.
+            const auto client = c.surface.lock()->client();
+            const bool agent_bound = std::ranges::any_of(pointers, [&](const auto& p) {
+                return !p->dead && p->wl->resource() && p->wl->client() == client;
+            }) || std::ranges::any_of(keyboards, [&](const auto& k) {
+                return !k->dead && k->wl->resource() && k->wl->client() == client;
+            });
+            if (xwayland && !agent_bound) { invalidate(c); send(c, refusal("client_not_bound")); return; }
             if (kProduction) {
                 if (primary_conflict(c)) { invalidate(c); send(c, refusal("primary_target_busy")); return; }
                 if (agent_conflict(c)) { invalidate(c); send(c, refusal("agent_target_busy")); return; }
@@ -1330,15 +1377,13 @@ struct InputExperiment::Impl {
                 send(c, std::format(R"({{"ok":true,"target":"{}","revision":{},"width":{},"height":{},"route":"primary_background"}})",
                     c.token, c.revision, c.geometry[2], c.geometry[3])); return;
             }
-            // Clients that bind one wl_seat never hold agent resources. Driver
-            // uses this to select PRIMARY_TARGET explicitly; the plugin never
-            // changes route on its own.
-            const auto client = c.surface.lock()->client();
-            const bool agent_bound = std::ranges::any_of(pointers, [&](const auto& p) {
-                return !p->dead && p->wl->resource() && p->wl->client() == client;
-            }) || std::ranges::any_of(keyboards, [&](const auto& k) {
-                return !k->dead && k->wl->resource() && k->wl->client() == client;
-            });
+            if (xwayland) {
+                c.human_focus = g_pSeatManager->m_state.keyboardFocus;
+                // XWayland names its devices for a seat "xwayland-<kind>:<global name>".
+                send(c, std::format(R"({{"ok":true,"target":"{}","revision":{},"width":{},"height":{},"route":"xwayland","seat":{},"xid":{}}})",
+                    c.token, c.revision, c.geometry[2], c.geometry[3], wl_global_get_name(global, client),
+                    window->m_xwaylandSurface->m_xID)); return;
+            }
             send(c, std::format(R"({{"ok":true,"target":"{}","revision":{},"width":{},"height":{},"agent_bound":{}}})",
                 c.token, c.revision, c.geometry[2], c.geometry[3], agent_bound)); return;
         }
@@ -1372,6 +1417,18 @@ struct InputExperiment::Impl {
         if (agent_conflict(c)) {
             if (kProduction) revoke("agent_target_busy");
             send(c, refusal("agent_target_busy")); return;
+        }
+        // Hyprland raises an X window in X stacking when it gains keyboard
+        // focus, and X stacking decides which window a pointer event reaches.
+        // Driver checks coverage after XWAYLAND_TARGET, so a focus change since
+        // then voids that check.
+        if (c.xwayland && cap != 2 && g_pSeatManager->m_state.keyboardFocus.lock() != c.human_focus.lock()) {
+            send(c, refusal("xwayland_focus_changed")); return;
+        }
+        // Every X raw listener sees agent pointer events, and a game that locks
+        // or confines the human's pointer usually reads exactly those.
+        if (c.xwayland && cap != 2 && g_pInputManager->isConstrained()) {
+            send(c, refusal("primary_constraint")); return;
         }
         if (c.route == InputRoute::primary_foreground) {
             foreground_request(c, f, cap);
@@ -1407,9 +1464,15 @@ struct InputExperiment::Impl {
                 if (!pointer_enter(c, x, y)) { send(c, refusal("client_not_bound")); return; }
                 for (auto& p : pointers) {
                     if (p->dead || !p->wl->resource() || !p->focus) continue;
-                    if (p->wl->version() >= 5) p->wl->sendAxisSource(WL_POINTER_AXIS_SOURCE_WHEEL);
-                    p->wl->sendAxis(event_ms(), static_cast<wl_pointer_axis>(axis), wl_fixed_from_double(value));
-                    if (p->wl->version() >= 5) p->wl->sendFrame();
+                    const auto wheel = [&](double amount) {
+                        if (p->wl->version() >= 5) p->wl->sendAxisSource(WL_POINTER_AXIS_SOURCE_WHEEL);
+                        p->wl->sendAxis(event_ms(), static_cast<wl_pointer_axis>(axis), wl_fixed_from_double(amount));
+                        if (p->wl->version() >= 5) p->wl->sendFrame();
+                    };
+                    // XI2 clients take the first scroll after an enter as their
+                    // baseline. With no motion to set it, an empty scroll does.
+                    if (c.xwayland) wheel(0.0);
+                    wheel(value);
                 }
             } else {
                 const auto x2 = real(f[6]), y2 = real(f[7]); const auto duration = number(f[8]);
@@ -1597,7 +1660,8 @@ struct InputExperiment::Impl {
         }
         if (pointer_target.entered()) {
             const auto surface = pointer_target.surface();
-            const auto geometry = target_geometry(pointer_target.window(), surface);
+            const auto window = pointer_target.window();
+            const auto geometry = target_geometry(window, surface, window && window->m_isX11);
             const bool bound = std::ranges::any_of(pointers, [&](const auto& p) {
                 return !p->dead && p->wl->resource() && surface && p->focus == surface;
             });
@@ -1726,7 +1790,8 @@ struct InputExperiment::ReactionGuards {
     void* plugin;
     CFunctionHook* grab = nullptr;
     CFunctionHook* drag = nullptr;
-    std::uint64_t refused_grabs = 0, refused_drags = 0;
+    std::uint64_t refused_grabs = 0, refused_drags = 0, withheld_focus = 0;
+    CHyprSignalListener open_early;
 
     ReactionGuards(InputExperiment& input, void* handle) : owner(input), plugin(handle) {
         if (live) throw std::runtime_error("input reaction guards already installed");
@@ -1735,6 +1800,15 @@ struct InputExperiment::ReactionGuards {
             reinterpret_cast<void*>(guarded_grab));
         drag = install("_ZN21CWLDataDeviceProtocol12initiateDragEN9Hyprutils6Memory12CWeakPointerI21CWLDataSourceResourceEENS1_14CSharedPointerI18CWLSurfaceResourceEES7_",
             reinterpret_cast<void*>(guarded_drag));
+        // Hyprland focuses a new window after openEarly unless this is set, and
+        // sets it itself for X menus that declare their type.
+        open_early = Event::bus()->m_events.window.openEarly.listen([this](PHLWINDOW window) {
+            if (!window || !window->m_isX11 || window->m_noInitialFocus) return;
+            if (std::ranges::any_of(owner.lanes_, [&](const auto& lane) { return lane->owns_x_reaction(window->resource()); })) {
+                window->m_noInitialFocus = true;
+                ++withheld_focus;
+            }
+        });
     }
     ~ReactionGuards() {
         if (drag) HyprlandAPI::removeFunctionHook(plugin, drag);
@@ -1830,10 +1904,11 @@ std::string InputExperiment::status_json() const {
             lane->held_button, lane->held_keys.size(), lane->drag.has_value(), pointer_focus, keyboard_focus);
     }
     // Aggregate legacy fields remain available to existing test probes.
-    return std::format(R"({{"protocol":{},"test_only":{},"seat_lifetime":"compositor","upgrade":"desktop_restart","transport_ready":{},"epoch":"{}","lease_active":{},"seat_resources":{},"pointer_resources":{},"keyboard_resources":{},"dispatches":{},"primary_background":{},"refused_popup_grabs":{},"refused_drag_starts":{},"lanes":[{}]}})",
+    return std::format(R"({{"protocol":{},"test_only":{},"seat_lifetime":"compositor","upgrade":"desktop_restart","transport_ready":{},"epoch":"{}","lease_active":{},"seat_resources":{},"pointer_resources":{},"keyboard_resources":{},"dispatches":{},"primary_background":{},"refused_popup_grabs":{},"refused_drag_starts":{},"withheld_initial_focus":{},"lanes":[{}]}})",
         kProduction ? 3 : 0, !kProduction, !lanes_[0]->suspended && !lanes_[1]->suspended, lanes_[0]->epoch, lanes_[0]->lease != nullptr || lanes_[1]->lease != nullptr,
         lanes_[0]->seats.size() + lanes_[1]->seats.size(), lanes_[0]->pointers.size() + lanes_[1]->pointers.size(),
         lanes_[0]->keyboards.size() + lanes_[1]->keyboards.size(), lanes_[0]->dispatches + lanes_[1]->dispatches,
-        kProduction, reaction_guards_ ? reaction_guards_->refused_grabs : 0, reaction_guards_ ? reaction_guards_->refused_drags : 0, states);
+        kProduction, reaction_guards_ ? reaction_guards_->refused_grabs : 0, reaction_guards_ ? reaction_guards_->refused_drags : 0,
+        reaction_guards_ ? reaction_guards_->withheld_focus : 0, states);
 }
 } // namespace cua::hyprland
