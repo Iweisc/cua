@@ -1,4 +1,4 @@
-//! Compatibility admission for native Hyprland background input.
+//! Compatibility admission for Hyprland background input.
 //! This is not a security boundary against same-user code. Unknown package
 //! versions refuse until the native operation matrix is qualified for them.
 //! Users may admit further executables they have qualified themselves.
@@ -102,11 +102,13 @@ fn package_qualified(executable: &Path) -> Result<bool, &'static str> {
         .any(|line| line == package.executable.trim_start_matches('/')))
 }
 
-pub(super) fn qualify(pid: u32) -> Result<Qualification, &'static str> {
+/// Cua's package matrix covers native windows only, so an X window of the
+/// same app still needs the user's entry.
+pub(super) fn qualify(pid: u32, xwayland: bool) -> Result<Qualification, &'static str> {
     let process_exe = PathBuf::from(format!("/proc/{pid}/exe"));
     let executable =
         std::fs::read_link(&process_exe).map_err(|_| "client_qualification_unavailable")?;
-    let qualification = if package_qualified(&executable)? {
+    let qualification = if !xwayland && package_qualified(&executable)? {
         Qualification::Package
     } else if user_list_path()
         .and_then(|path| read_bounded(&path).ok())
@@ -140,7 +142,10 @@ mod tests {
 
     #[test]
     fn nonexistent_process_cannot_be_qualified() {
-        assert_eq!(qualify(u32::MAX), Err("client_qualification_unavailable"));
+        assert_eq!(
+            qualify(u32::MAX, false),
+            Err("client_qualification_unavailable")
+        );
     }
 
     #[test]

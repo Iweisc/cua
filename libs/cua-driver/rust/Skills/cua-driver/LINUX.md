@@ -338,9 +338,37 @@ cursor. The result route remains `synthetic_events`. It refuses while your point
 keyboard focus is on that app, and during a grab, drag-and-drop, or pointer
 constraint. The plugin also withholds popup grabs and cancels drag starts that a
 background app makes in reaction to agent input, so a dropdown cannot take your
-keyboard. GTK menus need that grab and do not open in the background. XWayland
-raw background input remains outside this scope; Xwayland routes keys to the X
-focus. AT-SPI routes retain their separate behavior.
+keyboard. GTK menus need that grab and do not open in the background. AT-SPI
+routes retain their separate behavior.
+
+XWayland windows (SDL games, Wine, Java, Steam, and other apps with no
+accessibility tree) use the same tools with screenshot coordinates and stock
+XWayland. XWayland attaches every Wayland seat's devices to your X core pointer
+and keyboard, so before each action Driver gives the agent seat its own
+XInput2 master pair, focuses that keyboard on the target, and points the
+target app's X client pointer at it. The app's own grabs and focus changes then
+land on agent devices, not yours, and Driver hands the app back after it
+settles. Apps that wait for the window manager to offer focus (Wine, Java) get
+that offer before typing. List the app's executable in `hyprland-apps.txt`; the
+packaged Calc and Inkscape qualification covers native windows only.
+
+- Pointer actions refuse with `xwayland_target_covered` when another app's X
+  window covers the target at that point. X sends pointer input by X stacking,
+  and Hyprland keeps windows on hidden workspaces mapped, so this is common.
+  Keyboard actions still work there.
+- While your pointer is locked or confined, as in a game, X pointer actions
+  refuse with `primary_constraint`, because every X raw-input listener sees
+  them. Keyboard actions still work.
+- Menus and dialogs an X app opens in reaction to agent input open without
+  taking your focus, but they appear on your current workspace. Close them in
+  the same task.
+- Qt and Chromium grab every X pointer while one of their menus is open, so a
+  menu the agent opens there captures your pointer over X windows until it
+  closes.
+- With `misc:focus_on_activate` enabled, an X app that asks to be activated in
+  reaction to agent input can take your focus. It is off by default.
+- Java needs `_JAVA_AWT_WM_NONREPARENTING=1` under Hyprland, or its windows stay
+  blank.
 
 Two compositor seats, `Cua-Agent` and `Cua-Agent-2`, persist across configuration
 disable/re-enable. Each connection claims one lane, and each admitted action

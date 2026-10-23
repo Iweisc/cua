@@ -42,6 +42,9 @@ enum TargetBinding {
     // still without moving the human's focus or cursor.
     PrimaryBackground,
     Foreground,
+    // An X window, still through the agent seat. The plugin admits it only on
+    // request, after xwayland_seat has moved the seat off the human's X devices.
+    Xwayland,
 }
 
 impl TargetBinding {
@@ -50,14 +53,23 @@ impl TargetBinding {
             Self::AgentSeat => "TARGET",
             Self::PrimaryBackground => "PRIMARY_TARGET",
             Self::Foreground => "FOREGROUND_TARGET",
+            Self::Xwayland => "XWAYLAND_TARGET",
         }
     }
 
     fn acknowledgement(self) -> &'static str {
         match self {
-            Self::AgentSeat => "synthetic_events",
+            Self::AgentSeat | Self::Xwayland => "synthetic_events",
             Self::PrimaryBackground => "primary_background",
             Self::Foreground => "primary_foreground",
+        }
+    }
+
+    fn target_route(self) -> Option<&'static str> {
+        match self {
+            Self::AgentSeat => None,
+            Self::Xwayland => Some("xwayland"),
+            Self::PrimaryBackground | Self::Foreground => Some(self.acknowledgement()),
         }
     }
 }
@@ -83,9 +95,9 @@ impl DeliveryRoute {
 }
 
 fn validate_target_route(target: &Value, binding: TargetBinding) -> Result<()> {
-    if binding != TargetBinding::AgentSeat {
+    if let Some(route) = binding.target_route() {
         ensure!(
-            target["route"] == binding.acknowledgement(),
+            target["route"] == route,
             "{} target route mismatch",
             binding.command()
         );
@@ -294,7 +306,7 @@ pub fn enabled() -> bool {
 /// elsewhere.
 pub fn background_admission(pid: u32) -> std::result::Result<(), &'static str> {
     if protocol() == InputProtocol::Production {
-        super::hyprland_compatibility::qualify(pid).map(|_| ())
+        super::hyprland_compatibility::qualify(pid, false).map(|_| ())
     } else {
         Ok(())
     }
@@ -371,6 +383,9 @@ struct Client {
     protocol: InputProtocol,
     foreground_supported: bool,
     primary_background_supported: bool,
+    xwayland_supported: bool,
+    // The target is an X window; set per call from Hyprland's client list.
+    xwayland: bool,
     delivery_route: Option<DeliveryRoute>,
     // Assigned by the compositor to this connection, never by the local pool.
     lane: Option<usize>,
@@ -527,6 +542,8 @@ impl Client {
             protocol: protocol(),
             foreground_supported: false,
             primary_background_supported: false,
+            xwayland_supported: false,
+            xwayland: false,
             delivery_route: None,
             lane: None,
             owner,
@@ -567,6 +584,8 @@ impl Client {
             self.protocol == InputProtocol::Production && hello["foreground_target"] == true;
         self.primary_background_supported =
             self.protocol == InputProtocol::Production && hello["primary_background"] == true;
+        self.xwayland_supported =
+            self.protocol == InputProtocol::Production && hello["xwayland_target"] == true;
         if self.protocol == InputProtocol::Experiment {
             self.challenge = hex_field(&hello, "challenge")?;
         } else {
@@ -714,14 +733,42 @@ impl Client {
                 width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0,
                 "invalid target geometry"
             );
+            // Held until this attempt ends, so the X side is released on every path.
+            let _isolation = if binding == TargetBinding::Xwayland {
+                let field = |name| {
+                    target[name]
+                        .as_u64()
+                        .and_then(|value| u32::try_from(value).ok())
+                        .with_context(|| format!("missing XWayland {name}"))
+                };
+                let need = action.xwayland_need(width, height);
+                match super::xwayland_seat::prepare(
+                    field("seat")?,
+                    field("xid")?,
+                    (width, height),
+                    need,
+                ) {
+                    Ok(prepared) => Some(prepared),
+                    Err(code) => {
+                        let detail = super::xwayland_seat::detail(code);
+                        return Ok(json!({"ok":false,"code":code,"detail":detail}));
+                    }
+                }
+            } else {
+                None
+            };
             self.sequence = self.sequence.checked_add(1).context("sequence exhausted")?;
             let packet = action.packet(self.sequence, &token, revision, width, height)?;
             let mut reply =
                 self.dispatch_routed_with_started(&packet, is_drag, &mut started, route, binding)?;
+            // Both refusals precede any input. xwayland_focus_changed means
+            // Hyprland may have restacked X windows since the coverage check.
+            let retry = ["stale_geometry", "xwayland_focus_changed"]
+                .into_iter()
+                .any(|code| reply["code"] == code && reply["detail"] == code);
             if self.protocol == InputProtocol::Production
                 && reply["ok"] == false
-                && reply["code"] == "stale_geometry"
-                && reply["detail"] == "stale_geometry"
+                && retry
                 && reply.get("effect").is_none()
                 && reply.get("delivery").is_none()
                 && attempt < MAX_STALE_GEOMETRY_RETRIES
@@ -811,7 +858,16 @@ impl Client {
 
     fn bind_target(&self, action: &Action, route: DeliveryRoute) -> Result<(Value, TargetBinding)> {
         self.check_route(route)?;
-        let binding = route.binding();
+        let binding = if route == DeliveryRoute::Background && self.xwayland {
+            TargetBinding::Xwayland
+        } else {
+            route.binding()
+        };
+        if binding == TargetBinding::Xwayland && !self.xwayland_supported {
+            let code = super::xwayland_seat::UNAVAILABLE;
+            let detail = "this plugin build cannot target X windows";
+            return Ok((json!({"ok":false,"code":code,"detail":detail}), binding));
+        }
         let target = self.request(&self.target_packet(action, binding))?;
         if target["ok"] != true {
             return Ok((target, binding));
@@ -844,6 +900,22 @@ impl Client {
 }
 
 impl Action {
+    fn scroll_point(point: Option<(f64, f64)>, width: f64, height: f64) -> (f64, f64) {
+        point.unwrap_or((width / 2.0, height / 2.0))
+    }
+
+    fn xwayland_need(&self, width: f64, height: f64) -> super::xwayland_seat::Need {
+        use super::xwayland_seat::Need;
+        let (x, y) = match self {
+            Self::Activate | Self::Key { .. } | Self::TextKey { .. } => return Need::Keyboard,
+            Self::Click { x, y, .. } => (*x, *y),
+            Self::Scroll { point, .. } => Self::scroll_point(*point, width, height),
+            // An implicit grab keeps the rest of the drag on the pressed window.
+            Self::Drag { from, .. } => *from,
+        };
+        Need::Pointer { x, y }
+    }
+
     fn capability(&self) -> u8 {
         match self {
             Self::Activate => 16,
@@ -915,7 +987,7 @@ impl Action {
                 direction,
                 amount,
             } => {
-                let (x, y) = (*position).unwrap_or((width / 2.0, height / 2.0));
+                let (x, y) = Self::scroll_point(*position, width, height);
                 point(x, y)?;
                 ensure!((1..=100).contains(amount), "unsupported scroll amount");
                 let (axis, sign) = match direction.as_str() {
@@ -1270,15 +1342,18 @@ fn execute_actions_routed(
         route == DeliveryRoute::Background || protocol() == InputProtocol::Production,
         "foreground input requires production protocol; no downgrade is permitted"
     );
-    let qualification =
-        if route == DeliveryRoute::Background && protocol() == InputProtocol::Production {
-            match super::hyprland_compatibility::qualify(pid) {
-                Ok(qualification) => Some(qualification),
-                Err(reason) => return Ok(json!({"ok":false,"code":reason,"detail":reason})),
-            }
-        } else {
-            None
-        };
+    let isolated = route == DeliveryRoute::Background && protocol() == InputProtocol::Production;
+    let xwayland = isolated
+        && super::hyprland::window_for_address(address)
+            .is_some_and(|window| window.pid == pid && window.xwayland == Some(true));
+    let qualification = if isolated {
+        match super::hyprland_compatibility::qualify(pid, xwayland) {
+            Ok(qualification) => Some(qualification),
+            Err(reason) => return Ok(json!({"ok":false,"code":reason,"detail":reason})),
+        }
+    } else {
+        None
+    };
     let client = session_client(&owner)?;
     let mut slot = client.lock(&cancellation)?;
     if let Some(client) = slot.as_ref() {
@@ -1304,9 +1379,9 @@ fn execute_actions_routed(
             )
         })?);
     }
-    slot.as_mut()
-        .context("missing input connection")?
-        .cancellation = cancellation;
+    let connected = slot.as_mut().context("missing input connection")?;
+    connected.cancellation = cancellation;
+    connected.xwayland = xwayland;
     let mut reply =
         dispatch_actions_in_slot(&mut slot, actions, started, route, text, Client::attest)?;
     if let Some(qualification) = qualification {
@@ -2049,6 +2124,138 @@ mod tests {
         server.join().unwrap();
     }
 
+    fn click() -> Action {
+        Action::Click {
+            x: 10.0,
+            y: 20.0,
+            button: 1,
+            count: 1,
+        }
+    }
+
+    fn assert_peer_receives_nothing_more(peer: &socket2::Socket) {
+        let mut byte = [0u8];
+        assert_eq!(
+            unsafe { libc::recv(peer.as_raw_fd(), byte.as_mut_ptr().cast(), 1, 0) },
+            0
+        );
+    }
+
+    // These stop at the plugin's replies: reaching xwayland_seat::prepare would
+    // open the developer's real X display.
+    #[test]
+    fn x_windows_bind_only_through_xwayland_target() {
+        let (mut client, peer) = production_test_client();
+        client.xwayland = true;
+        client.xwayland_supported = true;
+        client.primary_background_supported = true;
+        let server = std::thread::spawn(move || {
+            assert_eq!(read_packet(&peer), "XWAYLAND_TARGET 1 1 1");
+            peer.send(
+                br#"{"ok":false,"code":"primary_target_busy","detail":"primary_target_busy"}"#,
+            )
+            .unwrap();
+            assert_peer_receives_nothing_more(&peer);
+        });
+        let reply = client
+            .execute_routed_with_attest(
+                click(),
+                None,
+                DeliveryRoute::Background,
+                record_test_attestation,
+            )
+            .unwrap();
+        assert_eq!(reply["code"], "primary_target_busy");
+        drop(client);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn unadvertised_xwayland_target_refuses_without_a_packet() {
+        let (mut client, peer) = production_test_client();
+        client.xwayland = true;
+        let reply = client
+            .execute_routed_with_attest(
+                click(),
+                None,
+                DeliveryRoute::Background,
+                record_test_attestation,
+            )
+            .unwrap();
+        assert_eq!(reply["code"], "xwayland_unavailable");
+        drop(client);
+        assert_peer_receives_nothing_more(&peer);
+    }
+
+    #[test]
+    fn xwayland_admission_without_seat_or_route_sends_no_action() {
+        for reply in [
+            json!({"ok":true,"target":TOKEN,"revision":1,"width":100,"height":100,"route":"xwayland","xid":7}),
+            json!({"ok":true,"target":TOKEN,"revision":1,"width":100,"height":100,"seat":71,"xid":7}),
+        ] {
+            let (mut client, peer) = production_test_client();
+            client.xwayland = true;
+            client.xwayland_supported = true;
+            let server = std::thread::spawn(move || {
+                assert_eq!(read_packet(&peer), "XWAYLAND_TARGET 1 1 1");
+                peer.send(reply.to_string().as_bytes()).unwrap();
+                assert_peer_receives_nothing_more(&peer);
+            });
+            let error = client
+                .execute_routed_with_attest(
+                    click(),
+                    None,
+                    DeliveryRoute::Background,
+                    record_test_attestation,
+                )
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error == "missing XWayland seat" || error.contains("target route mismatch"),
+                "{error}"
+            );
+            drop(client);
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn xwayland_needs_follow_the_action_kind() {
+        use super::super::xwayland_seat::Need;
+        let need = |action: Action| action.xwayland_need(200.0, 100.0);
+        assert_eq!(need(click()), Need::Pointer { x: 10.0, y: 20.0 });
+        assert_eq!(
+            need(Action::Scroll {
+                point: None,
+                direction: "down".into(),
+                amount: 1
+            }),
+            Need::Pointer { x: 100.0, y: 50.0 }
+        );
+        assert_eq!(
+            need(Action::Drag {
+                from: (1.0, 2.0),
+                to: (3.0, 4.0),
+                duration_ms: 100
+            }),
+            Need::Pointer { x: 1.0, y: 2.0 }
+        );
+        assert_eq!(
+            need(Action::Key {
+                key: "a".into(),
+                modifiers: vec![]
+            }),
+            Need::Keyboard
+        );
+        assert_eq!(
+            need(Action::TextKey {
+                keycode: 30,
+                shift: false
+            }),
+            Need::Keyboard
+        );
+    }
+
     #[test]
     fn foreground_requires_advertisement_and_production_without_sending_target() {
         for protocol in [InputProtocol::Production, InputProtocol::Experiment] {
@@ -2219,7 +2426,7 @@ mod tests {
             assert_eq!(read_packet(&peer), "HELLO");
             peer.send(
                 json!({"ok":true,"protocol":3,"epoch":TOKEN,"foreground_target":true,
-                    "primary_background":true})
+                    "primary_background":true,"xwayland_target":true})
                 .to_string()
                 .as_bytes(),
             )
@@ -2230,6 +2437,7 @@ mod tests {
         assert!(client.handshake(0).unwrap());
         assert!(client.foreground_supported);
         assert!(client.primary_background_supported);
+        assert!(client.xwayland_supported);
         server.join().unwrap();
     }
 
@@ -2921,6 +3129,8 @@ mod tests {
                 protocol: InputProtocol::Experiment,
                 foreground_supported: false,
                 primary_background_supported: false,
+                xwayland_supported: false,
+                xwayland: false,
                 delivery_route: None,
                 lane: None,
                 owner: "input-unregistered-test-client".into(),
