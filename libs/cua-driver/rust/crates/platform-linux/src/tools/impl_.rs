@@ -2768,6 +2768,21 @@ fn require_point_args(tool: &str, args: &Value) -> Option<ToolResult> {
 #[cfg(test)]
 mod pointer_argument_tests;
 
+#[cfg(test)]
+#[test]
+fn non_ax_escalation_stays_in_the_background_where_hyprland_can_address_the_window() {
+    assert_eq!(non_ax_escalation_for(true, true)["recommended"], "px");
+    assert_eq!(
+        non_ax_escalation_for(true, false)["recommended"],
+        "foreground"
+    );
+    assert_eq!(non_ax_escalation_for(false, false)["recommended"], "px");
+    assert!(non_ax_escalation_for(true, true)["reason"]
+        .as_str()
+        .unwrap()
+        .contains("delivery_mode:\"background\""));
+}
+
 fn parse_mouse_button(name: &str) -> u8 {
     match name {
         "right" => 3,
@@ -2784,9 +2799,25 @@ fn parse_mouse_button(name: &str) -> u8 {
 /// background-target an unfocused window (libei injects to the compositor's input
 /// focus — see `input::delivery`), and the pixel path itself routes through the
 /// same coordinate-free AT-SPI actuation that just no-op'd, so the move there is
-/// to bring the window to the foreground first (`foreground`).
+/// to bring the window to the foreground first (`foreground`). Hyprland's
+/// plugin is the exception: it addresses one window, native or XWayland.
 fn non_ax_escalation() -> Value {
-    if crate::wayland::is_wayland() {
+    non_ax_escalation_for(
+        crate::wayland::is_wayland(),
+        crate::wayland::hyprland_input::enabled(),
+    )
+}
+
+fn non_ax_escalation_for(wayland: bool, hyprland_input: bool) -> Value {
+    if wayland && hyprland_input {
+        json!({
+            "recommended": "px",
+            "reason": "non-AX surface — act by pixel (x,y) off the screenshot in this \
+                       response, keeping delivery_mode:\"background\". Hyprland's plugin \
+                       addresses this window directly for a qualified app (see \
+                       hyprland-apps.txt). A refusal is not a reason to bring it forward."
+        })
+    } else if wayland {
         json!({
             "recommended": "foreground",
             "reason": "non-AX surface on Wayland: a specific unfocused window can't be \
