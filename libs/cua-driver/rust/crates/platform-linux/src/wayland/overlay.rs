@@ -16,6 +16,11 @@
 //! EventQueue + layer surface; commands flow in over a `crossbeam-channel`.
 //! The render core wakes at frame cadence only while pixels can change;
 //! stable or hidden state performs only a cheap, one-second topology check.
+//!
+//! Layer-shell surfaces sit above every window. With Cua's Hyprland input
+//! plugin, cursors pinned to a window are drawn in a separate layer named
+//! after that window, and the plugin draws that layer directly above the
+//! window, as macOS orders its overlay above the target.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{
@@ -194,17 +199,20 @@ struct OverlayState {
     layer_shell: Option<ZwlrLayerShellV1>,
     xdg_output_manager: Option<ZxdgOutputManagerV1>,
     outputs: HashMap<u32, NativeOutput>,
-    /// Outputs whose most recently committed buffer contains cursor pixels.
-    /// Usually this contains exactly one output; keeping a set makes hide,
-    /// removal, and topology changes clear every previously painted surface.
-    painted_outputs: HashSet<u32>,
+    /// Layers, by output and group, whose most recently committed buffer
+    /// contains cursor pixels. Usually this contains exactly one layer;
+    /// keeping a set makes hide, removal, and topology changes clear every
+    /// previously painted surface.
+    painted: HashSet<(u32, Group)>,
     /// Configured layer surfaces that have received at least one wl_buffer.
-    /// This is intentionally separate from `painted_outputs`: every new or
+    /// This is intentionally separate from `painted`: every new or
     /// reconfigured surface needs a one-shot transparent commit to complete
     /// its layer-shell handshake, but stable empty surfaces must not trigger
     /// recurring full-output SHM redraws.
-    initialized_outputs: HashSet<u32>,
+    initialized: HashSet<(u32, Group)>,
     topology_dirty: bool,
+    /// Whether pinned cursors get their own layer per target window.
+    stack_with_windows: bool,
     /// The shared keyed render map (`cursor_overlay::RenderMap`) gives this
     /// backend the same lifecycle as every other platform: removing a named
     /// key tombstones it, so already-queued late commands cannot recreate a
@@ -232,6 +240,25 @@ struct NativeOutput {
     scale: i32,
     name: Option<String>,
     closed: bool,
+    /// One layer per Hyprland window a cursor is pinned above.
+    pinned: HashMap<u64, PinnedLayer>,
+}
+
+/// The layer a cursor is drawn in: `None` for the layer above every window,
+/// or the window its cursor is pinned above.
+type Group = Option<u64>;
+
+struct PinnedLayer {
+    surface: WlSurface,
+    layer_surface: ZwlrLayerSurfaceV1,
+    configured: bool,
+}
+
+impl PinnedLayer {
+    fn destroy(self) {
+        self.layer_surface.destroy();
+        self.surface.destroy();
+    }
 }
 
 impl NativeOutput {
@@ -249,6 +276,7 @@ impl NativeOutput {
             scale: 1,
             name: None,
             closed: false,
+            pinned: HashMap::new(),
         }
     }
 
@@ -273,6 +301,9 @@ impl NativeOutput {
 
     fn destroy_surfaces(&mut self) {
         self.close_layer();
+        for (_, layer) in self.pinned.drain() {
+            layer.destroy();
+        }
         if let Some(xdg_output) = self.xdg_output.take() {
             xdg_output.destroy();
         }
@@ -318,6 +349,7 @@ struct OutputData {
 #[derive(Clone, Copy)]
 struct LayerData {
     id: u32,
+    group: Group,
 }
 
 // SAFETY: the raw pointers in pending_buffers point at mmap regions owned
@@ -344,9 +376,10 @@ impl OverlayState {
             layer_shell: None,
             xdg_output_manager: None,
             outputs: HashMap::new(),
-            painted_outputs: HashSet::new(),
-            initialized_outputs: HashSet::new(),
+            painted: HashSet::new(),
+            initialized: HashSet::new(),
             topology_dirty: false,
+            stack_with_windows: false,
             // The default slot preserves the launch-time cursor id, while
             // lazily-created named slots take their key as the id.
             render: WlRenderMap::new(template, ()),
@@ -524,6 +557,125 @@ fn visible_cores_for_output<'a>(
     visible_cores
 }
 
+/// The layer this cursor is drawn in. The window id is a Hyprland address
+/// whenever `stack_with_windows` is set.
+fn cursor_group(core: &RenderStateCore, stack_with_windows: bool) -> Group {
+    core.pinned_wid
+        .filter(|&wid| stack_with_windows && wid != 0)
+}
+
+/// The plugin parses this name in `hyprland-plugin/src/cursor_layer.hpp`.
+fn layer_namespace(group: Group) -> String {
+    match group {
+        None => "cua-agent-cursor".to_owned(),
+        Some(wid) => format!("cua-agent-cursor@{wid:x}"),
+    }
+}
+
+fn visible_cores_for_layer<'a>(
+    cores: &'a CursorMap<RenderStateCore>,
+    layouts: &[OutputLayout],
+    output_id: u32,
+    group: Group,
+    stack_with_windows: bool,
+) -> Vec<(&'a CursorKey, &'a RenderStateCore)> {
+    let mut visible = visible_cores_for_output(cores, layouts, output_id);
+    visible.retain(|(_, core)| cursor_group(core, stack_with_windows) == group);
+    visible
+}
+
+/// A layer no cursor is pinned to any more is dropped once its clearing
+/// frame is committed, so its last frame never lingers or fades out.
+fn keep_pinned_layer(
+    output_id: u32,
+    wid: u64,
+    pinned: &HashSet<u64>,
+    painted: &HashSet<(u32, Group)>,
+) -> bool {
+    pinned.contains(&wid) || painted.contains(&(output_id, Some(wid)))
+}
+
+fn create_layer(
+    compositor: &WlCompositor,
+    layer_shell: &ZwlrLayerShellV1,
+    output: &WlOutput,
+    data: LayerData,
+    qh: &QueueHandle<OverlayState>,
+) -> (WlSurface, ZwlrLayerSurfaceV1) {
+    let surface = compositor.create_surface(qh, ());
+    let layer_surface = layer_shell.get_layer_surface(
+        &surface,
+        Some(output),
+        Layer::Overlay,
+        layer_namespace(data.group),
+        qh,
+        data,
+    );
+    layer_surface.set_anchor(Anchor::Top | Anchor::Bottom | Anchor::Left | Anchor::Right);
+    layer_surface.set_size(0, 0);
+    layer_surface.set_exclusive_zone(-1);
+    layer_surface.set_keyboard_interactivity(KeyboardInteractivity::None);
+
+    let region: WlRegion = compositor.create_region(qh, ());
+    surface.set_input_region(Some(&region));
+    region.destroy();
+
+    surface.commit();
+    (surface, layer_surface)
+}
+
+/// Give every configured output a layer for each window a cursor is pinned
+/// above, and drop the layers no cursor needs.
+fn sync_pinned_layers(state: &mut OverlayState, qh: &QueueHandle<OverlayState>) {
+    let (Some(compositor), Some(layer_shell)) =
+        (state.compositor.clone(), state.layer_shell.clone())
+    else {
+        return;
+    };
+    let pinned: HashSet<u64> = state
+        .render
+        .cursors
+        .values()
+        .filter_map(|core| cursor_group(core, state.stack_with_windows))
+        .collect();
+    for (&id, output) in state.outputs.iter_mut() {
+        let dropped: Vec<u64> = output
+            .pinned
+            .keys()
+            .copied()
+            .filter(|&wid| !keep_pinned_layer(id, wid, &pinned, &state.painted))
+            .collect();
+        for wid in dropped {
+            if let Some(layer) = output.pinned.remove(&wid) {
+                layer.destroy();
+            }
+            state.initialized.remove(&(id, Some(wid)));
+        }
+        if output.layout(id).is_none() {
+            continue;
+        }
+        for &wid in &pinned {
+            if output.pinned.contains_key(&wid) {
+                continue;
+            }
+            let data = LayerData {
+                id,
+                group: Some(wid),
+            };
+            let (surface, layer_surface) =
+                create_layer(&compositor, &layer_shell, &output.output, data, qh);
+            output.pinned.insert(
+                wid,
+                PinnedLayer {
+                    surface,
+                    layer_surface,
+                    configured: false,
+                },
+            );
+        }
+    }
+}
+
 fn ensure_output_resources(state: &mut OverlayState, qh: &QueueHandle<OverlayState>) {
     let ids: Vec<u32> = state.outputs.keys().copied().collect();
     for id in ids {
@@ -557,25 +709,9 @@ fn ensure_layer_surface(state: &mut OverlayState, id: u32, qh: &QueueHandle<Over
         return;
     }
 
-    let surface = compositor.create_surface(qh, ());
-    let layer_surface = layer_shell.get_layer_surface(
-        &surface,
-        Some(&output.output),
-        Layer::Overlay,
-        "cua-agent-cursor".to_string(),
-        qh,
-        LayerData { id },
-    );
-    layer_surface.set_anchor(Anchor::Top | Anchor::Bottom | Anchor::Left | Anchor::Right);
-    layer_surface.set_size(0, 0);
-    layer_surface.set_exclusive_zone(-1);
-    layer_surface.set_keyboard_interactivity(KeyboardInteractivity::None);
-
-    let region: WlRegion = compositor.create_region(qh, ());
-    surface.set_input_region(Some(&region));
-    region.destroy();
-
-    surface.commit();
+    let data = LayerData { id, group: None };
+    let (surface, layer_surface) =
+        create_layer(&compositor, &layer_shell, &output.output, data, qh);
     output.surface = Some(surface);
     output.layer_surface = Some(layer_surface);
 }
@@ -616,6 +752,7 @@ fn wait_for_renderer_command(
 fn owner_thread(rx: Receiver<WlOverlayCmd>) -> anyhow::Result<()> {
     let template = CONFIG_TEMPLATE.get().cloned().unwrap_or_default();
     let mut state = OverlayState::new(template);
+    state.stack_with_windows = super::hyprland_input::enabled();
     let Some(first_command) = wait_for_renderer_command(&rx, &mut state) else {
         return Ok(());
     };
@@ -778,6 +915,7 @@ fn owner_thread(rx: Receiver<WlOverlayCmd>) -> anyhow::Result<()> {
         let next_frame_tick_needed = any_core_needs_frame_tick(&state.render.cursors);
         if dirty || frame_tick_needed || next_frame_tick_needed {
             redraw(&mut state, &shm, &qh)?;
+            sync_pinned_layers(&mut state, &qh);
             // Flush the committed frame and dispatch wl_buffer.release before
             // parking. The buffer map remains authoritative until release, so
             // no mmap/fd can be reclaimed while the compositor still uses it.
@@ -905,16 +1043,59 @@ fn redraw(
         .iter()
         .filter_map(|(&id, output)| output.layout(id))
         .collect();
+    let mut groups: Vec<Group> = state
+        .outputs
+        .values()
+        .flat_map(|output| output.pinned.keys().copied().map(Some))
+        .collect();
+    groups.push(None);
+    groups.sort_unstable();
+    groups.dedup();
+    for group in groups {
+        redraw_group(state, shm, qh, &layouts, group)?;
+    }
+    Ok(())
+}
+
+fn redraw_group(
+    state: &mut OverlayState,
+    shm: &WlShm,
+    qh: &QueueHandle<OverlayState>,
+    layouts: &[OutputLayout],
+    group: Group,
+) -> anyhow::Result<()> {
+    let stack = state.stack_with_windows;
+    // A pinned group paints only on outputs whose layer for it is configured.
+    let layouts: Vec<OutputLayout> = layouts
+        .iter()
+        .filter(|layout| {
+            group.is_none_or(|wid| {
+                state.outputs[&layout.id]
+                    .pinned
+                    .get(&wid)
+                    .is_some_and(|layer| layer.configured)
+            })
+        })
+        .copied()
+        .collect();
+    let in_group =
+        |core: &&RenderStateCore| core.is_revealed() && cursor_group(core, stack) == group;
+    let of_group = |set: &HashSet<(u32, Group)>| -> HashSet<u32> {
+        set.iter()
+            .filter(|(_, g)| *g == group)
+            .map(|(id, _)| *id)
+            .collect()
+    };
     let cursor_positions = state
         .render
         .cursors
         .values()
-        .filter(|core| core.is_revealed())
+        .filter(in_group)
         .map(|core| core.pos);
     let (mut selected, mut targets) = frame_plan(
         &layouts,
-        &state.painted_outputs,
-        &state.initialized_outputs,
+        &of_group(&state.painted),
+        &of_group(&state.initialized),
         cursor_positions,
     );
     // Each surface is a full-output buffer with full damage, so effects on the
@@ -925,7 +1106,7 @@ fn redraw(
         .render
         .cursors
         .values()
-        .filter(|core| core.is_revealed())
+        .filter(in_group)
         .filter_map(|core| core.effect_bounds());
     for id in effect_spill_outputs(&layouts, effect_rects) {
         if selected.insert(id) && !targets.iter().any(|target| target.id == id) {
@@ -934,10 +1115,13 @@ fn redraw(
     }
 
     for target in targets {
-        redraw_output(state, shm, qh, target, &layouts)?;
+        redraw_output(state, shm, qh, target, group, &layouts)?;
     }
 
-    state.painted_outputs = selected;
+    state.painted.retain(|(_, g)| *g != group);
+    state
+        .painted
+        .extend(selected.into_iter().map(|id| (id, group)));
     Ok(())
 }
 
@@ -946,13 +1130,21 @@ fn redraw_output(
     shm: &WlShm,
     qh: &QueueHandle<OverlayState>,
     target: FrameTarget,
+    group: Group,
     layouts: &[OutputLayout],
 ) -> anyhow::Result<()> {
-    let Some((surface, layout)) = state
-        .outputs
-        .get(&target.id)
-        .and_then(|output| Some((output.surface.clone()?, output.layout(target.id)?)))
-    else {
+    let Some((surface, layout)) = state.outputs.get(&target.id).and_then(|output| {
+        let surface = match group {
+            None => output.surface.clone()?,
+            Some(wid) => output
+                .pinned
+                .get(&wid)
+                .filter(|layer| layer.configured)?
+                .surface
+                .clone(),
+        };
+        Some((surface, output.layout(target.id)?))
+    }) else {
         return Ok(());
     };
     let w = layout.width.max(1);
@@ -995,7 +1187,13 @@ fn redraw_output(
     {
         // HashMap iteration is intentionally normalized by key so overlapping
         // named cursors composite deterministically from frame to frame.
-        for (_, core) in visible_cores_for_output(&state.render.cursors, layouts, target.id) {
+        for (_, core) in visible_cores_for_layer(
+            &state.render.cursors,
+            layouts,
+            target.id,
+            group,
+            state.stack_with_windows,
+        ) {
             cursor_overlay::paint_cursor(
                 &mut pm,
                 core,
@@ -1067,11 +1265,13 @@ fn redraw_output(
     state.pending_buffers.insert(buffer_id, (ptr, size, fd));
 
     dbg(&format!(
-        "redraw output={} origin=({}, {}) w={w} h={h} stride={stride} buf_id={buffer_id} cursors={}",
+        "redraw output={} group={} origin=({}, {}) w={w} h={h} stride={stride} buf_id={buffer_id} cursors={} pending={}",
         output_label(state, target.id),
+        layer_namespace(group),
         layout.origin_x,
         layout.origin_y,
         painted_positions.len(),
+        state.pending_buffers.len(),
     ));
     surface.attach(Some(&buffer), 0, 0);
     // Damage both coordinate spaces. Some wlroots compositors otherwise leave
@@ -1081,7 +1281,7 @@ fn redraw_output(
     surface.commit();
     // Mark initialized only after the buffer attach + surface commit succeed.
     // An early return above leaves the output pending for the next plan.
-    state.initialized_outputs.insert(target.id);
+    state.initialized.insert((target.id, group));
     pool.destroy();
     Ok(())
 }
@@ -1152,8 +1352,8 @@ impl Dispatch<wl_registry::WlRegistry, ()> for OverlayState {
                 ensure_output_resources(state, qh);
             }
             wl_registry::Event::GlobalRemove { name } => {
-                state.painted_outputs.remove(&name);
-                state.initialized_outputs.remove(&name);
+                state.painted.retain(|(id, _)| *id != name);
+                state.initialized.retain(|(id, _)| *id != name);
                 if let Some(mut output) = state.outputs.remove(&name) {
                     output.destroy_surfaces();
                     // wl_output.release was added in v3. On an older generic
@@ -1298,6 +1498,18 @@ impl Dispatch<ZwlrLayerSurfaceV1, LayerData> for OverlayState {
                 height,
             } => {
                 layer.ack_configure(serial);
+                if let Some(wid) = data.group {
+                    if let Some(pinned) = state
+                        .outputs
+                        .get_mut(&data.id)
+                        .and_then(|output| output.pinned.get_mut(&wid))
+                    {
+                        pinned.configured = true;
+                        state.initialized.remove(&(data.id, data.group));
+                        state.topology_dirty = true;
+                    }
+                    return;
+                }
                 if let Some(output) = state.outputs.get_mut(&data.id) {
                     output.closed = false;
                     let fallback = output.logical_size.or(output.mode_size).unwrap_or((1, 1));
@@ -1308,14 +1520,25 @@ impl Dispatch<ZwlrLayerSurfaceV1, LayerData> for OverlayState {
                     // Each configure starts a new layer-surface buffer cycle.
                     // Queue exactly one matching clear/paint frame even when
                     // the compositor repeats the same logical size.
-                    state.initialized_outputs.remove(&data.id);
+                    state.initialized.remove(&(data.id, None));
                     state.topology_dirty = true;
                     output.configured_size = Some(configured_size);
                 }
             }
             zwlr_layer_surface_v1::Event::Closed => {
-                state.painted_outputs.remove(&data.id);
-                state.initialized_outputs.remove(&data.id);
+                state.painted.remove(&(data.id, data.group));
+                state.initialized.remove(&(data.id, data.group));
+                if let Some(wid) = data.group {
+                    if let Some(layer) = state
+                        .outputs
+                        .get_mut(&data.id)
+                        .and_then(|output| output.pinned.remove(&wid))
+                    {
+                        layer.destroy();
+                        state.topology_dirty = true;
+                    }
+                    return;
+                }
                 if let Some(output) = state.outputs.get_mut(&data.id) {
                     output.closed = true;
                     output.close_layer();
@@ -1524,6 +1747,53 @@ mod tests {
         assert_eq!(select_output(&layouts, 400.0, 300.0).unwrap().id, 4);
         assert_eq!(visible_cores_for_output(&cores, &layouts, 4).len(), 1);
         assert!(visible_cores_for_output(&cores, &layouts, 8).is_empty());
+    }
+
+    #[test]
+    fn pinned_cursors_get_a_layer_named_after_their_window_only_when_stacking() {
+        let mut core = positioned_core();
+        assert_eq!(cursor_group(&core, true), None);
+        core.pinned_wid = Some(0);
+        assert_eq!(cursor_group(&core, true), None);
+        core.pinned_wid = Some(0x55d0_c1a2_b3f0);
+        assert_eq!(cursor_group(&core, false), None);
+        assert_eq!(cursor_group(&core, true), Some(0x55d0_c1a2_b3f0));
+        // hyprland-plugin/tests/cursor_layer_test.cpp parses this exact name.
+        assert_eq!(
+            layer_namespace(Some(0x55d0_c1a2_b3f0)),
+            "cua-agent-cursor@55d0c1a2b3f0"
+        );
+        assert_eq!(layer_namespace(None), "cua-agent-cursor");
+    }
+
+    #[test]
+    fn cursors_sharing_an_output_paint_only_into_their_own_window_layer() {
+        let layouts = three_monitor_layout();
+        let mut a = positioned_core();
+        a.pinned_wid = Some(0xa);
+        let mut b = positioned_core();
+        b.pinned_wid = Some(0xb);
+        let cores = CursorMap::from([("a".to_owned(), a), ("b".to_owned(), b)]);
+        let keys = |group, stack| {
+            visible_cores_for_layer(&cores, &layouts, 1, group, stack)
+                .into_iter()
+                .map(|(key, _)| key.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(keys(Some(0xa), true), vec!["a"]);
+        assert_eq!(keys(Some(0xb), true), vec!["b"]);
+        assert!(keys(None, true).is_empty());
+        assert_eq!(keys(None, false), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn an_unpinned_layer_is_dropped_only_after_its_clearing_frame() {
+        let pinned = HashSet::from([0xa]);
+        let painted = HashSet::from([(1, Some(0xb))]);
+        assert!(keep_pinned_layer(1, 0xa, &pinned, &HashSet::new()));
+        assert!(keep_pinned_layer(1, 0xb, &pinned, &painted));
+        assert!(!keep_pinned_layer(2, 0xb, &pinned, &painted));
+        assert!(!keep_pinned_layer(1, 0xc, &pinned, &painted));
     }
 
     #[test]
