@@ -1945,7 +1945,16 @@ struct InputExperiment::CursorStacking {
         // next action instead of pointing at another spot.
         live->pins.release_moved(w, goal_box(w), close_layer);
         // The cursor slides with its window when the workspace changes.
-        const auto offset = w->m_pinned || !w->m_workspace ? Vector2D{} : w->m_workspace->m_renderOffset->value();
+        const auto workspace = w->m_workspace;
+        const auto offset = w->m_pinned || !workspace ? Vector2D{} : workspace->m_renderOffset->value();
+        // Hyprland's fade alpha for the window's main pass, so the cursor
+        // fades with it, a special workspace included. Opacity rules style
+        // the window, not the cursor, and are left out.
+        using enum Desktop::View::eWindowAlpha;
+        const bool moving_out = w->m_monitorMovedFrom != -1 && (!workspace || !workspace->isVisible());
+        const float fade = w->alphaValue(WINDOW_ALPHA_FADE) * w->alphaValue(WINDOW_ALPHA_FULLSCREEN) * w->alphaValue(WINDOW_ALPHA_LAYOUT) *
+            (w->m_pinned || moving_out || !workspace ? 1.F : workspace->m_alpha->value()) *
+            (moving_out ? w->alphaValue(WINDOW_ALPHA_MOVE_TO_WORKSPACE) : 1.F) * w->alphaValue(WINDOW_ALPHA_MOVE_FROM_WORKSPACE);
         for (const auto& ref : monitor->m_layerSurfaceLayers[ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY]) {
             const auto ls = ref.lock();
             if (!ls || !ls->m_mapped || !live->pins.above(ls, w)) continue;
@@ -1962,6 +1971,7 @@ struct InputExperiment::CursorStacking {
             data.w = ls->m_geometry.w;
             data.h = ls->m_geometry.h;
             data.pLS = ls;
+            data.fadeAlpha = fade;
             data.clipBox = CBox{0, 0, monitor->m_size.x, monitor->m_size.y}.scale(monitor->m_scale).round();
             self->addPassElement(makeUnique<CSurfacePassElement>(data));
         }

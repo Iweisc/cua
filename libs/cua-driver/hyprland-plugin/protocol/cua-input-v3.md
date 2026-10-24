@@ -276,7 +276,8 @@ toggle), the plugin sends the layer `zwlr_layer_surface_v1.closed`. Driver
 then stops drawing the cursors pinned to that address and opens no layer for
 them until it pins them again. A cursor therefore never moves onto a window
 that took its target's address, and never stays at a point its moved target
-left.
+left. The cursor fades with the window's fade alpha, including a special
+workspace fading in or out, but not with its opacity rules.
 
 ## XWayland extension
 
