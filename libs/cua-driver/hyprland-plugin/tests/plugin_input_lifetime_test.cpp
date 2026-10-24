@@ -38,6 +38,7 @@ namespace cua::hyprland {
 struct InputExperiment::Impl {};
 struct InputExperiment::DesktopListeners {};
 struct InputExperiment::ReactionGuards {};
+struct InputExperiment::StateRequests {};
 struct InputExperiment::CursorStacking {};
 class PrimaryTrace {};
 InputExperiment::InputExperiment(const std::string&, void*) { ++created; }

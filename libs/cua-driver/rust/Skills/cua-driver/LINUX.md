@@ -367,8 +367,19 @@ Moving your pointer over it does not focus it, because Hyprland draws floating
 windows over tiled ones and it may open under your pointer. Click it to type
 into it. On your workspace it stacks under your window, though it can still
 cover part of a tiled one. A dialog of your own window still opens on your
-workspace and takes your focus. Close such windows in the same task. With
-`misc:focus_on_activate` enabled, an app that asks to be
+workspace and takes your focus. Close such windows in the same task. An app
+that asks to go fullscreen or maximized in reaction to agent input, through
+F11, a page's fullscreen button, a title-bar double-click, or a drag on its tab
+strip, never changes size on a workspace you can see, and never ends your
+fullscreen or maximized window or takes your focus. A native Wayland app is
+told it is fullscreen and draws that inside its own window: F11 hides a
+browser's toolbars, Chromium shows a page's fullscreen video in the window, and
+Firefox reports the page's fullscreen request as failed. The agent's F11 or
+Escape there ends it. On a hidden workspace without another fullscreen or
+maximized window, the app goes fullscreen there and stays on that workspace.
+Your own F11, double-click, and fullscreen buttons work as usual. An agent
+drag on a title bar or tab strip never moves or resizes the window, on any
+route. With `misc:focus_on_activate` enabled, an app that asks to be
 activated in reaction to agent input can still take your focus. It is off by
 default. An agent click or scroll at `x`/`y` goes to what the window draws
 there, as your pointer would: its open menu, popover, or dropdown list when one

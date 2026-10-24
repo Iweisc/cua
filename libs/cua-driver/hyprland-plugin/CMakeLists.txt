@@ -133,6 +133,12 @@ if(BUILD_TESTING)
     target_compile_options(cua_hyprland_reaction_window_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
     add_test(NAME cua_hyprland_reaction_window_test COMMAND cua_hyprland_reaction_window_test)
 
+    add_executable(cua_hyprland_state_request_test tests/state_request_test.cpp)
+    target_compile_features(cua_hyprland_state_request_test PRIVATE cxx_std_26)
+    target_include_directories(cua_hyprland_state_request_test PRIVATE src)
+    target_compile_options(cua_hyprland_state_request_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    add_test(NAME cua_hyprland_state_request_test COMMAND cua_hyprland_state_request_test)
+
     add_test(NAME cua_hyprland_cmake_api_test
         COMMAND ${CMAKE_COMMAND}
             -S ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake-api

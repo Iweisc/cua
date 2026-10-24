@@ -13,6 +13,7 @@
 #include "cursor_layer.hpp"
 #include "target_identity.hpp"
 #include "reaction_window.hpp"
+#include "state_request.hpp"
 #include "pointer_hit.hpp"
 
 #include <src/Compositor.hpp>
@@ -1038,13 +1039,16 @@ struct InputExperiment::Impl {
                 p->sendButton(event_ms(), code, pressed ? WL_POINTER_BUTTON_STATE_PRESSED : WL_POINTER_BUTTON_STATE_RELEASED);
                 p->sendFrame();
             }
-        // sendButton records the press as a move/resize serial for this seat.
-        // An agent press must never let the client start a compositor
-        // move/resize that follows the human's pointer, so drop it at once.
-        if (pressed)
-            if (const auto seat = borrowed_seat.lock(); seat && seat->good())
-                g_pSeatManager->clearPointerButtonSerials(seat, borrowed_surface.lock(), code);
+        if (pressed) forget_press(borrowed_seat, borrowed_surface, code);
         if (!pressed) held_button = 0;
+    }
+    // CWLPointerResource::sendButton records a press as a serial the client
+    // may start a compositor move or resize with, and that move would follow
+    // the human's pointer until their next release. An agent press on a
+    // primary seat must never do that, so drop it at once. Agent seats need
+    // nothing: Hyprland ignores a move or resize naming a seat it did not make.
+    static void forget_press(const WP<CWLSeatResource>& seat, const WP<CWLSurfaceResource>& surface, std::uint32_t code) {
+        if (const auto s = seat.lock(); s && s->good()) g_pSeatManager->clearPointerButtonSerials(s, surface.lock(), code);
     }
     void borrowed_key(std::uint32_t code, bool pressed) {
         xkb_state_update_key(physical_keyboard_state, code + 8, pressed ? XKB_KEY_DOWN : XKB_KEY_UP);
@@ -1264,6 +1268,7 @@ struct InputExperiment::Impl {
             p->sendButton(event_ms(), code, pressed ? WL_POINTER_BUTTON_STATE_PRESSED : WL_POINTER_BUTTON_STATE_RELEASED);
             p->sendFrame();
         }
+        if (pressed) forget_press(foreground_seat, foreground_surface, code);
         held_button = pressed ? code : 0;
     }
     void foreground_key(Client& c, std::uint32_t code, bool pressed) {
@@ -2155,6 +2160,101 @@ struct InputExperiment::ReactionGuards {
     }
 };
 
+// A fullscreen or maximize request carries no seat or serial. Hyprland 0.56.2
+// handles it in CWindow::onUpdateState, which its window listener inlines, so
+// a function hook would never run. These listeners take the place of that one
+// on every window, and call onUpdateState for each request they let through.
+// Hyprland keeps a toplevel's fullscreen flag equal to its own client mode and
+// sets the maximized flag on every window at map.
+struct InputExperiment::StateRequests {
+    static inline StateRequests* live = nullptr;
+    InputExperiment& owner;
+    std::uint64_t refused = 0;
+    CHyprSignalListener created;
+
+    explicit StateRequests(InputExperiment& input) : owner(input) {
+        if (live) throw std::runtime_error("input state request guard already installed");
+        live = this;
+        // A throwing constructor never runs the destructor.
+        try {
+            created = Event::bus()->m_events.window.create.listen([](PHLWINDOW window) { take_over(window); });
+            for (const auto& window : Desktop::windowState()->windows()) take_over(window);
+        } catch (...) {
+            live = nullptr;
+            throw;
+        }
+    }
+    // The listeners stay on their windows and behave as Hyprland's own once
+    // `live` is cleared. The module is never unmapped (-z nodelete), so they
+    // stay callable after the plugin unloads.
+    ~StateRequests() { live = nullptr; }
+    // Hyprland's own listener exists from the window's creation until it is
+    // destroyed.
+    static void take_over(const PHLWINDOW& window) {
+        if (!window || !window->m_listeners.updateState) return;
+        const auto request = [ref = PHLWINDOWREF(window)] {
+            const auto w = ref.lock();
+            if (!w || (live && w->m_isMapped && !live->admit(w))) return;
+            w->onUpdateState();
+            // Hyprland changes the flag only with its own fullscreen mode, and
+            // would leave an app in the fullscreen a refusal gave it.
+            if (const auto toplevel = toplevel_of(w); toplevel && w->m_isMapped && toplevel->m_state.requestsFullscreen.has_value())
+                toplevel->setFullscreen(client_fullscreen(w));
+        };
+        if (const auto xdg = window->m_xdgSurface.lock(); xdg && xdg->m_toplevel)
+            window->m_listeners.updateState = xdg->m_toplevel->m_events.stateChanged.listen(request);
+        else if (const auto x = window->m_xwaylandSurface.lock())
+            window->m_listeners.updateState = x->m_events.stateChanged.listen(request);
+    }
+    static SP<CXDGToplevelResource> toplevel_of(const PHLWINDOW& window) {
+        const auto xdg = window->m_xdgSurface.lock();
+        return xdg ? xdg->m_toplevel.lock() : nullptr;
+    }
+    static bool client_fullscreen(const PHLWINDOW& window) {
+        return Fullscreen::controller()->getFullscreenModes(window).client == Fullscreen::FSMODE_FULLSCREEN;
+    }
+    bool agent(const PHLWINDOW& window) const {
+        const auto surface = window->resource();
+        const bool driven = std::ranges::any_of(owner.lanes_, [&](const auto& lane) { return lane->drives(surface); });
+        const auto& commands = owner.reaction_guards_->human_commands;
+        const bool app = std::ranges::any_of(owner.lanes_, [&](const auto& lane) { return bool(lane->app_target(surface, window->m_isX11, commands)); });
+        return agent_request(window, Desktop::focusState()->window(), driven, app);
+    }
+    // False when the request is refused.
+    bool admit(const PHLWINDOW& window) {
+        const auto toplevel = toplevel_of(window);
+        const auto x = window->m_xwaylandSurface.lock();
+        // Minimize requests reach the same listener, and Hyprland ignores them.
+        const bool requested = toplevel ? toplevel->m_state.requestsFullscreen.has_value() || toplevel->m_state.requestsMaximize.has_value() :
+                                          x && (x->m_state.requestsFullscreen.has_value() || x->m_state.requestsMaximize.has_value());
+        if (!requested) return true;
+        const auto workspace = window->m_workspace;
+        const auto fullscreen = workspace ? Fullscreen::controller()->getFullscreenWindow(workspace) : nullptr;
+        switch (state_request(agent(window), window->m_pinned || (workspace && workspace->isVisible()), fullscreen && fullscreen != window)) {
+        case StateRequest::apply: return true;
+        case StateRequest::apply_in_place:
+            // Hyprland moves a window that names an output to that output's
+            // active workspace, which is the human's.
+            if (toplevel) toplevel->m_state.requestsFullscreenMonitor.reset();
+            return true;
+        case StateRequest::refuse:
+            ++refused;
+            // Hyprland leaves the window as it is. Firefox waits for the
+            // fullscreen it asked for and then ignores every F11, the human's
+            // too, so an app still gets that flag, inside its own window. A
+            // window Hyprland made fullscreen stays fullscreen. An X window
+            // keeps its _NET_WM_STATE.
+            if (toplevel) {
+                if (toplevel->m_state.requestsFullscreen.has_value())
+                    toplevel->setFullscreen(*toplevel->m_state.requestsFullscreen || client_fullscreen(window));
+                toplevel->m_owner->scheduleConfigure();
+            }
+            return false;
+        }
+        return true;
+    }
+};
+
 // Driver's agent cursor sits one stacking position above its target window,
 // as on macOS: windows above the target cover it, and it is not drawn while
 // the target is on a hidden workspace, after it closes, or after it moves or
@@ -2297,6 +2397,7 @@ InputExperiment::InputExperiment(const std::string& directory, void* plugin) {
 #ifdef CUA_HYPRLAND_INPUT
     reaction_guards_ = std::make_unique<ReactionGuards>(*this, plugin);
     cursor_stacking_ = std::make_unique<CursorStacking>(plugin);
+    state_requests_ = std::make_unique<StateRequests>(*this);
 #endif
     // Seat globals come last. Clients bind a new global as soon as it is
     // announced, and destroying it after a failed hook would disconnect them.
@@ -2304,6 +2405,7 @@ InputExperiment::InputExperiment(const std::string& directory, void* plugin) {
     lifetime.publish();
 }
 InputExperiment::~InputExperiment() {
+    state_requests_.reset();
     cursor_stacking_.reset();
     reaction_guards_.reset();
     desktop_listeners_.reset();
@@ -2337,11 +2439,11 @@ std::string InputExperiment::status_json() const {
             lane->held_button, lane->held_keys.size(), lane->drag.has_value(), pointer_focus, keyboard_focus);
     }
     // Aggregate legacy fields remain available to existing test probes.
-    return std::format(R"({{"protocol":{},"test_only":{},"seat_lifetime":"compositor","upgrade":"desktop_restart","transport_ready":{},"session_available":{},"epoch":"{}","lease_active":{},"seat_resources":{},"pointer_resources":{},"keyboard_resources":{},"dispatches":{},"primary_background":{},"refused_popup_grabs":{},"refused_drag_starts":{},"withheld_initial_focus":{},"lanes":[{}]}})",
+    return std::format(R"({{"protocol":{},"test_only":{},"seat_lifetime":"compositor","upgrade":"desktop_restart","transport_ready":{},"session_available":{},"epoch":"{}","lease_active":{},"seat_resources":{},"pointer_resources":{},"keyboard_resources":{},"dispatches":{},"primary_background":{},"refused_popup_grabs":{},"refused_drag_starts":{},"withheld_initial_focus":{},"refused_state_requests":{},"lanes":[{}]}})",
         kProduction ? 3 : 0, !kProduction, !lanes_[0]->suspended && !lanes_[1]->suspended, session_available(), lanes_[0]->epoch, lanes_[0]->lease != nullptr || lanes_[1]->lease != nullptr,
         lanes_[0]->seats.size() + lanes_[1]->seats.size(), lanes_[0]->pointers.size() + lanes_[1]->pointers.size(),
         lanes_[0]->keyboards.size() + lanes_[1]->keyboards.size(), lanes_[0]->dispatches + lanes_[1]->dispatches,
         kProduction, reaction_guards_ ? reaction_guards_->refused_grabs : 0, reaction_guards_ ? reaction_guards_->refused_drags : 0,
-        reaction_guards_ ? reaction_guards_->withheld_focus : 0, states);
+        reaction_guards_ ? reaction_guards_->withheld_focus : 0, state_requests_ ? state_requests_->refused : 0, states);
 }
 } // namespace cua::hyprland

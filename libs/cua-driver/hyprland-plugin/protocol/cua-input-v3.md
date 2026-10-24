@@ -288,7 +288,8 @@ human focus has since reached that client: Hyprland has already moved them to
 the human's surface. Human focus reaching the target cancels the lease
 synchronously, as on the agent-seat route. An agent button press clears the
 seat's pointer-button serial at once, so the client cannot use it to start an
-interactive move or resize that would follow the human's pointer.
+interactive move or resize that would follow the human's pointer. See
+[Reactions to background input](#reactions-to-background-input).
 
 Successful dispatch returns
 `{"ok":true,"effect":"unverifiable","route":"primary_background"}`.
@@ -352,6 +353,42 @@ windows above tiled ones, so it may open under the human's pointer, and with
 focuses it. On the human's workspace it stacks directly under the human's
 window, also when that window is fullscreen. `input.withheld_initial_focus`
 counts these windows.
+
+A client can also ask to change its own state. Hyprland applies
+`xdg_toplevel.set_fullscreen`, `unset_fullscreen`, `set_maximized`, and
+`unset_maximized`, and an X window's `_NET_WM_STATE` fullscreen and maximize
+messages, by replacing the workspace's fullscreen or maximized window. That
+ends the human's fullscreen or maximized window, drops their keyboard focus,
+and covers their window. Hyprland 0.56.2 also toggles maximize on either
+maximize request, so the `unset_maximized` Firefox sends when a drag starts on
+its tab strip maximizes the window. Such a request is a reaction to agent input
+when the human's keyboard focus is not on its window, and a lane leases or
+delivered to that window in the last two seconds or its process reacts to the
+agent as it does for a new window, above. On a workspace shown on any output,
+and on any workspace where another window is fullscreen or maximized, the
+plugin keeps Hyprland from applying a reaction. Firefox waits for the
+fullscreen it asked for and then ignores every later F11, the human's too, so
+an xdg-shell client still gets the fullscreen flag it asked for in a configure
+at its current size, and draws its fullscreen inside its window. The flag of a
+window Hyprland made fullscreen stays set. The next fullscreen request Hyprland
+handles for that window sets the flag back to Hyprland's own state. An X
+window's `_NET_WM_STATE` stays as it was. On a hidden workspace a reaction
+applies, but the plugin drops the output a fullscreen request names, because
+Hyprland would move the window to that output's active workspace. The human's
+own requests, such as their F11, title-bar double-click, or a page's fullscreen
+button, apply as usual. `input.refused_state_requests` counts the reactions
+Hyprland did not apply. Hyprland ignores `xdg_toplevel.set_minimized` and
+`WM_CHANGE_STATE`.
+
+Hyprland starts an interactive move or resize for `xdg_toplevel.move` or
+`resize` only when the request names a seat Hyprland made and a button press
+serial it recorded on that seat, and the move then follows the human's pointer
+until their next button release. A request naming an agent seat fails the first
+check. The primary-seat and foreground routes press buttons through the
+client's primary seat, so the plugin removes each agent press from that seat's
+recorded serials as it sends it, and a request carrying that serial fails the
+second check. Hyprland 0.56.2 does not handle `_NET_WM_MOVERESIZE`, so X
+windows cannot start one.
 
 ## Agent cursor stacking
 
@@ -465,7 +502,9 @@ surface lifetime, geometry revision, and route at admission and dispatch on the
 compositor thread. `ACTIVATE` intentionally activates that target. Foreground
 click, key, scroll, and drag use the same bounded operation shapes with a
 foreground binding; primary focus and cursor position may change. This route
-makes no promise to restore focus or cursor position after delivery.
+makes no promise to restore focus or cursor position after delivery. As on the
+primary-seat route, an agent button press never leaves a serial the target can
+start an interactive move or resize with.
 
 Before taking over primary input, the plugin must refuse held physical keys or
 buttons, active grabs, pointer constraints, and drag-and-drop. It requires a

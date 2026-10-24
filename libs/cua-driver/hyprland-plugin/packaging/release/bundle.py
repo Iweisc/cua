@@ -43,6 +43,7 @@ src/protocol.cpp
 src/reaction_window.hpp
 src/seat_lifetime.hpp
 src/session.cpp
+src/state_request.hpp
 src/status.cpp
 src/target_identity.hpp
 tests/agent_key_repeat_test.py
@@ -70,6 +71,7 @@ tests/pointer_hit_test.cpp
 tests/protocol_test.cpp
 tests/reaction_window_test.cpp
 tests/seat_lifetime_test.cpp
+tests/state_request_test.cpp
 tests/status_test.cpp
 tests/target_identity_test.cpp
 tests/transport_test.cpp
