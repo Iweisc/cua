@@ -136,8 +136,10 @@ cause `agent_target_busy`; ordinary dispatch and conflict checks never evict
 them. This permits opposite-order reuse when both new connections reserve
 their lanes before either selects a target, without retrying any input.
 
-Target replacement, unmap, destruction, geometry change, and
-desktop/keymap/configuration transitions clear passive focus.
+Target replacement, unmap, destruction, and geometry change clear passive
+focus. Desktop, keymap, and configuration transitions revoke authority and
+release held input, but keep passive focus on an unchanged live target, as
+after normal completion.
 An observed physical keymap transition cancels existing authority, but fresh
 background admission after that transition uses the unchanged private agent
 keymap.

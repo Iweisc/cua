@@ -16,8 +16,26 @@
 using namespace cua::hyprland;
 using Clock = InputGrant::Clock;
 struct Window { bool m_isX11 = false; };
-struct Surface { int client() const { return 1; } };
+struct Surface { int client() const { return 1; } bool good() const { return true; } };
 using Target = PassivePointerTarget<std::weak_ptr<Window>, std::weak_ptr<Surface>>;
+constexpr int WL_POINTER_BUTTON_STATE_RELEASED = 0, WL_KEYBOARD_KEY_STATE_RELEASED = 0;
+// A primary-seat pointer or keyboard the background primary route borrows.
+struct Borrowed {
+    unsigned releases = 0, leaves = 0;
+    bool good() const { return true; }
+    void sendButton(unsigned, unsigned, int state) { releases += state == WL_POINTER_BUTTON_STATE_RELEASED; }
+    void sendKey(unsigned, unsigned, int) {}
+    void sendMods(unsigned, unsigned, unsigned, unsigned) {}
+    void sendLeave() { ++leaves; }
+    void sendFrame() {}
+};
+struct SeatManager { struct { std::weak_ptr<Surface> pointerFocus, keyboardFocus; } m_state; } seat_manager;
+SeatManager* g_pSeatManager = &seat_manager;
+struct xkb_keymap;
+struct xkb_state;
+void xkb_state_unref(xkb_state*) {}
+xkb_state* xkb_state_new(xkb_keymap*) { return nullptr; }
+unsigned event_ms() { return 0; }
 struct Client {
     bool dead = false;
     void* source = nullptr;
@@ -67,6 +85,10 @@ struct Lane {
     Clock::time_point expires;
     std::vector<unsigned> held_keys{42};
     std::vector<std::string> responses;
+    std::vector<std::weak_ptr<Borrowed>> borrowed_pointers, borrowed_keyboards;
+    std::weak_ptr<Surface> borrowed_surface, borrowed_seat;
+    xkb_state* physical_keyboard_state = nullptr;
+    xkb_keymap* physical_keymap = nullptr;
 
     Lane() {
         clients.push_back(std::make_unique<Client>());
@@ -90,7 +112,6 @@ struct Lane {
     }
     void send(Client&, const std::string& response) { responses.push_back(response); }
     void finish_foreground() { foreground_started = false; }
-    void return_primary() {}
     void release_pointer_button() { if (held_button) ++releases; held_button = 0; }
     void leave_pointer() {
         release_pointer_button(); ++leaves; pointer_target.reset();
@@ -104,6 +125,17 @@ struct Lane {
         foreground_needs_keyboard = true;
         grant.arm(2, Clock::now());
         expires = grant.deadline();
+    }
+    // A primary-route drag holds its press on the target's own primary-seat
+    // pointer. The agent seat has no focus there.
+    std::shared_ptr<Borrowed> use_primary_route() {
+        auto borrowed = std::make_shared<Borrowed>();
+        lease->route = InputRoute::primary_background;
+        pointer_target.reset();
+        pointers.front()->focus.reset();
+        borrowed_pointers.push_back(borrowed);
+        borrowed_surface = borrowed_seat = surface;
+        return borrowed;
     }
     // PRODUCTION_METHODS
     void check_inert(bool retained = true) const {
@@ -127,6 +159,21 @@ int main() {
       l.session = true; l.layout = true; l.guard_targets(); l.check_inert(); }
     { Lane l; l.desktop_generation = UINT64_MAX; l.desktop_transition();
       l.guard_targets(); l.check_inert(); check(l.suspended, "generation overflow admitted input"); }
+    // A killed or stopped owner releases its drag and keeps the unchanged hover.
+    { Lane l; l.lease->dead = true; l.guard_targets(); l.check_inert(); }
+    { Lane l; l.cancel_authority("stopped"); l.guard_targets(); l.check_inert(); }
+    // The primary route releases on the borrowed pointer, never on the agent seat.
+    for (int path = 0; path < 4; ++path) {
+        Lane l;
+        const auto borrowed = l.use_primary_route();
+        if (path == 0) l.lease->dead = true;
+        if (path == 1) l.cancel_authority("stopped");
+        if (path == 2) l.desktop_transition();
+        if (path == 3) l.refresh_ok = false;
+        l.guard_targets();
+        check(borrowed->releases == 1 && borrowed->leaves == 1 && !l.releases && !l.held_button &&
+              l.borrowed_pointers.empty(), "borrowed press was not released exactly once on its own route");
+    }
     for (bool session_fault : {true, false}) {
         for (int path = 0; path < 3; ++path) {
             Lane l;

@@ -971,6 +971,7 @@ struct InputExperiment::Impl {
     // CSeatManager has already left these resources and re-entered the human's
     // surface on them; they are no longer ours to release or leave.
     void return_primary() {
+        const bool borrowed = !borrowed_pointers.empty() || !borrowed_keyboards.empty();
         const auto root = borrowed_surface.lock();
         if (root && root->good()) {
             const auto pointer = g_pSeatManager->m_state.pointerFocus.lock();
@@ -990,7 +991,9 @@ struct InputExperiment::Impl {
                     }
         }
         borrowed_pointers.clear(); borrowed_keyboards.clear(); borrowed_surface.reset(); borrowed_seat.reset();
-        held_button = 0; held_keys.clear();
+        // With nothing borrowed, a held button or key is on the agent seat, and
+        // revoke() still has to release it there.
+        if (borrowed) { held_button = 0; held_keys.clear(); }
         if (physical_keyboard_state) xkb_state_unref(physical_keyboard_state);
         physical_keyboard_state = physical_keymap ? xkb_state_new(physical_keymap) : nullptr;
     }
