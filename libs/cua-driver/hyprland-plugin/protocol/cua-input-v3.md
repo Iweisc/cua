@@ -343,7 +343,7 @@ layer maps, and draws it only after that window. A layer whose name carries a
 stable id binds only to a window with that id. A layer that maps after its
 target closed, even once another window took the address, binds to no window,
 and the plugin sends it `zwlr_layer_surface_v1.closed` at once, so Driver's
-next pin opens a layer named for the window it then has at that address.
+next action opens a layer named for the window it then has at that address.
 Driver places the cursor
 relative to the window's top-left corner from the box it read when it acted,
 and does not see the window move, so the plugin also records that box. When
@@ -351,19 +351,20 @@ the window is destroyed, even on a hidden workspace, or its corner moves or
 it shrinks (a move, layout reflow, swap, or fullscreen, float, or group
 toggle), the plugin sends the layer `zwlr_layer_surface_v1.closed`. Driver
 then stops drawing the cursors pinned to that address and opens no layer for
-them until it pins them again. A cursor therefore never moves onto a window
-that took its target's address, and never stays at a point its moved target
-left. The cursor fades with the window's fade alpha, including a special
+them until an action places them again. Such a cursor then appears at its new
+point instead of gliding in from where its window was. A cursor therefore
+never moves onto a window that took its target's address, and never stays at
+a point its moved target left. The cursor fades with the window's fade alpha, including a special
 workspace fading in or out, but not with its opacity rules.
 
 Without the plugin's hooks Hyprland would draw a pinned layer above every
 window. When the plugin unloads, it hides every pinned layer and sends it
 `closed`. Driver checks that the input sockets exist on each pin and each
 closed pinned layer. Once they are gone, after an unload or a config disable,
-it hides the cursors pinned to a window until their next pin, and draws them
-in the plain layer from then on. A config disable keeps the hooks, so pinned
-layers stay correctly stacked until Driver drops them. After a re-enable, the
-next pin opens window layers again.
+it hides the cursors pinned to a window until their next action, and draws
+them in the plain layer from then on. A config disable keeps the hooks, so
+pinned layers stay correctly stacked until Driver drops them. After a
+re-enable, the next action opens window layers again.
 
 ## XWayland extension
 

@@ -69,7 +69,7 @@ class CursorPins {
         // The layer opened after its window was gone, maybe once another
         // window took the address. Driver keeps one layer per address, so this
         // one would keep the cursor it pins to that window from being drawn.
-        // Once it is closed, Driver's next pin opens a layer named for the
+        // Once it is closed, Driver's next action opens a layer named for the
         // window it now has there.
         close(layer);
     }

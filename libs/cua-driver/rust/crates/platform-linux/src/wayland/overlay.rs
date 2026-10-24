@@ -409,21 +409,36 @@ fn apply_keyed_command(
     };
     if let Some((target_x, target_y)) = seed_target {
         render.seed_start_if_sentinel(&key, target_x, target_y, frame);
+        // See `release_pinned_window`. The cursor was last drawn where its
+        // window no longer is, so it reappears at its new point instead of
+        // gliding in from there over other windows.
+        if let Some(core) = render
+            .cursors
+            .get_mut(&key)
+            .filter(|core| core.pinned_target_off_workspace)
+        {
+            core.pinned_target_off_workspace = false;
+            if let OverlayCommand::MoveTo {
+                x,
+                y,
+                end_heading_radians,
+                ..
+            } = &cmd
+            {
+                core.pos = cursor_overlay::anchor_for_pointer(*x, *y, *end_heading_radians);
+                core.heading = *end_heading_radians;
+            }
+        }
     }
 
     let disabling = matches!(&cmd, OverlayCommand::SetEnabled(false));
-    let pinning = matches!(&cmd, OverlayCommand::PinAbove(_));
     let outcome = render.apply_command(key, cmd);
-    if let Some(core) = outcome
-        .applied_key()
-        .and_then(|key| render.cursors.get_mut(key))
-    {
-        if disabling {
+    if disabling {
+        if let Some(core) = outcome
+            .applied_key()
+            .and_then(|key| render.cursors.get_mut(key))
+        {
             quiesce_hidden(core);
-        }
-        if pinning {
-            // See `release_pinned_window`.
-            core.pinned_target_off_workspace = false;
         }
     }
     outcome.is_dirty()
@@ -609,8 +624,8 @@ fn pinned_windows(cores: &CursorMap<RenderStateCore>, stack_with_windows: bool) 
 /// Hyprland hands that address to the next window it opens, when it opens
 /// after that, and once its window moves or shrinks, since the cursor was
 /// placed from the old box. The cursors pinned there paint nothing and get no
-/// new layer until they are pinned again. Hyprland also closes a removed
-/// monitor's layers, so those cursors wait for their next pin too.
+/// new layer until an action places them again. Hyprland also closes a removed
+/// monitor's layers, so those cursors wait for their next action too.
 fn release_pinned_window(
     cores: &mut CursorMap<RenderStateCore>,
     wid: u64,
@@ -626,8 +641,8 @@ fn release_pinned_window(
 /// Only the plugin draws a pinned layer above its window. Without it, after
 /// an unload or with its input disabled, Hyprland draws the layer above every
 /// window, so cursors use the plain layer, as on compositors without the
-/// plugin. A pinned cursor that changes layers waits for its next pin, as when
-/// its layer closes, so it never shows over the windows that covered its
+/// plugin. A pinned cursor that changes layers waits for its next action, as
+/// when its layer closes, so it never shows over the windows that covered its
 /// target.
 fn set_stacking(
     cores: &mut CursorMap<RenderStateCore>,
@@ -1878,7 +1893,7 @@ mod tests {
     }
 
     #[test]
-    fn a_cursor_whose_window_layer_closed_waits_for_its_next_pin() {
+    fn a_cursor_whose_window_layer_closed_reappears_at_its_next_point() {
         let mut render = WlRenderMap::new(CursorConfig::default(), ());
         for (key, wid) in [("a", 0xa), ("b", 0xa), ("c", 0xc)] {
             let mut core = positioned_core();
@@ -1899,19 +1914,43 @@ mod tests {
         assert!(drawn(&render, Some(0xa)).is_empty());
         assert_eq!(drawn(&render, Some(0xc)), vec!["c"]);
 
-        // The window that takes the address gets a layer for the cursor
-        // pinned to it anew, and the other old cursor stays hidden.
-        assert!(apply_keyed_command(
+        // The next action on the window at that address shows the cursor it
+        // pins there once it places it, right at its point rather than
+        // gliding in from the old one. The other old cursor stays hidden.
+        apply_keyed_command(
             &mut render,
             None,
             "a".to_owned(),
             OverlayCommand::PinAbove(0xa),
+        );
+        assert_eq!(pinned_windows(&render.cursors, true), HashSet::from([0xc]));
+        assert!(drawn(&render, Some(0xa)).is_empty());
+        let heading = std::f64::consts::FRAC_PI_4;
+        let move_to = |x, y| OverlayCommand::MoveTo {
+            x,
+            y,
+            end_heading_radians: heading,
+            target: None,
+        };
+        assert!(apply_keyed_command(
+            &mut render,
+            None,
+            "a".to_owned(),
+            move_to(500.0, 400.0)
         ));
         assert_eq!(
             pinned_windows(&render.cursors, true),
             HashSet::from([0xa, 0xc])
         );
         assert_eq!(drawn(&render, Some(0xa)), vec!["a"]);
+        assert_eq!(
+            render.cursors["a"].pos,
+            cursor_overlay::anchor_for_pointer(500.0, 400.0, heading)
+        );
+
+        // A cursor whose window stayed put glides from where it was.
+        apply_keyed_command(&mut render, None, "c".to_owned(), move_to(500.0, 400.0));
+        assert_eq!(render.cursors["c"].pos, (100.0, 100.0));
     }
 
     #[test]
@@ -1934,30 +1973,34 @@ mod tests {
         assert_eq!(drawn(&render, Some(0xa), stack), vec!["a"]);
 
         // The plugin unloads. Neither cursor moves over the windows that
-        // covered its target, and each returns in the plain layer once pinned.
+        // covered its target, and each returns in the plain layer with its
+        // next action.
+        let act = |render: &mut WlRenderMap| {
+            apply_keyed_command(render, None, "a".to_owned(), OverlayCommand::PinAbove(0xa));
+            apply_keyed_command(
+                render,
+                None,
+                "a".to_owned(),
+                OverlayCommand::SnapTo {
+                    x: 100.0,
+                    y: 100.0,
+                    heading_radians: None,
+                },
+            );
+        };
         set_stacking(&mut render.cursors, &mut stack, false);
         assert!(!stack);
         assert!(pinned_windows(&render.cursors, stack).is_empty());
         assert!(drawn(&render, None, stack).is_empty());
-        apply_keyed_command(
-            &mut render,
-            None,
-            "a".to_owned(),
-            OverlayCommand::PinAbove(0xa),
-        );
+        act(&mut render);
         assert!(pinned_windows(&render.cursors, stack).is_empty());
         assert_eq!(drawn(&render, None, stack), vec!["a"]);
 
-        // Its input is enabled again, and the next pin opens a window layer.
+        // Its input is enabled again, and the next action opens a window layer.
         set_stacking(&mut render.cursors, &mut stack, true);
         assert!(drawn(&render, None, stack).is_empty());
         assert!(drawn(&render, Some(0xa), stack).is_empty());
-        apply_keyed_command(
-            &mut render,
-            None,
-            "a".to_owned(),
-            OverlayCommand::PinAbove(0xa),
-        );
+        act(&mut render);
         assert_eq!(pinned_windows(&render.cursors, stack), HashSet::from([0xa]));
         assert_eq!(drawn(&render, Some(0xa), stack), vec!["a"]);
     }

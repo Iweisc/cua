@@ -2040,8 +2040,8 @@ struct InputExperiment::CursorStacking {
 
     // The goal box, which hyprctl reports and Driver acts on.
     static CBox goal_box(const PHLWINDOW& w) { return w->geometricBox(Desktop::View::IGeometric::GEOMETRIC_GOAL); }
-    // Driver stops drawing a cursor whose layer is closed until it pins that
-    // cursor again, which opens a new layer.
+    // Driver stops drawing a cursor whose layer is closed until an action
+    // places that cursor again, which opens a new layer.
     static void close_layer(const PHLLS& ls) {
         if (const auto resource = ls->m_layerSurface.lock()) resource->sendClosed();
     }
