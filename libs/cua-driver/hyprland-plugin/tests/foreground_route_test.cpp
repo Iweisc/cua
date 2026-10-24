@@ -226,17 +226,4 @@ int main() {
     check(agent_keyboard_refusal(InputRoute::independent, true, 2, sibling, target).empty());
     for (const auto route : {InputRoute::primary_background, InputRoute::primary_foreground})
         check(agent_keyboard_refusal(route, false, 2, sibling, target).empty());
-
-    // A left press on the window takes the agent seat's keyboard focus with
-    // it, exactly where agent keys would be allowed.
-    for (const auto& focus : {other_app, no_focus})
-        check(agent_press_enters_keyboard(InputRoute::independent, false, 272, false, focus, target));
-    for (const auto& focus : {target, sibling})
-        check(!agent_press_enters_keyboard(InputRoute::independent, false, 272, false, focus, target));
-    for (const std::uint32_t other_button : {273u, 274u})
-        check(!agent_press_enters_keyboard(InputRoute::independent, false, other_button, false, other_app, target));
-    check(!agent_press_enters_keyboard(InputRoute::independent, false, 272, true, other_app, target));
-    check(!agent_press_enters_keyboard(InputRoute::independent, true, 272, false, other_app, target));
-    for (const auto route : {InputRoute::primary_background, InputRoute::primary_foreground})
-        check(!agent_press_enters_keyboard(route, false, 272, false, other_app, target));
 }

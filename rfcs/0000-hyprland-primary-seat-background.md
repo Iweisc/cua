@@ -171,11 +171,9 @@ of the target client, checked before every key. Firefox and Qt keep one
 keyboard focus per process, so an agent key in one window took the person's
 typing in another, and agent keys in the person's own window mix with theirs
 in every toolkit. Ghostty, foot, and GTK keep focus per seat but are refused
-too, with no per-app exception. Where keys are allowed, a left press also
-carries the agent seat's keyboard focus for that dispatch, as a person's click
-gets focus first: Ghostty drops a left press on a window without it. While the
-person types in one Ghostty window, agent left clicks in another window of that
-process are still dropped. `PRIMARY_TARGET` and X windows still refuse
+too, with no per-app exception. Agent presses carry no keyboard focus, so
+Ghostty drops agent left clicks: giving the press focus, then leaving in the
+same dispatch, closed Firefox's `<select>` list. `PRIMARY_TARGET` and X windows still refuse
 every action with `primary_target_busy`, because their input or the app's
 reactions reach the person's own devices.
 

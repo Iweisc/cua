@@ -608,10 +608,6 @@ struct InputExperiment::Impl {
         return agent_keyboard_refusal(c.route, c.xwayland, capability,
             g_pSeatManager->m_state.keyboardFocus.lock(), c.surface.lock());
     }
-    bool press_enters_keyboard(const Client& c, std::uint32_t button, PointerHit hit) const {
-        return agent_press_enters_keyboard(c.route, c.xwayland, button, hit == PointerHit::popup,
-            g_pSeatManager->m_state.keyboardFocus.lock(), c.surface.lock());
-    }
     // XWayland is a single Wayland client for every X app. Each input user has
     // its own X master pair there, so only the same X process conflicts.
     static bool same_app(const SP<CWLSurfaceResource>& a, const SP<CWLSurfaceResource>& b) {
@@ -1579,8 +1575,6 @@ struct InputExperiment::Impl {
                 if (btn < 272 || btn > 274 || clicks < 1 || clicks > 2) { send(c, refusal("invalid_request")); return; }
                 if (!consume_grant(c, cap)) return;
                 if (!pointer_enter(c, target->surface, target->local)) { send(c, refusal("client_not_bound")); return; }
-                // complete_action leaves again in this handler, as after a KEY.
-                if (press_enters_keyboard(c, btn, target->hit)) keyboard_enter(c);
                 for (unsigned i = 0; i < clicks; ++i) { button(btn, true); button(btn, false); }
             } else if (command == "SCROLL") {
                 const auto axis = number(f[6]); const auto value = real(f[7]);
@@ -1607,13 +1601,7 @@ struct InputExperiment::Impl {
                 if (!consume_grant(c, cap)) return;
                 if (!pointer_enter(c, target->surface, target->local)) { send(c, refusal("client_not_bound")); return; }
                 if (trace) trace->mark("agent_drag_start", lane + 1);
-                if (press_enters_keyboard(c, 272, target->hit)) keyboard_enter(c);
                 button(272, true);
-                // The drag outlives this handler, but its keyboard focus must
-                // not: the person could enter the app before a later leave,
-                // and Qt takes that leave as their own window losing focus.
-                // Ghostty checks focus only at the press.
-                leave_keyboard();
                 drag.emplace(Drag{&c, x, y, x2, y2, Clock::now(), static_cast<unsigned>(duration), DragGeometry{c.revision}});
                 send(c, R"({"ok":true,"phase":"started"})"); return;
             }
