@@ -8,7 +8,9 @@
 //!   another workspace — unlike the grim screen-region crop it replaces.
 //!   The protocol handle is the `hyprctl clients` window address truncated
 //!   to its low 32 bits (Hyprland's `getWindowFromHandle` compares
-//!   `ptr & 0xFFFFFFFF`).
+//!   `ptr & 0xFFFFFFFF`). The frame includes the window's open popups
+//!   (menus, dropdown lists) inside its box, and cuts off any part past its
+//!   edge, so screenshot pixels stay window-local.
 //!
 //! Frame dispatch is deadline-bounded: `copy` with `ignore_damage=0` waits
 //! for window damage and would hang forever on an idle window. Captures use

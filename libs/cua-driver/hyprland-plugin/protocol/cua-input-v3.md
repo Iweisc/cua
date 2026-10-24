@@ -375,6 +375,19 @@ close, and that snapshot includes the cursor, so it fades out with the window.
 A pinned layer is never drawn above every window. The plain
 `cua-agent-cursor` layer stays above every window.
 
+The window's own popups follow the same stacking: the plugin draws them right
+after the window and its cursors, so windows above the window cover them and a
+hidden workspace hides them. Hyprland gives tiled windows a separate popup
+pass after all of them, but only the focused one, because a popup normally
+closes when its window loses focus. A popup an agent opens in another window
+stays open while the human's keyboard is outside its app, since its grab is
+withheld (see [Reactions to background input](#reactions-to-background-input)),
+and would never be drawn, so the plugin draws the popups of every other tiled
+window right after that window. The focused window's popups keep Hyprland's own pass.
+Popups take their own fade, not the window's, as in Hyprland. A single-window
+capture (`hyprland_toplevel_export`) includes the popups inside the window's
+box and cuts off any part past its edge.
+
 Hyprland reuses a freed window's address for the next window it creates, so
 the plugin binds each pinned layer to the window at its address when the
 layer maps, and draws it only after that window. A layer whose name carries a

@@ -120,4 +120,24 @@ int main() {
     pins.release(close);
     pins.release_moved(windows.back(), Box{1200, 600, 600, 400}, close);
     check(closed == 5);
+
+    // A window drawn whole on screen gets its cursor between the window and
+    // its popups.
+    using cua::hyprland::WindowPass;
+    using cua::hyprland::window_draw;
+    const auto drawn = [](cua::hyprland::WindowDraw d, WindowPass first, bool cursor, bool popups) {
+        return d.first == first && d.cursor == cursor && d.popups == popups;
+    };
+    for (const bool focused : {false, true})
+        for (const bool has_popups : {false, true})
+            check(drawn(window_draw(WindowPass::all, true, focused, has_popups), WindowPass::main, true, true));
+    // An unfocused tiled window's popups, which only an agent leaves open,
+    // are drawn right after it. The focused one keeps Hyprland's popup pass.
+    check(drawn(window_draw(WindowPass::main, true, false, true), WindowPass::main, true, true));
+    check(drawn(window_draw(WindowPass::main, true, false, false), WindowPass::main, true, false));
+    check(drawn(window_draw(WindowPass::main, true, true, true), WindowPass::main, true, false));
+    check(drawn(window_draw(WindowPass::popup, true, true, true), WindowPass::popup, false, false));
+    // Captures, snapshots, and hidden windows are drawn as asked, without a cursor.
+    for (const auto asked : {WindowPass::all, WindowPass::main, WindowPass::popup})
+        check(drawn(window_draw(asked, false, false, true), asked, false, false));
 }

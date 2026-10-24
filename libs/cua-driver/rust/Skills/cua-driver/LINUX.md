@@ -405,6 +405,11 @@ on, as on macOS. Windows above that window cover it, and it is not drawn while
 that window is on a hidden workspace. When the window closes, the cursor fades
 out with it, and when the window moves or shrinks, the cursor hides. Either way
 it stays hidden until the agent acts again, and then appears at the new point.
+A menu, popover, or dropdown list the agent opens is drawn the same way,
+directly above its window and over the agent cursor, while you work in another
+app. `get_window_state`'s screenshot shows the part of it inside
+the window. A part past the window's edge shows only in
+`get_desktop_state`'s screenshot.
 On other Wayland compositors, and
 on Hyprland once the plugin is unloaded or its input disabled, the cursor stays
 above every window.

@@ -2214,16 +2214,27 @@ struct InputExperiment::CursorStacking {
         if (ls && pinned_cursor_window(ls->m_namespace)) return;
         reinterpret_cast<Layer>(live->layer->m_original)(self, ls, monitor, time, popups, lockscreen);
     }
+    static bool has_visible_popup(const PHLWINDOW& w) {
+        bool found = false;
+        if (!w->m_isX11 && w->m_popupHead)
+            w->m_popupHead->breadthfirst([&found](SP<Desktop::View::CPopup> popup, void*) { found = found || popup->aliveAndVisible(); }, nullptr);
+        return found;
+    }
     static void render_window(Render::IHyprRenderer* self, PHLWINDOW w, PHLMONITOR monitor, const Time::steady_tp& time, bool decorate,
                               Render::eRenderPassMode mode, bool ignore_position, bool standalone) {
-        reinterpret_cast<Window>(live->window->m_original)(self, w, monitor, time, decorate, mode, ignore_position, standalone);
-        // Only the focused tiled window gets a separate popup pass, so the
-        // cursor is drawn after the main pass. The target's own menus cover
-        // it, as on macOS. Single-window captures never include it. Hyprland
-        // snapshots a window only to animate its close, so the cursor in that
-        // snapshot fades out with the window.
-        if (!w || !monitor || mode == Render::RENDER_PASS_POPUP || standalone || ignore_position || !w->m_isMapped || w->isHidden())
-            return;
+        const auto original = reinterpret_cast<Window>(live->window->m_original);
+        // Single-window captures never include the cursor, and draw the
+        // window's popups as asked. Hyprland snapshots a window only to
+        // animate its close, so the cursor in that snapshot fades out with
+        // the window. See window_draw for the rest.
+        const bool on_screen = w && monitor && !standalone && !ignore_position && w->m_isMapped && !w->isHidden();
+        const auto asked = mode == Render::RENDER_PASS_ALL ? WindowPass::all : mode == Render::RENDER_PASS_MAIN ? WindowPass::main : WindowPass::popup;
+        const auto draw = window_draw(asked, on_screen, on_screen && w == Desktop::focusState()->window(), on_screen && has_visible_popup(w));
+        original(self, w, monitor, time, decorate, draw.first == WindowPass::main ? Render::RENDER_PASS_MAIN : mode, ignore_position, standalone);
+        if (draw.cursor) draw_cursors(self, w, monitor, time);
+        if (draw.popups) original(self, w, monitor, time, decorate, Render::RENDER_PASS_POPUP, ignore_position, standalone);
+    }
+    static void draw_cursors(Render::IHyprRenderer* self, const PHLWINDOW& w, const PHLMONITOR& monitor, const Time::steady_tp& time) {
         // Driver painted the cursor where it acted, from the box it read
         // then. It cannot see the window move, so the cursor waits for the
         // next action instead of pointing at another spot.

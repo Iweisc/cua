@@ -105,4 +105,27 @@ class CursorPins {
     };
     std::vector<Pin> pins_;
 };
+
+// Hyprland's renderWindow passes: all, the window alone, or its popups alone.
+enum class WindowPass { all, main, popup };
+
+struct WindowDraw {
+    WindowPass first;
+    bool cursor = false;
+    bool popups = false;
+};
+
+// How one renderWindow call is drawn: `first`, then the window's pinned agent
+// cursors, then its popups. The window's own popups sit directly above it and
+// over its cursor, as on macOS, and windows above it cover both. Hyprland gives
+// tiled windows a separate popup pass after all of them, but only the focused
+// one, since a popup normally closes when its window loses focus. A popup an
+// agent opened stays open without the person's focus, so the other tiled
+// windows get theirs here. `on_screen` is false for captures and snapshots,
+// which are drawn as asked.
+[[nodiscard]] constexpr WindowDraw window_draw(WindowPass asked, bool on_screen, bool focused, bool has_popups) {
+    if (!on_screen || asked == WindowPass::popup) return {asked};
+    if (asked == WindowPass::all) return {WindowPass::main, true, true};
+    return {WindowPass::main, true, !focused && has_popups};
+}
 } // namespace cua::hyprland
