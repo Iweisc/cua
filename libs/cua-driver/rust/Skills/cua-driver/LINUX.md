@@ -319,6 +319,12 @@ Call `list_windows` to get the new window's id. An id Driver never returned,
 for example after Driver restarts, names whichever window holds the address
 when it is first used.
 
+Driver finds Hyprland through `HYPRLAND_INSTANCE_SIGNATURE`, or, when a
+service or shell started it without that variable, through the live instance
+serving its `WAYLAND_DISPLAY`. With neither, it treats the desktop as generic
+Wayland: X windows get X11 ids, which per-window capture refuses with
+`surface_identity_unproven`.
+
 The plugin separately binds the exact live native surface and checks geometry,
 desktop availability, and other-lane conflicts. A click, scroll, or drag at a
 point outside that window, including the end of a drag, is refused with

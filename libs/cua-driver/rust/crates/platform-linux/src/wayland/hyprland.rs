@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -213,8 +213,49 @@ pub struct Window {
 }
 
 pub fn is_session() -> bool {
-    !super::is_inject_mode()
-        && std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some_and(|s| !s.is_empty())
+    !super::is_inject_mode() && instance_signature().is_some()
+}
+
+/// Hyprland exports its signature to the programs it starts, but a driver
+/// started any other way may only have WAYLAND_DISPLAY. Without the signature
+/// the driver falls to the generic Wayland path, where X windows get XIDs no
+/// capture can attest and input goes global. Each instance names its Wayland
+/// socket in `hypr/<signature>/hyprland.lock`, the file `hyprctl instances`
+/// reads.
+pub(super) fn instance_signature() -> Option<String> {
+    if let Some(signature) = std::env::var("HYPRLAND_INSTANCE_SIGNATURE")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
+        return Some(signature);
+    }
+    let runtime = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR")?);
+    signature_for_socket(&runtime, &wayland_socket_path().ok()?)
+}
+
+/// The one live instance serving `display`. A crashed Hyprland leaves its lock
+/// behind, and the next instance usually takes the same socket name.
+fn signature_for_socket(runtime: &Path, display: &Path) -> Option<String> {
+    let mut found = None;
+    for entry in std::fs::read_dir(runtime.join("hypr")).ok()?.flatten() {
+        let Ok(lock) = std::fs::read_to_string(entry.path().join("hyprland.lock")) else {
+            continue;
+        };
+        let mut lines = lock.lines();
+        let (Some(pid), Some(socket)) = (lines.next(), lines.next()) else {
+            continue;
+        };
+        let live = pid
+            .parse::<u32>()
+            .is_ok_and(|pid| pid > 0 && Path::new(&format!("/proc/{pid}")).exists());
+        if live && runtime.join(socket) == display {
+            if found.is_some() {
+                return None;
+            }
+            found = entry.file_name().into_string().ok();
+        }
+    }
+    found
 }
 
 /// `hyprctl -j cua:status` from the attested compositor. `Err` when the plugin
@@ -225,8 +266,7 @@ pub fn plugin_status() -> Result<serde_json::Value> {
 
 fn ipc_path() -> Result<PathBuf> {
     let runtime = std::env::var_os("XDG_RUNTIME_DIR").context("missing XDG_RUNTIME_DIR")?;
-    let signature = std::env::var("HYPRLAND_INSTANCE_SIGNATURE")
-        .context("missing HYPRLAND_INSTANCE_SIGNATURE")?;
+    let signature = instance_signature().context("missing HYPRLAND_INSTANCE_SIGNATURE")?;
     if signature.is_empty()
         || !signature
             .bytes()
@@ -284,24 +324,26 @@ fn wayland_connection_with_timeout(timeout: Duration) -> Result<wayland_client::
     if std::env::var_os("WAYLAND_SOCKET").is_some() {
         bail!("Hyprland observation requires a named WAYLAND_DISPLAY socket");
     }
+    let socket = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)?;
+    socket.connect_timeout(&socket2::SockAddr::unix(wayland_socket_path()?)?, timeout)?;
+    wayland_client::Connection::from_socket(socket.into()).context("Wayland connection failed")
+}
+
+fn wayland_socket_path() -> Result<PathBuf> {
     let display =
         PathBuf::from(std::env::var_os("WAYLAND_DISPLAY").context("missing WAYLAND_DISPLAY")?);
-    let path = if display.is_absolute() {
-        display
-    } else {
-        if display.components().count() != 1 {
-            bail!("invalid WAYLAND_DISPLAY socket name");
-        }
-        let runtime =
-            PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").context("missing XDG_RUNTIME_DIR")?);
-        if !runtime.is_absolute() {
-            bail!("XDG_RUNTIME_DIR must be absolute");
-        }
-        runtime.join(display)
-    };
-    let socket = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)?;
-    socket.connect_timeout(&socket2::SockAddr::unix(path)?, timeout)?;
-    wayland_client::Connection::from_socket(socket.into()).context("Wayland connection failed")
+    if display.is_absolute() {
+        return Ok(display);
+    }
+    if display.components().count() != 1 {
+        bail!("invalid WAYLAND_DISPLAY socket name");
+    }
+    let runtime =
+        PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").context("missing XDG_RUNTIME_DIR")?);
+    if !runtime.is_absolute() {
+        bail!("XDG_RUNTIME_DIR must be absolute");
+    }
+    Ok(runtime.join(display))
 }
 
 /// Bind the Wayland connection to the IPC compositor before accepting pixels.
@@ -1108,6 +1150,30 @@ mod tests {
         enumerated(b).hand_out([&listed(ADDRESS)]);
         assert_eq!(confirm_identity(ADDRESS, Some(b)), Ok(Some(b)));
         assert_eq!(confirm_identity(ADDRESS, Some(a)), Err(WindowReplaced));
+    }
+
+    #[test]
+    fn without_the_signature_the_live_instance_on_wayland_display_is_used() {
+        let runtime = tempfile::tempdir().unwrap();
+        let instance = |signature: &str, lock: String| {
+            let dir = runtime.path().join("hypr").join(signature);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("hyprland.lock"), lock).unwrap();
+        };
+        let live = std::process::id();
+        let display = runtime.path().join("wayland-1");
+        // No pid gets this high, so the crashed instance is dead.
+        instance("crashed", format!("{}\nwayland-1\n", u32::MAX));
+        instance("other", format!("{live}\nwayland-2\n"));
+        instance("truncated", format!("{live}\n"));
+        assert_eq!(signature_for_socket(runtime.path(), &display), None);
+        instance("current", format!("{live}\nwayland-1\n"));
+        assert_eq!(
+            signature_for_socket(runtime.path(), &display).as_deref(),
+            Some("current")
+        );
+        instance("twin", format!("{live}\nwayland-1\n"));
+        assert_eq!(signature_for_socket(runtime.path(), &display), None);
     }
 
     #[test]

@@ -410,8 +410,7 @@ struct Client {
 fn socket_path(lane: usize) -> Result<PathBuf> {
     let runtime =
         PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").context("missing XDG_RUNTIME_DIR")?);
-    let signature =
-        std::env::var("HYPRLAND_INSTANCE_SIGNATURE").context("missing Hyprland instance")?;
+    let signature = super::hyprland::instance_signature().context("missing Hyprland instance")?;
     ensure!(runtime.is_absolute(), "XDG_RUNTIME_DIR must be absolute");
     ensure!(
         !signature.is_empty()
