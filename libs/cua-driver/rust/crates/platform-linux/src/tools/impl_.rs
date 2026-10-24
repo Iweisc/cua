@@ -4170,6 +4170,81 @@ fn element_is_menu_role(role: &str) -> bool {
     )
 }
 
+/// The real pointer a background element click can press with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ElementPointer {
+    /// The session's MPX pointer on X11.
+    Mpx,
+    /// The Hyprland input plugin's agent seat.
+    HyprlandPlugin,
+}
+
+/// How a background element click reaches the element.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ElementPress {
+    /// Fire its AT-SPI action.
+    Action,
+    /// Press the pointer at its centre.
+    Pointer,
+    /// Press the pointer while it is SHOWING, else fire its AT-SPI action.
+    PointerIfShowing,
+    /// Press the pointer when the toolkit's hit test at its centre finds it,
+    /// else fire its AT-SPI action.
+    PointerIfHit,
+}
+
+/// An AT-SPI action can open a menu or press a button, but it cannot give an
+/// entry / spin button / slider the widget focus a following type_text needs
+/// (GIMP spin scales, VS Code settings inputs, GTK entries on Hyprland), so
+/// with a real pointer those are clicked like a user would.
+///
+/// A menu / menu item's `doAction` is declined or silently ignored by
+/// LibreOffice VCL (and opens GTK menus without the pointer grab a following
+/// item click expects), so the MPX pointer presses an entry that is on screen
+/// (a menubar entry, an item of an open GTK3 / VCL popup) too. A menu item
+/// that is not showing has no point to press: gail (GTK2, GIMP) never marks
+/// menu items SHOWING, open or closed, and an item of a closed menu is still
+/// reached through its AT-SPI `click` action (the same rule the foreground
+/// route applies).
+///
+/// The plugin pointer reaches only the window's main surface, never its popup
+/// menus, so menus keep their action there. It reaches a covered window and
+/// one on a hidden workspace, but it presses whatever is at the point, so an
+/// entry scrolled out of its pane keeps its action as well.
+fn element_press(pointer: Option<ElementPointer>, role: &str) -> ElementPress {
+    let focus_taking = element_needs_real_click(role);
+    match pointer {
+        Some(ElementPointer::Mpx) if focus_taking => ElementPress::Pointer,
+        Some(ElementPointer::Mpx) if element_is_menu_role(role) => ElementPress::PointerIfShowing,
+        Some(ElementPointer::HyprlandPlugin) if focus_taking => ElementPress::PointerIfHit,
+        _ => ElementPress::Action,
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn element_clicks_press_the_pointer_only_where_an_action_falls_short() {
+    use ElementPointer::{HyprlandPlugin, Mpx};
+    use ElementPress::{Action, Pointer, PointerIfHit, PointerIfShowing};
+    let cases = [
+        ("entry", [Action, Pointer, PointerIfHit]),
+        ("Text", [Action, Pointer, PointerIfHit]),
+        ("text box", [Action, Pointer, PointerIfHit]),
+        ("spin button", [Action, Pointer, PointerIfHit]),
+        ("slider", [Action, Pointer, PointerIfHit]),
+        ("combo box", [Action, Pointer, PointerIfHit]),
+        ("menu item", [Action, PointerIfShowing, Action]),
+        ("menu", [Action, PointerIfShowing, Action]),
+        ("push button", [Action, Action, Action]),
+        ("check box", [Action, Action, Action]),
+        ("page tab", [Action, Action, Action]),
+    ];
+    for (role, expected) in cases {
+        let got = [None, Some(Mpx), Some(HyprlandPlugin)].map(|p| element_press(p, role));
+        assert_eq!(got, expected, "{role}");
+    }
+}
+
 /// A chord the window manager, not the application, acts on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WmChord {
@@ -6827,35 +6902,41 @@ impl Tool for ClickTool {
                     "an exact window_id or window-bound element token is required",
                 );
             }
-            // An AT-SPI action can open a menu or press a button, but it cannot
-            // give an entry / spin button / slider the widget focus a following
-            // type_text needs (GIMP spin scales, VS Code settings inputs). With
-            // the MPX real pointer available, click those like a user would.
             let needs_real_click = element_needs_real_click(&observed.role);
-            // A menu / menu item's `doAction` is declined or silently ignored
-            // by LibreOffice VCL (and opens GTK menus without the pointer
-            // grab a following item click expects): with a real pointer, press
-            // it like a user would and let the popup be listed. That holds
-            // for an entry that is on screen (SHOWING: a menubar entry, an
-            // item of an open GTK3 / VCL popup). A menu item that is not
-            // showing has no point to press: gail (GTK2, GIMP) never marks
-            // menu items SHOWING, open or closed, and an item of a closed
-            // menu is still reached through its AT-SPI `click` action (the
-            // same rule the foreground route applies), so those keep the
-            // action route.
-            let real_pointer = !delivery.is_foreground()
+            let pointer = if isolated_background {
+                Some(ElementPointer::HyprlandPlugin)
+            } else if !delivery.is_foreground()
                 && !crate::wayland::wayland_input_enabled()
-                && crate::input::real_pointer_input_available();
-            let menu_entry_on_screen = real_pointer && element_is_menu_role(&observed.role) && {
-                // A bounded D-Bus round-trip: off the runtime thread.
-                let observed_for_state = observed.clone();
-                let showing = tokio::task::spawn_blocking(move || {
-                    crate::atspi::element_showing_observed(&observed_for_state)
-                })
-                .await;
-                !matches!(showing, Ok(Ok(false)))
+                && crate::input::real_pointer_input_available()
+            {
+                Some(ElementPointer::Mpx)
+            } else {
+                None
             };
-            let real_click_role = real_pointer && (needs_real_click || menu_entry_on_screen);
+            let real_click_role = match element_press(pointer, &observed.role) {
+                ElementPress::Action => false,
+                ElementPress::Pointer => true,
+                ElementPress::PointerIfShowing => {
+                    // A bounded D-Bus round-trip: off the runtime thread.
+                    let observed_for_state = observed.clone();
+                    let showing = tokio::task::spawn_blocking(move || {
+                        crate::atspi::element_showing_observed(&observed_for_state)
+                    })
+                    .await;
+                    !matches!(showing, Ok(Ok(false)))
+                }
+                ElementPress::PointerIfHit => {
+                    // A press that may land on another widget is worse than
+                    // an action that leaves the focus where it was, so an
+                    // unanswered hit test keeps the action.
+                    let observed_for_hit = observed.clone();
+                    let hit = tokio::task::spawn_blocking(move || {
+                        crate::atspi::element_hit_at_centre_observed(&observed_for_hit)
+                    })
+                    .await;
+                    matches!(hit, Ok(Ok(true)))
+                }
+            };
             // Without a real pointer, an editable / table cell cannot take a
             // background click that gives it focus: refuse instead of firing
             // an AT-SPI action whose effect is not a click.

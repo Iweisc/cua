@@ -351,7 +351,12 @@ such as Down and Return choose an item. Agent clicks reach only the window's
 main surface, not its menus, so use keys inside a menu. A click at `x`/`y` is
 always a pointer click, as on macOS, so it places the caret and focuses the
 entry under it. It never fires the accessibility action at that point. A click
-by `element_token` still fires that element's AT-SPI action.
+by `element_token` fires that element's AT-SPI action, except on a text field,
+text view, spin button, slider, combo box, or table cell. Their action does not
+focus them, so, as on X11, Driver clicks them with the pointer at their center
+when the toolkit's own hit test finds them there. That works in a covered window
+and on a hidden workspace. An element scrolled out of view, or one whose toolkit
+does not answer the hit test, keeps its AT-SPI action.
 
 With the input plugin, the agent cursor sits directly above the window it acts
 on, as on macOS. Windows above that window cover it, and it is not drawn while

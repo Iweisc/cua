@@ -45,8 +45,9 @@ the `PRIMARY_TARGET` route described in
 X windows reach background input through `XWAYLAND_TARGET` on stock
 XWayland, after Driver moves the agent seat onto its own X master pair; see
 [the protocol](protocol/cua-input-v3.md#xwayland-extension). Semantic AT-SPI
-actions are separate. Driver uses them for clicks by element, and sends every
-click at window coordinates through this plugin.
+actions are separate. Driver uses them for clicks by element, except on text
+fields and the other controls their action does not focus, and sends those and
+every click at window coordinates through this plugin.
 
 The exact-target foreground route intentionally changes primary focus and,
 for pointer actions, cursor position, without restoration. The canonical native
