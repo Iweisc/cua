@@ -218,6 +218,19 @@ the bound top-level surface, so they do not reach the popup.
 `hyprctl -j cua:status` reports `input.primary_background`,
 `input.refused_popup_grabs`, and `input.refused_drag_starts`.
 
+## Agent cursor stacking
+
+Driver draws its agent cursors in full-output `zwlr_layer_shell_v1` overlay
+layers. When the plugin's input sockets exist, cursors pinned to a window go
+in a layer per window and output named `cua-agent-cursor@<hex window address>`.
+While that window is mapped, the plugin leaves the layer out of Hyprland's
+layer pass and draws it right after the window's main pass, at the window's
+workspace offset. Windows stacked above the target and the target's own
+popups cover the cursor, and a hidden workspace hides it. Single-window
+captures and snapshots never include it. Once the window is gone, the layer
+renders as an ordinary overlay layer. The plain `cua-agent-cursor` layer stays
+above every window.
+
 ## XWayland extension
 
 XWayland binds every Wayland seat, the agent seats included, and attaches each
