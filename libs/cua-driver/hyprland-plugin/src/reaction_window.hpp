@@ -39,6 +39,26 @@ template <typename Time>
     return !human || *human < agent;
 }
 
+// A window an app opens after closing the window the agent drove, as login and
+// splash flows do right after a click. No driven window is left to compare it
+// with, so the app it came from decides, as for a window with no parent.
+struct Replacement {
+    // It has no parent and comes from the app of the window the agent last drove.
+    bool same_app = false;
+    // That window has closed.
+    bool driven_gone = false;
+    // The agent's input there is within the reaction window.
+    bool recent = false;
+    // The human's focused window is in that app.
+    bool human_in_app = false;
+    // The agent gave that app a command after the human last did.
+    bool agent_last = false;
+};
+
+[[nodiscard]] constexpr bool agent_replacement(const Replacement& r) {
+    return r.same_app && r.driven_gone && r.recent && (!r.human_in_app || r.agent_last);
+}
+
 // A reaction window floats where a new tile would change the human's layout:
 // on a workspace they can see, where it would split their tile, and where a
 // window is fullscreen or maximized, which Hyprland ends for a new tile.

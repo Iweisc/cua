@@ -335,8 +335,12 @@ the process of such a lane window and either the human's pointer and keyboard
 focus are not in that process, or the lane delivered to it after the human's
 last click or Ctrl, Alt or Super chord there. Plain typing is no command, so
 the human typing on in one window does not claim a window the agent opened
-from another, while their own Ctrl+N does. The rule compares processes, not
-clients, because Electron shows its GTK dialogs over a second Wayland
+from another, while their own Ctrl+N does. When the lane window has closed in
+the last two seconds, as when a login or splash flow replaces its window right
+after a click, a window with no parent from that window's process counts the
+same way and opens on the workspace that window had at dispatch, which the
+plugin makes again if it closed with the window. The rule compares processes,
+not clients, because Electron shows its GTK dialogs over a second Wayland
 connection. So a dialog of the agent's window is a reaction even while the
 human uses another window of the same app, and a dialog of the human's own
 window never is. A reaction window opens on the workspace of its parent, or

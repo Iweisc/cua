@@ -361,7 +361,9 @@ special one, without taking your focus. In an app you are also using, a new
 window with no parent is the agent's when the agent acted in that app after
 your last click or Ctrl, Alt or Super shortcut there, so your own Ctrl+N still
 focuses its window while typing elsewhere in the app does not claim the
-agent's. Such a window never ends your fullscreen or maximized window, and on a
+agent's. An app that replaces its window right after an agent click, as a login
+or splash screen does, opens the new one where the old one was. Such a window
+never ends your fullscreen or maximized window, and on a
 workspace you can see it floats, so it never splits or resizes your tile.
 Moving your pointer over it does not focus it, because Hyprland draws floating
 windows over tiled ones and it may open under your pointer. Click it to type

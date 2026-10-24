@@ -23,6 +23,7 @@
 #include <src/output/Monitor.hpp>
 #include <src/protocols/core/Compositor.hpp>
 #include <src/state/MonitorState.hpp>
+#include <src/state/WorkspaceState.hpp>
 #include <src/desktop/state/FocusState.hpp>
 #include <src/desktop/view/Popup.hpp>
 #include <src/managers/input/InputManager.hpp>
@@ -285,6 +286,15 @@ struct InputExperiment::Impl {
     // Borrowed primary-seat resources take their serials from Hyprland. They
     // only act in apps the human is not in, where the app rule applies.
     mutable AgentSerials agent_serials;
+    // The app and workspace of the window this lane last delivered to, for a
+    // window that app opens after closing it.
+    struct DrivenApp {
+        pid_t pid = 0;
+        bool x = false;
+        WORKSPACEID workspace = WORKSPACE_INVALID;
+        std::string workspace_name;
+        MONITORID monitor = MONITOR_INVALID;
+    } recent_app;
     Clock::time_point recent_dispatch{};
 
     explicit Impl(const std::string& directory, unsigned index) : lane(index) {
@@ -738,6 +748,8 @@ struct InputExperiment::Impl {
     void note_dispatch(const Client& c) {
         recent_target = c.surface;
         recent_dispatch = Clock::now();
+        if (const auto w = c.window.lock(); w && w->m_workspace)
+            recent_app = {w->getPID(), w->m_isX11, w->m_workspace->m_id, w->m_workspace->m_name, w->monitorID()};
     }
     bool owns_reaction(wl_client* client) const {
         if (!client) return false;
@@ -776,6 +788,25 @@ struct InputExperiment::Impl {
         for (const auto& c : commands)
             if (same(c.surface.lock()) && (!human || c.at > *human)) human = c.at;
         return agent_commanded_last(agent, human) ? target : nullptr;
+    }
+    // The app `window` replaces the window this lane drove in, if it does.
+    const DrivenApp* replaced_app(const PHLWINDOW& window, const std::vector<HumanCommand>& commands) const {
+        const auto same = [&](const PHLWINDOW& w) { return w && recent_app.pid > 0 && w->m_isX11 == recent_app.x && w->getPID() == recent_app.pid; };
+        const auto window_of = [](const SP<CWLSurfaceResource>& s) {
+            const auto wl = s ? Desktop::View::CWLSurface::fromResource(s) : nullptr;
+            return wl ? Desktop::View::CWindow::fromView(wl->view()) : nullptr;
+        };
+        std::optional<Clock::time_point> human;
+        for (const auto& c : commands)
+            if (same(window_of(c.surface.lock())) && (!human || c.at > *human)) human = c.at;
+        const Replacement replacement{
+            .same_app = !window->parent() && same(window),
+            .driven_gone = !recent_target.lock(),
+            .recent = Clock::now() - recent_dispatch < kReactionWindow,
+            .human_in_app = same(Desktop::focusState()->window()),
+            .agent_last = agent_commanded_last(recent_dispatch, human),
+        };
+        return agent_replacement(replacement) ? &recent_app : nullptr;
     }
     // The window this lane is driving, or drove within the reaction window.
     bool drives(const SP<CWLSurfaceResource>& surface) const {
@@ -1987,11 +2018,12 @@ struct InputExperiment::ReactionGuards {
             open_early = Event::bus()->m_events.window.openEarly.listen([this](PHLWINDOW window) {
                 if (!window || window->m_noInitialFocus) return;
                 const auto anchor = anchor_of(window);
-                if (!anchor) return;
+                const auto replaced = anchor ? nullptr : replaced_app(window);
+                if (!anchor && !replaced) return;
                 window->m_noInitialFocus = true;
                 // Otherwise it would join the human's focused group as its visible tab.
                 window->m_groupRules |= Desktop::View::GROUP_BARRED;
-                open_on(window, anchor->m_workspace);
+                open_on(window, anchor ? anchor->m_workspace : workspace_of(*replaced));
                 const bool visible = window->m_workspace && window->m_workspace->isVisible();
                 window->m_isFloating = reaction_floats(window->m_isFloating, visible, Fullscreen::controller()->hasFullscreen(window->m_workspace));
                 // A floating window still draws over tiled ones and may open under
@@ -2104,6 +2136,18 @@ struct InputExperiment::ReactionGuards {
             }
         }
         return reaction_anchor(parents, Desktop::focusState()->window(), driven, app_window);
+    }
+    const Impl::DrivenApp* replaced_app(const PHLWINDOW& window) const {
+        for (const auto& lane : owner.lanes_)
+            if (const auto app = lane->replaced_app(window, human_commands)) return app;
+        return nullptr;
+    }
+    // The workspace of a closed driven window. Hyprland drops a workspace when
+    // its last window closes, so it is made again, as a workspace rule would.
+    static PHLWORKSPACE workspace_of(const Impl::DrivenApp& app) {
+        if (const auto workspace = State::workspaceState()->query().id(app.workspace).run()) return workspace;
+        if (app.workspace == WORKSPACE_INVALID) return nullptr;
+        return State::workspaceState()->create(app.workspace, app.monitor, app.workspace_name, false);
     }
     // As Hyprland's `workspace N silent` rule does, before the window is laid
     // out, so it never shows on the human's workspace. The workspace may be

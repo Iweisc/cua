@@ -10,6 +10,7 @@
 namespace {
 using cua::hyprland::agent_commanded_last;
 using cua::hyprland::agent_grab;
+using cua::hyprland::agent_replacement;
 using cua::hyprland::AgentSerials;
 using cua::hyprland::GrabSignals;
 using cua::hyprland::reaction_anchor;
@@ -46,6 +47,16 @@ int main() {
     check(agent_commanded_last(5, std::optional<int>{}), "with no human command the new window is the agent's");
     check(agent_commanded_last(5, std::optional<int>{4}), "a human command before the agent's leaves the new window the agent's");
     check(!agent_commanded_last(5, std::optional<int>{6}), "a human command after the agent's makes the new window theirs");
+
+    check(agent_replacement({.same_app = true, .driven_gone = true, .recent = true}),
+        "a window an app opens right after closing the window the agent drove is the agent's");
+    check(!agent_replacement({.same_app = true, .driven_gone = false, .recent = true}), "while the driven window is open, its own rules decide");
+    check(!agent_replacement({.same_app = false, .driven_gone = true, .recent = true}), "a window from another app is not the agent's");
+    check(!agent_replacement({.same_app = true, .driven_gone = true, .recent = false}), "a window after the reaction window is not the agent's");
+    check(!agent_replacement({.same_app = true, .driven_gone = true, .recent = true, .human_in_app = true}),
+        "in an app the human uses, their newer command makes the new window theirs");
+    check(agent_replacement({.same_app = true, .driven_gone = true, .recent = true, .human_in_app = true, .agent_last = true}),
+        "in an app the human uses, the agent's newer command keeps the new window the agent's");
 
     check(reaction_floats(false, false, true), "a tiled reaction window floats where a window is fullscreen");
     check(reaction_floats(false, true, false), "a tiled reaction window floats on a workspace the human can see");
