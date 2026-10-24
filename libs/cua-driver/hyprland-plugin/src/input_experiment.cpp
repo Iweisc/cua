@@ -1839,21 +1839,28 @@ struct InputExperiment::ReactionGuards {
     ReactionGuards(InputExperiment& input, void* handle) : owner(input), plugin(handle) {
         if (live) throw std::runtime_error("input reaction guards already installed");
         live = this;
-        grab = install_hook(plugin, "_ZN17CXDGShellProtocol14addOrStartGrabEN9Hyprutils6Memory14CSharedPointerI17CXDGPopupResourceEE",
-            reinterpret_cast<void*>(guarded_grab));
-        drag = install_hook(plugin, "_ZN21CWLDataDeviceProtocol12initiateDragEN9Hyprutils6Memory12CWeakPointerI21CWLDataSourceResourceEENS1_14CSharedPointerI18CWLSurfaceResourceEES7_",
-            reinterpret_cast<void*>(guarded_drag));
-        // Hyprland focuses a new window after openEarly unless this is set, and
-        // sets it itself for X menus that declare their type.
-        open_early = Event::bus()->m_events.window.openEarly.listen([this](PHLWINDOW window) {
-            if (!window || !window->m_isX11 || window->m_noInitialFocus) return;
-            if (std::ranges::any_of(owner.lanes_, [&](const auto& lane) { return lane->owns_x_reaction(window->resource()); })) {
-                window->m_noInitialFocus = true;
-                ++withheld_focus;
-            }
-        });
+        // A throwing constructor never runs the destructor.
+        try {
+            grab = install_hook(plugin, "_ZN17CXDGShellProtocol14addOrStartGrabEN9Hyprutils6Memory14CSharedPointerI17CXDGPopupResourceEE",
+                reinterpret_cast<void*>(guarded_grab));
+            drag = install_hook(plugin, "_ZN21CWLDataDeviceProtocol12initiateDragEN9Hyprutils6Memory12CWeakPointerI21CWLDataSourceResourceEENS1_14CSharedPointerI18CWLSurfaceResourceEES7_",
+                reinterpret_cast<void*>(guarded_drag));
+            // Hyprland focuses a new window after openEarly unless this is set, and
+            // sets it itself for X menus that declare their type.
+            open_early = Event::bus()->m_events.window.openEarly.listen([this](PHLWINDOW window) {
+                if (!window || !window->m_isX11 || window->m_noInitialFocus) return;
+                if (std::ranges::any_of(owner.lanes_, [&](const auto& lane) { return lane->owns_x_reaction(window->resource()); })) {
+                    window->m_noInitialFocus = true;
+                    ++withheld_focus;
+                }
+            });
+        } catch (...) {
+            uninstall();
+            throw;
+        }
     }
-    ~ReactionGuards() {
+    ~ReactionGuards() { uninstall(); }
+    void uninstall() {
         if (drag) HyprlandAPI::removeFunctionHook(plugin, drag);
         if (grab) HyprlandAPI::removeFunctionHook(plugin, grab);
         live = nullptr;
@@ -1910,18 +1917,25 @@ struct InputExperiment::CursorStacking {
     explicit CursorStacking(void* handle) : plugin(handle) {
         if (live) throw std::runtime_error("cursor stacking already installed");
         live = this;
-        layer = install_hook(plugin, "_ZN6Render13IHyprRenderer11renderLayerEN9Hyprutils6Memory14CSharedPointerIN7Desktop4View13CLayerSurfaceEEENS3_IN7Monitor8CMonitorEEERKNSt6chrono10time_pointINSB_3_V212steady_clockENSB_8durationIlSt5ratioILl1ELl1000000000EEEEEEbb",
-            reinterpret_cast<void*>(render_layer));
-        window = install_hook(plugin, "_ZN6Render13IHyprRenderer12renderWindowEN9Hyprutils6Memory14CSharedPointerIN7Desktop4View7CWindowEEENS3_IN7Monitor8CMonitorEEERKNSt6chrono10time_pointINSB_3_V212steady_clockENSB_8durationIlSt5ratioILl1ELl1000000000EEEEEEbNS_15eRenderPassModeEbb",
-            reinterpret_cast<void*>(render_window));
-        opened = Event::bus()->m_events.layer.opened.listen([this](PHLLS ls) {
-            if (ls) pins.open(ls, ls->m_namespace, Desktop::windowState()->windows(), [](const PHLWINDOW& w) { return reinterpret_cast<std::uintptr_t>(w.get()); }, goal_box);
-        });
-        // A window that closed on a hidden workspace never drew its cursor,
-        // and releases its layer here all the same.
-        destroyed = Event::bus()->m_events.window.destroy.listen([this](PHLWINDOWREF) { pins.release(close_layer); });
+        // A throwing constructor never runs the destructor.
+        try {
+            layer = install_hook(plugin, "_ZN6Render13IHyprRenderer11renderLayerEN9Hyprutils6Memory14CSharedPointerIN7Desktop4View13CLayerSurfaceEEENS3_IN7Monitor8CMonitorEEERKNSt6chrono10time_pointINSB_3_V212steady_clockENSB_8durationIlSt5ratioILl1ELl1000000000EEEEEEbb",
+                reinterpret_cast<void*>(render_layer));
+            window = install_hook(plugin, "_ZN6Render13IHyprRenderer12renderWindowEN9Hyprutils6Memory14CSharedPointerIN7Desktop4View7CWindowEEENS3_IN7Monitor8CMonitorEEERKNSt6chrono10time_pointINSB_3_V212steady_clockENSB_8durationIlSt5ratioILl1ELl1000000000EEEEEEbNS_15eRenderPassModeEbb",
+                reinterpret_cast<void*>(render_window));
+            opened = Event::bus()->m_events.layer.opened.listen([this](PHLLS ls) {
+                if (ls) pins.open(ls, ls->m_namespace, Desktop::windowState()->windows(), [](const PHLWINDOW& w) { return reinterpret_cast<std::uintptr_t>(w.get()); }, goal_box);
+            });
+            // A window that closed on a hidden workspace never drew its cursor,
+            // and releases its layer here all the same.
+            destroyed = Event::bus()->m_events.window.destroy.listen([this](PHLWINDOWREF) { pins.release(close_layer); });
+        } catch (...) {
+            uninstall();
+            throw;
+        }
     }
-    ~CursorStacking() {
+    ~CursorStacking() { uninstall(); }
+    void uninstall() {
         if (window) HyprlandAPI::removeFunctionHook(plugin, window);
         if (layer) HyprlandAPI::removeFunctionHook(plugin, layer);
         live = nullptr;
