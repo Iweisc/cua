@@ -210,8 +210,7 @@ fn core_pointer(devices: &[Device]) -> Option<u16> {
     .map(|device| device.id)
 }
 
-/// X resource ids carry their owning client in the bits above the mask, so a
-/// menu the target app mapped over its own window still counts as the target.
+/// X resource ids carry their owning client in the bits above the mask.
 fn same_client(a: u32, b: u32, resource_mask: u32) -> bool {
     a != 0 && b != 0 && a & !resource_mask == b & !resource_mask
 }
@@ -431,7 +430,16 @@ impl X {
             .translate_coordinates(self.root, self.root, x, y)?
             .reply()?
             .child;
-        if same_client(child, window, self.resource_mask) {
+        // A menu the target app mapped over its window still belongs to the
+        // target. Another of its windows may be the one the human is using.
+        let own_menu = child != window
+            && same_client(child, window, self.resource_mask)
+            && self
+                .conn
+                .get_window_attributes(child)?
+                .reply()?
+                .override_redirect;
+        if child == window || own_menu {
             Ok(())
         } else {
             Err(refuse(COVERED))
@@ -552,8 +560,9 @@ pub(super) fn prepare(
             .xinput_xi_set_client_pointer(window, pointer)?
             .check()?;
         // Sent after the client pointer moved, so the app's own focus request
-        // lands on the agent keyboard.
-        if offer && x.takes_focus(window)? {
+        // lands on the agent keyboard. Wine and Java switch their active window
+        // on it, which would move the human's typing if they are in that app.
+        if offer && !same_client(x.active()?, window, x.resource_mask) && x.takes_focus(window)? {
             x.offer_focus(window)?;
         }
         Ok((pointer, core))
