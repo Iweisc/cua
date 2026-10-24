@@ -13865,10 +13865,17 @@ impl Tool for GetAccessibilityTreeTool {
     }
     async fn invoke(&self, _args: Value) -> ToolResult {
         let (procs, windows) = tokio::task::spawn_blocking(|| {
-            (
-                crate::proc_fs::list_processes(),
-                crate::x11::list_windows(None),
-            )
+            // Hyprland ids are compositor addresses. XIDs from X11 name XWayland
+            // windows that get_window_state and input cannot resolve there.
+            let windows = if crate::wayland::is_wayland() && crate::wayland::hyprland::is_session()
+            {
+                let (windows, identities) = crate::wayland::list_windows_with_identities(None);
+                identities.hand_out(&windows);
+                windows
+            } else {
+                crate::x11::list_windows(None)
+            };
+            (crate::proc_fs::list_processes(), windows)
         })
         .await
         .unwrap_or_default();

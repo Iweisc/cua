@@ -312,7 +312,8 @@ Inkscape `1.4.4-6`; for every app, verify the effect from fresh state.
 A Hyprland `window_id` is the window's compositor address, and Hyprland gives
 a closed window's address to the next window, usually at once. Driver
 remembers which window each id named when `list_windows`, `get_desktop_state`,
-`launch_app`, `list_apps`, or `get_window_state` returned it. Once that window
+`get_accessibility_tree`, `launch_app`, `list_apps`, or `get_window_state`
+returned it. Once that window
 closes, actions and `get_window_state` with its id refuse with
 `window_id_not_found`, even when a new window, native or X, holds the address.
 Call `list_windows` to get the new window's id. An id Driver never returned,
