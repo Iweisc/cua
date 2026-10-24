@@ -207,7 +207,11 @@ it to false in the configuration and reload. Unloading the plugin also closes
 the socket and every connection immediately.
 
 For the default discovery build, this enables status and liveness only. For
-the opt-in v3 build, it also opens the two input endpoints. Enabling v3 is a
+the opt-in v3 build, it also opens the two input endpoints. If input cannot
+start in this Hyprland, for example because a hook target is missing, the
+plugin adds no seats, reports the reason in `hyprctl -j cua:status` under
+`transport.last_error`, and does not retry on later reloads until Hyprland
+restarts. Enabling v3 is a
 trusted-local desktop configuration choice; Driver still checks each call
 under its normal permission policy. The candidate refuses clients, layouts,
 and operations outside its qualification scope.

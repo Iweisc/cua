@@ -2137,7 +2137,7 @@ struct InputExperiment::CursorStacking {
 InputExperiment::InputExperiment(const std::string& directory, void* plugin) {
     SeatLifetime lifetime(directory);
     for (unsigned i = 0; i < lanes_.size(); ++i) lanes_[i] = std::make_unique<Impl>(directory, i);
-    for (auto& lane : lanes_) { lane->peers = {lanes_[0].get(), lanes_[1].get()}; lane->start(); }
+    for (auto& lane : lanes_) lane->peers = {lanes_[0].get(), lanes_[1].get()};
 #if defined(CUA_HYPRLAND_TEST_INPUT) || defined(CUA_HYPRLAND_INPUT_TRACE)
     trace_ = std::make_unique<PrimaryTrace>(plugin, [this](wl_resource* resource) {
         for (unsigned i = 0; i < lanes_.size(); ++i) {
@@ -2155,6 +2155,9 @@ InputExperiment::InputExperiment(const std::string& directory, void* plugin) {
     reaction_guards_ = std::make_unique<ReactionGuards>(*this, plugin);
     cursor_stacking_ = std::make_unique<CursorStacking>(plugin);
 #endif
+    // Seat globals come last. Clients bind a new global as soon as it is
+    // announced, and destroying it after a failed hook would disconnect them.
+    for (auto& lane : lanes_) lane->start();
     lifetime.publish();
 }
 InputExperiment::~InputExperiment() {

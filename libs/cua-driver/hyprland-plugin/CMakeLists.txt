@@ -212,6 +212,16 @@ if(UNIX)
             -Wall -Wextra -Wpedantic -Werror -Wno-return-type-c-linkage)
         target_link_libraries(cua_hyprland_plugin_v3_lifetime_test PRIVATE cua_hyprland_transport)
         add_test(NAME cua_hyprland_plugin_v3_lifetime_test COMMAND cua_hyprland_plugin_v3_lifetime_test)
+        add_executable(cua_hyprland_plugin_input_failure_test
+            tests/plugin_input_failure_test.cpp src/plugin.cpp)
+        target_compile_features(cua_hyprland_plugin_input_failure_test PRIVATE cxx_std_26)
+        target_include_directories(cua_hyprland_plugin_input_failure_test PRIVATE tests tests/mock-hyprland include src)
+        target_compile_definitions(cua_hyprland_plugin_input_failure_test PRIVATE
+            CUA_HYPRLAND_PLUGIN_VERSION="${PROJECT_VERSION}" CUA_HYPRLAND_SOCKET1_API=0 CUA_HYPRLAND_INPUT=1)
+        target_compile_options(cua_hyprland_plugin_input_failure_test PRIVATE
+            -Wall -Wextra -Wpedantic -Werror -Wno-return-type-c-linkage)
+        target_link_libraries(cua_hyprland_plugin_input_failure_test PRIVATE cua_hyprland_transport)
+        add_test(NAME cua_hyprland_plugin_input_failure_test COMMAND cua_hyprland_plugin_input_failure_test)
 
         add_executable(cua_hyprland_transport_test tests/transport_test.cpp)
         target_compile_options(cua_hyprland_transport_test PRIVATE -Wall -Wextra -Wpedantic -Werror)

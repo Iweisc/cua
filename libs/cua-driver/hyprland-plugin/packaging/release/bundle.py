@@ -64,6 +64,7 @@ tests/mock-hyprland/src/plugins/PluginAPI.hpp
 tests/owned_socket_path_test.cpp
 tests/passive_pointer_target_test.cpp
 tests/plugin_api_test.cpp
+tests/plugin_input_failure_test.cpp
 tests/plugin_input_lifetime_test.cpp
 tests/pointer_hit_test.cpp
 tests/protocol_test.cpp
