@@ -347,8 +347,15 @@ keyboard focus is on that app, and during a grab, drag-and-drop, or pointer
 constraint. The plugin also withholds popup grabs and cancels drag starts that a
 background app makes in reaction to agent input, so a dropdown cannot take your
 keyboard. GTK menus and combo boxes still open without the grab, and agent keys
-such as Down and Return choose an item. Agent clicks reach only the window's
-main surface, not its menus, so use keys inside a menu. A click at `x`/`y` is
+such as Down and Return choose an item. A window or dialog an app opens in
+reaction to agent input opens without taking your focus and stacks under your
+window, even when it is a dialog of the agent's window in the app you are
+using. A dialog of your own window still takes your focus. Such windows open on
+your current workspace, and Hyprland draws floating windows over tiled ones, so
+close them in the same task. With `misc:focus_on_activate` enabled, an app that
+asks to be activated in reaction to agent input can still take your focus. It
+is off by default. Agent clicks reach only the window's main surface, not its
+menus, so use keys inside a menu. A click at `x`/`y` is
 always a pointer click, as on macOS, so it places the caret and focuses the
 entry under it. It never fires the accessibility action at that point. A click
 by `element_token` fires that element's AT-SPI action, except on a text field,
@@ -391,14 +398,9 @@ back when it starts. Apps that wait for the window manager to offer focus
 - While your pointer is locked or confined, as in a game, X drags refuse with
   `primary_constraint`, because every X raw-input listener sees their motion.
   Clicks, scrolls, and keys send no motion and still work.
-- Menus and dialogs an X app opens in reaction to agent input open without
-  taking your focus, but they appear on your current workspace. Close them in
-  the same task.
 - Qt and Chromium grab every X pointer while one of their menus is open, so a
   menu the agent opens there captures your pointer over X windows until it
   closes.
-- With `misc:focus_on_activate` enabled, an X app that asks to be activated in
-  reaction to agent input can take your focus. It is off by default.
 - Java needs `_JAVA_AWT_WM_NONREPARENTING=1` under Hyprland, or its windows stay
   blank.
 

@@ -12,6 +12,7 @@
 #include "keymap_equivalence.hpp"
 #include "cursor_layer.hpp"
 #include "target_identity.hpp"
+#include "reaction_window.hpp"
 
 #include <src/Compositor.hpp>
 #include <src/devices/IKeyboard.hpp>
@@ -22,6 +23,7 @@
 #include <src/state/MonitorState.hpp>
 #include <src/desktop/state/FocusState.hpp>
 #include <src/managers/input/InputManager.hpp>
+#include <src/managers/fullscreen/FullscreenController.hpp>
 #include <src/pointer/PointerManager.hpp>
 #include <src/protocols/core/Seat.hpp>
 #include <src/protocols/core/DataDevice.hpp>
@@ -738,6 +740,25 @@ struct InputExperiment::Impl {
         if (lease && lease->xwayland && same_app(lease->surface.lock(), surface)) return true;
         const auto recent = recent_target.lock();
         return recent && same_app(recent, surface) && Clock::now() - recent_dispatch < kReactionWindow;
+    }
+    static pid_t pid_of(const SP<CWLSurfaceResource>& surface) {
+        pid_t pid = 0;
+        if (surface && surface->client()) wl_client_get_credentials(surface->client(), &pid, nullptr, nullptr);
+        return pid;
+    }
+    // Electron shows its GTK dialogs over a second Wayland connection, so a
+    // new native window is matched to the agent's app by process, not client.
+    bool owns_process_reaction(pid_t pid) const {
+        const auto in = [&](const SP<CWLSurfaceResource>& surface) { return pid > 0 && pid_of(surface) == pid; };
+        if (in(g_pSeatManager->m_state.pointerFocus.lock()) || in(g_pSeatManager->m_state.keyboardFocus.lock())) return false;
+        if (lease && lease->route != InputRoute::primary_foreground && in(lease->surface.lock())) return true;
+        return in(recent_target.lock()) && Clock::now() - recent_dispatch < kReactionWindow;
+    }
+    // The window this lane is driving, or drove within the reaction window.
+    bool drives(const SP<CWLSurfaceResource>& surface) const {
+        if (!surface) return false;
+        if (lease && lease->route != InputRoute::primary_foreground && lease->surface.lock() == surface) return true;
+        return recent_target.lock() == surface && Clock::now() - recent_dispatch < kReactionWindow;
     }
     void revoke(std::string_view reason, bool retain_pointer = false, ForegroundFailure failure = {ForegroundFailureReason::none}) {
         if (lease && trace && reason != "completed") trace->mark("agent_cancel", lane + 1);
@@ -1825,8 +1846,9 @@ static CFunctionHook* install_hook(void* plugin, const std::string& symbol, void
 }
 
 // Popup grabs and drag starts are client requests the compositor accepts from
-// any seat. These hooks keep a client reacting to agent input from taking the
-// human's focus or pointer. They forward everything else unchanged.
+// any seat, and Hyprland focuses and raises every new window. These hooks and
+// listeners keep a client reacting to agent input from taking the human's
+// focus or pointer. They forward everything else unchanged.
 struct InputExperiment::ReactionGuards {
     using Grab = void (*)(CXDGShellProtocol*, SP<CXDGPopupResource>);
     using Drag = void (*)(CWLDataDeviceProtocol*, WP<CWLDataSourceResource>, SP<CWLSurfaceResource>, SP<CWLSurfaceResource>);
@@ -1836,7 +1858,9 @@ struct InputExperiment::ReactionGuards {
     CFunctionHook* grab = nullptr;
     CFunctionHook* drag = nullptr;
     std::uint64_t refused_grabs = 0, refused_drags = 0, withheld_focus = 0;
-    CHyprSignalListener open_early;
+    CHyprSignalListener open_early, open;
+    // The reaction window between its openEarly and open events.
+    PHLWINDOWREF withheld;
 
     ReactionGuards(InputExperiment& input, void* handle) : owner(input), plugin(handle) {
         if (live) throw std::runtime_error("input reaction guards already installed");
@@ -1850,11 +1874,19 @@ struct InputExperiment::ReactionGuards {
             // Hyprland focuses a new window after openEarly unless this is set, and
             // sets it itself for X menus that declare their type.
             open_early = Event::bus()->m_events.window.openEarly.listen([this](PHLWINDOW window) {
-                if (!window || !window->m_isX11 || window->m_noInitialFocus) return;
-                if (std::ranges::any_of(owner.lanes_, [&](const auto& lane) { return lane->owns_x_reaction(window->resource()); })) {
-                    window->m_noInitialFocus = true;
-                    ++withheld_focus;
-                }
+                if (!window || window->m_noInitialFocus || !agent_window(window)) return;
+                window->m_noInitialFocus = true;
+                // Otherwise it would join the human's focused group as its visible tab.
+                window->m_groupRules |= Desktop::View::GROUP_BARRED;
+                withheld = window;
+                ++withheld_focus;
+            });
+            // Between these events Hyprland raises a new floating window and lets
+            // it over a fullscreen window.
+            open = Event::bus()->m_events.window.open.listen([this](PHLWINDOW window) {
+                if (!window || window != withheld.lock()) return;
+                withheld.reset();
+                keep_below_human(window);
             });
         } catch (...) {
             uninstall();
@@ -1869,6 +1901,35 @@ struct InputExperiment::ReactionGuards {
     }
     bool agent_reaction(wl_client* client) const {
         return std::ranges::any_of(owner.lanes_, [&](const auto& lane) { return lane->owns_reaction(client); });
+    }
+    bool agent_window(const PHLWINDOW& window) const {
+        const auto surface = window->resource();
+        if (!surface) return false;
+        std::vector<PHLWINDOW> parents;
+        // X parents come from the client's WM_TRANSIENT_FOR, which can loop.
+        for (auto parent = window->parent(); parent && parents.size() < 8; parent = parent->parent()) parents.push_back(parent);
+        const auto driven = [&](const PHLWINDOW& parent) {
+            return std::ranges::any_of(owner.lanes_, [&](const auto& lane) { return lane->drives(parent->resource()); });
+        };
+        const bool agent_app = std::ranges::any_of(owner.lanes_, [&](const auto& lane) {
+            return window->m_isX11 ? lane->owns_x_reaction(surface) : lane->owns_process_reaction(Impl::pid_of(surface));
+        });
+        return opened_by_agent(parents, Desktop::focusState()->window(), driven, agent_app);
+    }
+    // The window still appears, but never over the human's window, as a
+    // background app's window does on macOS.
+    static void keep_below_human(const PHLWINDOW& window) {
+        const auto human = Desktop::focusState()->window();
+        if (!human || human == window) return;
+        // Hyprland can only move a window to either end of its stack. This
+        // moves the new window alone, directly under the human's.
+        stack_below(const_cast<std::vector<PHLWINDOW>&>(Desktop::windowState()->windows()), window, human);
+        if (Fullscreen::controller()->isFullscreen(human)) {
+            // As CWindowState::lower does.
+            window->m_allowedOverFullscreen = false;
+            window->updateFullscreenInputState();
+            *window->alpha(Desktop::View::WINDOW_ALPHA_FULLSCREEN) = window->isBlockedByFullscreen() ? 0.F : 1.F;
+        }
     }
     // `live` is cleared only after both hooks are removed, so a call that
     // reaches these functions always has its original trampoline.

@@ -269,6 +269,23 @@ the bound top-level surface, so they do not reach the popup.
 `hyprctl -j cua:status` reports `input.primary_background`,
 `input.refused_popup_grabs`, and `input.refused_drag_starts`.
 
+Hyprland also gives every new top-level window keyboard focus, raises a new
+floating window over the others and over a fullscreen window, and makes a new
+tiled window the visible tab of the human's focused group. A new window is a
+reaction to agent input when the nearest window in its parent chain that is
+either the human's focused window or a window a lane leases or delivered to in
+the last two seconds is the lane's. With neither in its parent chain, it is a
+reaction when it comes from the process of such a lane window and the human's
+pointer and keyboard focus are not in that process. The rule compares
+processes, not clients, because Electron shows its GTK dialogs over a second
+Wayland connection. So a dialog of the agent's window is a reaction even
+while the human uses another window of the same app, and a dialog of the
+human's own window never is. A reaction window opens without initial focus,
+stays out of the human's group, and stacks directly under the human's window,
+also when that window is fullscreen. It still opens on the human's current
+workspace, and Hyprland draws floating windows over tiled ones.
+`input.withheld_initial_focus` counts these windows.
+
 ## Agent cursor stacking
 
 Driver draws its agent cursors in full-output `zwlr_layer_shell_v1` overlay
@@ -344,10 +361,9 @@ These rules differ from native targets:
   motion and proceed.
 - Pointer coordinates are scaled by the window's X surface scale, as Hyprland
   does for the human's pointer under `xwayland:force_zero_scaling`.
-- A new X window from an X process this lane leases, or delivered to in the
-  last two seconds, opens without initial focus unless the human is in that
-  process. X apps show menus and dialogs as new windows. `hyprctl -j
-  cua:status` counts these in `input.withheld_initial_focus`.
+- X apps show menus and dialogs as new windows. A menu or dialog that reacts
+  to agent input opens as [Reactions to background input](#reactions-to-background-input)
+  describes, without initial focus.
 
 ## Exact-target foreground extension
 

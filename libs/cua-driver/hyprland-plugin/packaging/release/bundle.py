@@ -39,6 +39,7 @@ src/plugin.cpp
 src/primary_trace.cpp
 src/primary_trace.hpp
 src/protocol.cpp
+src/reaction_window.hpp
 src/seat_lifetime.hpp
 src/session.cpp
 src/status.cpp
@@ -64,6 +65,7 @@ tests/passive_pointer_target_test.cpp
 tests/plugin_api_test.cpp
 tests/plugin_input_lifetime_test.cpp
 tests/protocol_test.cpp
+tests/reaction_window_test.cpp
 tests/seat_lifetime_test.cpp
 tests/status_test.cpp
 tests/target_identity_test.cpp
