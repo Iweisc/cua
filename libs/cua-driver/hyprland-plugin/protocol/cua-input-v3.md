@@ -310,13 +310,24 @@ Hyprland accepts `xdg_popup.grab` and `wl_data_device.start_drag` without
 checking which seat the serial came from. A client reacting to agent input on
 either background route could therefore take the human's keyboard focus or tie
 a drop to the human's next button release. The plugin withholds the popup grab,
-leaving the popup mapped, and cancels the drag source when the requesting
-client is under an agent lease or drag, or received background dispatch in the
-last two seconds, and the human's focus is not on that client. GTK still maps
-such a menu and handles agent keys in it, and agent clicks and scrolls reach
-it as described in [Pointer targets](#pointer-targets).
-`hyprctl -j cua:status` reports `input.primary_background`,
-`input.refused_popup_grabs`, and `input.refused_drag_starts`.
+leaving the popup mapped, and cancels the drag source when the request reacts
+to agent input. Hyprland drops the seat and serial that both requests quote,
+so the plugin reads them with a libwayland protocol logger, which sees each
+request just before Hyprland handles it. A request quoting an agent seat, or a
+serial an agent seat sent, is the agent's even while the human uses another
+window of the same app. Otherwise a request from the human's focused window is
+theirs, one from a window a lane leases or delivered to in the last two
+seconds is the agent's, and one from an app such a lane drives is the agent's
+when the human's focus is not in that app. Borrowed primary-seat resources take
+their serials from Hyprland, but they only act in apps the human's focus is
+not in. GTK and Qt send every key of an app to its open menu, wherever the
+compositor sends the key, so a popup whose grab was withheld gets
+`xdg_popup.popup_done` as soon as the human's keyboard is in its app, and when
+the human presses a key or button there. Otherwise GTK still maps such a menu
+and handles agent keys in it, and agent clicks and scrolls reach it as
+described in [Pointer targets](#pointer-targets). `hyprctl -j cua:status`
+reports `input.primary_background`, `input.refused_popup_grabs`, and
+`input.refused_drag_starts`.
 
 Hyprland also opens every new top-level window on the human's workspace,
 gives it keyboard focus, raises a new floating window over the others and over
@@ -326,20 +337,28 @@ the human's focused group. A new window is a reaction to agent input when the
 nearest window in its parent chain that is either the human's focused window
 or a window a lane leases or delivered to in the last two seconds is the
 lane's. With neither in its parent chain, it is a reaction when it comes from
-the process of such a lane window and the human's pointer and keyboard focus
-are not in that process. The rule compares processes, not clients, because
-Electron shows its GTK dialogs over a second Wayland connection. So a dialog
-of the agent's window is a reaction even while the human uses another window
-of the same app, and a dialog of the human's own window never is. A reaction
-window opens on the workspace of its parent, or with no parent, of the lane
-window in its app, as Hyprland's `workspace N silent` rule would place it.
-That workspace may be hidden or special. The plugin then sends `movewindow`
-and `movewindowv2`, because Hyprland has already sent `openwindow` naming the
-human's workspace. The window opens without initial focus, stays out of the
-human's group, and floats when its workspace has a fullscreen or maximized
-window. On the human's workspace it stacks directly under the human's window,
-also when that window is fullscreen, but Hyprland draws floating windows over
-tiled ones. `input.withheld_initial_focus` counts these windows.
+the process of such a lane window and either the human's pointer and keyboard
+focus are not in that process, or the lane delivered to it after the human's
+last click or Ctrl, Alt or Super chord there. Plain typing is no command, so
+the human typing on in one window does not claim a window the agent opened
+from another, while their own Ctrl+N does. The rule compares processes, not
+clients, because Electron shows its GTK dialogs over a second Wayland
+connection. So a dialog of the agent's window is a reaction even while the
+human uses another window of the same app, and a dialog of the human's own
+window never is. A reaction window opens on the workspace of its parent, or
+with no parent, of the lane window in its app, as Hyprland's
+`workspace N silent` rule would place it. That workspace may be hidden or
+special. The plugin then sends `movewindow` and `movewindowv2`, because
+Hyprland has already sent `openwindow` naming the human's workspace. The
+window opens without initial focus, stays out of the human's group, and floats
+when its workspace is visible or has a fullscreen or maximized window, so it
+never splits or resizes the human's tile. On a visible workspace it also gets
+`nofollowmouse` at `setprop` priority: Hyprland draws and hit-tests floating
+windows above tiled ones, so it may open under the human's pointer, and with
+`follow_mouse` moving the pointer would hand it their keyboard. A click still
+focuses it. On the human's workspace it stacks directly under the human's
+window, also when that window is fullscreen. `input.withheld_initial_focus`
+counts these windows.
 
 ## Agent cursor stacking
 

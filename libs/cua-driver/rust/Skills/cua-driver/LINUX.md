@@ -351,18 +351,26 @@ the agent seats. When the plugin reports that, Driver delivers through the
 target's own primary-seat resources instead, still without moving your focus or
 cursor. The result route remains `synthetic_events`. It refuses while your pointer or
 keyboard focus is on that app, and during a grab, drag-and-drop, or pointer
-constraint. The plugin also withholds popup grabs and cancels drag starts that a
-background app makes in reaction to agent input, so a dropdown cannot take your
-keyboard. GTK menus and combo boxes still open without the grab, and agent keys
-such as Down and Return choose an item. A window or dialog an app opens in
-reaction to agent input opens on the workspace of the window it belongs to,
-even a hidden or special one, without taking your focus. It never ends your
-fullscreen or maximized window, and on your workspace it stacks under your
-window. This holds even for a dialog of the agent's window in the app you are
-using. A dialog of your own window still opens on your workspace and takes
-your focus. Hyprland draws floating windows over tiled ones, so a dialog on
-your workspace can still cover part of a tiled window. Close such windows in
-the same task. With `misc:focus_on_activate` enabled, an app that asks to be
+constraint. The plugin also withholds popup grabs and cancels drag starts that
+an app makes in reaction to agent input, even in the app you are using, so a
+dropdown or drag cannot take your keyboard or pointer. GTK menus and combo
+boxes still open without the grab, and agent keys such as Down and Return
+choose an item. GTK and Qt send every key of an app to its open menu, so a menu
+the agent opens closes as soon as your keyboard is in that app. Your own menus
+and drags work as usual. A window or dialog an app opens in reaction to agent
+input opens on the workspace of the window it belongs to, even a hidden or
+special one, without taking your focus. In an app you are also using, a new
+window with no parent is the agent's when the agent acted in that app after
+your last click or Ctrl, Alt or Super shortcut there, so your own Ctrl+N still
+focuses its window while typing elsewhere in the app does not claim the
+agent's. Such a window never ends your fullscreen or maximized window, and on a
+workspace you can see it floats, so it never splits or resizes your tile.
+Moving your pointer over it does not focus it, because Hyprland draws floating
+windows over tiled ones and it may open under your pointer. Click it to type
+into it. On your workspace it stacks under your window, though it can still
+cover part of a tiled one. A dialog of your own window still opens on your
+workspace and takes your focus. Close such windows in the same task. With
+`misc:focus_on_activate` enabled, an app that asks to be
 activated in reaction to agent input can still take your focus. It is off by
 default. An agent click or scroll at `x`/`y` goes to what the window draws
 there, as your pointer would: its open menu, popover, or dropdown list when one

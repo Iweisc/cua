@@ -82,6 +82,11 @@ constexpr std::size_t kMaxResources = 512;
 // renderer process that is briefly descheduled, without leaving a refusal
 // window long enough to block the human's own later use of that app.
 constexpr auto kReactionWindow = std::chrono::seconds(2);
+// A click or modifier chord the human gave the app of `surface`.
+struct HumanCommand {
+    WP<CWLSurfaceResource> surface;
+    Clock::time_point at;
+};
 #ifdef CUA_HYPRLAND_INPUT
 constexpr bool kProduction = true;
 #else
@@ -276,6 +281,9 @@ struct InputExperiment::Impl {
     // The last client this lane delivered to. A popup grab or drag start that
     // client sends shortly afterwards is a reaction to agent input.
     WP<CWLSurfaceResource> recent_target;
+    // Borrowed primary-seat resources take their serials from Hyprland. They
+    // only act in apps the human is not in, where the app rule applies.
+    mutable AgentSerials agent_serials;
     Clock::time_point recent_dispatch{};
 
     explicit Impl(const std::string& directory, unsigned index) : lane(index) {
@@ -501,7 +509,11 @@ struct InputExperiment::Impl {
         if (physical_xkb_context) xkb_context_unref(physical_xkb_context);
         if (keymap_fd >= 0) close(keymap_fd);
     }
-    std::uint32_t serial() const { return wl_display_next_serial(g_pCompositor->m_wlDisplay); }
+    std::uint32_t serial() const {
+        const auto s = wl_display_next_serial(g_pCompositor->m_wlDisplay);
+        agent_serials.note(s, s);
+        return s;
+    }
     bool available() const { return !retired && !suspended && session_available(); }
     static void bind_seat(wl_client* client, void* data, std::uint32_t version, std::uint32_t id) {
         auto& self = *static_cast<Impl*>(data);
@@ -747,17 +759,26 @@ struct InputExperiment::Impl {
         if (surface && surface->client()) wl_client_get_credentials(surface->client(), &pid, nullptr, nullptr);
         return pid;
     }
-    // The window this lane drives in the app of a new window, unless the
-    // human is in that app. Apps are processes: X apps share one client, and
-    // Electron shows its GTK dialogs over a second Wayland connection.
-    SP<CWLSurfaceResource> app_target(const SP<CWLSurfaceResource>& surface, bool x) const {
+    // The window this lane drives in the app of a new window. When the human
+    // is in that app too, only if the agent gave it a command after the human
+    // last did. Apps are processes: X apps share one client, and Electron
+    // shows its GTK dialogs over a second Wayland connection.
+    SP<CWLSurfaceResource> app_target(const SP<CWLSurfaceResource>& surface, bool x, const std::vector<HumanCommand>& commands) const {
         const auto same = [&](const SP<CWLSurfaceResource>& other) {
             return x ? same_app(other, surface) : pid_of(surface) > 0 && pid_of(other) == pid_of(surface);
         };
-        if (!surface || same(g_pSeatManager->m_state.pointerFocus.lock()) || same(g_pSeatManager->m_state.keyboardFocus.lock())) return nullptr;
-        if (const auto s = lease && lease->route != InputRoute::primary_foreground ? lease->surface.lock() : nullptr; same(s)) return s;
-        if (const auto s = recent_target.lock(); Clock::now() - recent_dispatch < kReactionWindow && same(s)) return s;
-        return nullptr;
+        SP<CWLSurfaceResource> target;
+        Clock::time_point agent;
+        if (const auto s = lease && lease->route != InputRoute::primary_foreground ? lease->surface.lock() : nullptr; same(s)) {
+            target = s; agent = Clock::now();
+        } else if (const auto s = recent_target.lock(); Clock::now() - recent_dispatch < kReactionWindow && same(s)) {
+            target = s; agent = recent_dispatch;
+        }
+        if (!target || (!same(g_pSeatManager->m_state.pointerFocus.lock()) && !same(g_pSeatManager->m_state.keyboardFocus.lock()))) return target;
+        std::optional<Clock::time_point> human;
+        for (const auto& c : commands)
+            if (same(c.surface.lock()) && (!human || c.at > *human)) human = c.at;
+        return agent_commanded_last(agent, human) ? target : nullptr;
     }
     // The window this lane is driving, or drove within the reaction window.
     bool drives(const SP<CWLSurfaceResource>& surface) const {
@@ -1917,9 +1938,24 @@ struct InputExperiment::ReactionGuards {
     CFunctionHook* grab = nullptr;
     CFunctionHook* drag = nullptr;
     std::uint64_t refused_grabs = 0, refused_drags = 0, withheld_focus = 0;
-    CHyprSignalListener open_early, open;
+    CHyprSignalListener open_early, open, human_key, human_button, human_focus;
     // The reaction window between its openEarly and open events.
     PHLWINDOWREF withheld;
+    // Hyprland drops the seat and serial of xdg_popup.grab and
+    // wl_data_device.start_drag. The protocol logger sees each request just
+    // before its handler runs, so the hooks read them from here.
+    wl_protocol_logger* logger = nullptr;
+    struct Quote {
+        wl_client* client = nullptr;
+        wl_resource* seat = nullptr;
+        std::uint32_t serial = 0;
+    } quoted;
+    std::vector<HumanCommand> human_commands;
+    // Popups whose grab was withheld. GTK and Qt send every key of an app to
+    // its open menu, wherever the compositor sends them, so such a menu
+    // closes as soon as the human's keyboard is in its app. Closing it at
+    // their first key is too late: GTK still hands that key to the menu.
+    std::vector<WP<CXDGPopupResource>> agent_popups;
 
     ReactionGuards(InputExperiment& input, void* handle) : owner(input), plugin(handle) {
         if (live) throw std::runtime_error("input reaction guards already installed");
@@ -1930,6 +1966,22 @@ struct InputExperiment::ReactionGuards {
                 reinterpret_cast<void*>(guarded_grab));
             drag = install_hook(plugin, "_ZN21CWLDataDeviceProtocol12initiateDragEN9Hyprutils6Memory12CWeakPointerI21CWLDataSourceResourceEENS1_14CSharedPointerI18CWLSurfaceResourceEES7_",
                 reinterpret_cast<void*>(guarded_drag));
+            logger = wl_display_add_protocol_logger(g_pCompositor->m_wlDisplay, quote_request, this);
+            if (!logger) throw std::runtime_error("input protocol logger unavailable");
+            // Both fire before Hyprland delivers the human's input.
+            human_key = Event::bus()->m_events.input.keyboard.key.listen([this](IKeyboard::SKeyEvent e, Event::SCallbackInfo&) {
+                if (e.state != WL_KEYBOARD_KEY_STATE_PRESSED) return;
+                const auto focus = g_pSeatManager->m_state.keyboardFocus.lock();
+                close_agent_popups(focus);
+                if (g_pInputManager->getModsFromAllKBs() & (HL_MODIFIER_CTRL | HL_MODIFIER_ALT | HL_MODIFIER_META)) note_command(focus);
+            });
+            human_button = Event::bus()->m_events.input.mouse.button.listen([this](IPointer::SButtonEvent e, Event::SCallbackInfo&) {
+                if (e.state != WL_POINTER_BUTTON_STATE_PRESSED) return;
+                const auto focus = g_pSeatManager->m_state.pointerFocus.lock();
+                close_agent_popups(focus);
+                note_command(focus);
+            });
+            human_focus = g_pSeatManager->m_events.keyboardFocusChange.listen([this] { close_agent_popups(g_pSeatManager->m_state.keyboardFocus.lock()); });
             // Hyprland focuses a new window after openEarly unless this is set, and
             // sets it itself for X menus that declare their type.
             open_early = Event::bus()->m_events.window.openEarly.listen([this](PHLWINDOW window) {
@@ -1940,7 +1992,12 @@ struct InputExperiment::ReactionGuards {
                 // Otherwise it would join the human's focused group as its visible tab.
                 window->m_groupRules |= Desktop::View::GROUP_BARRED;
                 open_on(window, anchor->m_workspace);
-                window->m_isFloating = reaction_floats(window->m_isFloating, Fullscreen::controller()->hasFullscreen(window->m_workspace));
+                const bool visible = window->m_workspace && window->m_workspace->isVisible();
+                window->m_isFloating = reaction_floats(window->m_isFloating, visible, Fullscreen::controller()->hasFullscreen(window->m_workspace));
+                // A floating window still draws over tiled ones and may open under
+                // the human's pointer. With follow_mouse, merely moving the pointer
+                // would then hand it their keyboard. A click still does.
+                if (visible) window->m_ruleApplicator->noFollowMouse().set(true, Desktop::Types::PRIORITY_SET_PROP);
                 withheld = window;
                 ++withheld_focus;
             });
@@ -1960,7 +2017,61 @@ struct InputExperiment::ReactionGuards {
     void uninstall() {
         if (drag) HyprlandAPI::removeFunctionHook(plugin, drag);
         if (grab) HyprlandAPI::removeFunctionHook(plugin, grab);
+        if (logger) wl_protocol_logger_destroy(logger);
         live = nullptr;
+    }
+    static void quote_request(void* data, wl_protocol_logger_type type, const wl_protocol_logger_message* m) {
+        if (type != WL_PROTOCOL_LOGGER_REQUEST) return;
+        auto& guards = *static_cast<ReactionGuards*>(data);
+        const std::string_view name = m->message->name, interface = wl_resource_get_class(m->resource);
+        // xdg_popup.grab(seat, serial) and wl_data_device.start_drag(source, origin, icon, serial).
+        if (name == "grab" && interface == "xdg_popup" && m->arguments_count == 2)
+            guards.quoted = {wl_resource_get_client(m->resource), reinterpret_cast<wl_resource*>(m->arguments[0].o), m->arguments[1].u};
+        else if (name == "start_drag" && interface == "wl_data_device" && m->arguments_count == 4)
+            guards.quoted = {wl_resource_get_client(m->resource), nullptr, m->arguments[3].u};
+    }
+    // Closes the agent's menus in the app the human's input is going to,
+    // unless that input is on one of them.
+    void close_agent_popups(const SP<CWLSurfaceResource>& surface) {
+        const auto surface_of = [](const SP<CXDGPopupResource>& popup) {
+            return popup && popup->m_surface ? popup->m_surface->m_surface.lock() : nullptr;
+        };
+        std::erase_if(agent_popups, [&](const auto& weak) { return !surface_of(weak.lock()); });
+        if (!surface || std::ranges::any_of(agent_popups, [&](const auto& weak) { return surface_of(weak.lock()) == surface; })) return;
+        std::erase_if(agent_popups, [&](const auto& weak) {
+            const auto popup = weak.lock();
+            if (surface_of(popup)->client() != surface->client()) return false;
+            popup->done();
+            return true;
+        });
+    }
+    void note_command(const SP<CWLSurfaceResource>& surface) {
+        if (!surface) return;
+        const auto now = Clock::now();
+        std::erase_if(human_commands, [&](const auto& c) { return now - c.at >= kReactionWindow || !c.surface; });
+        human_commands.push_back({surface, now});
+    }
+    // Whether a popup grab or drag start from `surface`, in the window whose
+    // own surface is `root`, reacts to agent input. Reads and clears the quote.
+    bool agent_input(const SP<CWLSurfaceResource>& surface, const SP<CWLSurfaceResource>& root) {
+        GrabSignals signals;
+        if (quoted.client == surface->client()) {
+            signals.agent_seat = quoted.seat && std::ranges::any_of(owner.lanes_, [&](const auto& lane) {
+                return std::ranges::any_of(lane->seats, [&](const auto& seat) { return !seat->dead && seat->wl->resource() == quoted.seat; });
+            });
+            signals.agent_serial = std::ranges::any_of(owner.lanes_, [&](const auto& lane) { return lane->agent_serials.contains(quoted.serial); });
+        }
+        quoted = {};
+        signals.human_window = root && root == g_pSeatManager->m_state.keyboardFocus.lock();
+        signals.agent_window = root && std::ranges::any_of(owner.lanes_, [&](const auto& lane) { return lane->drives(root); });
+        signals.agent_app = agent_reaction(surface->client());
+        return agent_grab(signals);
+    }
+    // The surface of the window a popup belongs to.
+    static SP<CWLSurfaceResource> root_of(const SP<CXDGPopupResource>& popup) {
+        auto parent = popup->m_parent.lock();
+        while (parent && parent->m_popup) parent = parent->m_popup->m_parent.lock();
+        return parent && parent->m_toplevel ? parent->m_surface.lock() : nullptr;
     }
     bool agent_reaction(wl_client* client) const {
         return std::ranges::any_of(owner.lanes_, [&](const auto& lane) { return lane->owns_reaction(client); });
@@ -1977,7 +2088,7 @@ struct InputExperiment::ReactionGuards {
         };
         PHLWINDOW app_window;
         for (const auto& lane : owner.lanes_) {
-            const auto target = lane->app_target(surface, window->m_isX11);
+            const auto target = lane->app_target(surface, window->m_isX11, human_commands);
             if (const auto view = target ? Desktop::View::CWLSurface::fromResource(target) : nullptr) {
                 app_window = Desktop::View::CWindow::fromView(view->view());
                 break;
@@ -2019,14 +2130,19 @@ struct InputExperiment::ReactionGuards {
         const auto surface = popup && popup->m_surface ? popup->m_surface->m_surface.lock() : nullptr;
         // The popup stays mapped and still receives agent input. Only the
         // compositor-global grab, which would move human focus, is withheld.
-        if (surface && guards.agent_reaction(surface->client())) { ++guards.refused_grabs; return; }
+        if (surface && guards.agent_input(surface, root_of(popup))) {
+            ++guards.refused_grabs;
+            guards.agent_popups.push_back(popup);
+            guards.close_agent_popups(g_pSeatManager->m_state.keyboardFocus.lock());
+            return;
+        }
         reinterpret_cast<Grab>(guards.grab->m_original)(self, popup);
     }
     static void guarded_drag(CWLDataDeviceProtocol* self, WP<CWLDataSourceResource> source,
                              SP<CWLSurfaceResource> icon, SP<CWLSurfaceResource> origin) {
         auto& guards = *live;
         // Hyprland would drop this drag on the human's next button release.
-        if (origin && guards.agent_reaction(origin->client())) {
+        if (origin && guards.agent_input(origin, origin)) {
             ++guards.refused_drags;
             if (const auto s = source.lock()) s->cancelled();
             return;
