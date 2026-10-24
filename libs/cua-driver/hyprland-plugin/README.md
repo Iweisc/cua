@@ -158,6 +158,13 @@ Do not add a `plugin =` line to Hyprland configuration until the ABI match and
 status output have been checked in a disposable session. A mismatched module
 may be refused by Hyprland or fail during load. If load fails after a Hyprland
 upgrade, leave it unloaded, rebuild against the new exact package, and retry.
+
+Never write a new build into the module file a running Hyprland has loaded,
+for example by copying it onto the same path. Truncating a mapped module
+discards even its relocated pages, and Hyprland crashes the next time it runs
+plugin code. Install a replacement as a
+new file (a package upgrade does this, as does copying to a temporary name and
+renaming it over the old one), then restart the desktop before loading it.
 The portable driver remains available without this plugin.
 
 `hyprctl -j cua:status` is the authoritative runtime status surface. Consumers
