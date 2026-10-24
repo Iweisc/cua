@@ -23,9 +23,11 @@ class InputExperiment {
     struct Impl;
     struct DesktopListeners;
     struct ReactionGuards;
+    struct CursorStacking;
     std::array<std::unique_ptr<Impl>, 2> lanes_;
     std::unique_ptr<PrimaryTrace> trace_;
     std::unique_ptr<DesktopListeners> desktop_listeners_;
     std::unique_ptr<ReactionGuards> reaction_guards_;
+    std::unique_ptr<CursorStacking> cursor_stacking_;
 };
 } // namespace cua::hyprland

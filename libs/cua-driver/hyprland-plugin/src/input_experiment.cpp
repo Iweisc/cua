@@ -10,6 +10,7 @@
 #include "owned_socket_path.hpp"
 #include "foreground_route.hpp"
 #include "keymap_equivalence.hpp"
+#include "cursor_layer.hpp"
 
 #include <src/Compositor.hpp>
 #include <src/devices/IKeyboard.hpp>
@@ -26,6 +27,9 @@
 #include <src/layout/LayoutManager.hpp>
 #include <src/plugins/PluginAPI.hpp>
 #include <src/protocols/XDGShell.hpp>
+#include <src/protocols/LayerShell.hpp>
+#include <src/render/Renderer.hpp>
+#include <src/render/pass/SurfacePassElement.hpp>
 #include <src/xwayland/XSurface.hpp>
 #include <linux/input-event-codes.h>
 #include <wayland.hpp>
@@ -1785,6 +1789,15 @@ struct InputExperiment::DesktopListeners {
     }
 };
 
+static CFunctionHook* install_hook(void* plugin, const std::string& symbol, void* destination) {
+    // Exact mangled names pin these hooks to the audited 0.56.2 signatures.
+    const auto matches = HyprlandAPI::findFunctionsByName(plugin, symbol);
+    if (matches.size() != 1) throw std::runtime_error("input hook target unavailable");
+    auto* hook = HyprlandAPI::createFunctionHook(plugin, matches.front().address, destination);
+    if (!hook || !hook->hook()) throw std::runtime_error("input hook refused");
+    return hook;
+}
+
 // Popup grabs and drag starts are client requests the compositor accepts from
 // any seat. These hooks keep a client reacting to agent input from taking the
 // human's focus or pointer. They forward everything else unchanged.
@@ -1802,9 +1815,9 @@ struct InputExperiment::ReactionGuards {
     ReactionGuards(InputExperiment& input, void* handle) : owner(input), plugin(handle) {
         if (live) throw std::runtime_error("input reaction guards already installed");
         live = this;
-        grab = install("_ZN17CXDGShellProtocol14addOrStartGrabEN9Hyprutils6Memory14CSharedPointerI17CXDGPopupResourceEE",
+        grab = install_hook(plugin, "_ZN17CXDGShellProtocol14addOrStartGrabEN9Hyprutils6Memory14CSharedPointerI17CXDGPopupResourceEE",
             reinterpret_cast<void*>(guarded_grab));
-        drag = install("_ZN21CWLDataDeviceProtocol12initiateDragEN9Hyprutils6Memory12CWeakPointerI21CWLDataSourceResourceEENS1_14CSharedPointerI18CWLSurfaceResourceEES7_",
+        drag = install_hook(plugin, "_ZN21CWLDataDeviceProtocol12initiateDragEN9Hyprutils6Memory12CWeakPointerI21CWLDataSourceResourceEENS1_14CSharedPointerI18CWLSurfaceResourceEES7_",
             reinterpret_cast<void*>(guarded_drag));
         // Hyprland focuses a new window after openEarly unless this is set, and
         // sets it itself for X menus that declare their type.
@@ -1820,14 +1833,6 @@ struct InputExperiment::ReactionGuards {
         if (drag) HyprlandAPI::removeFunctionHook(plugin, drag);
         if (grab) HyprlandAPI::removeFunctionHook(plugin, grab);
         live = nullptr;
-    }
-    CFunctionHook* install(const std::string& symbol, void* destination) {
-        // Exact mangled names pin these hooks to the audited 0.56.2 signatures.
-        const auto matches = HyprlandAPI::findFunctionsByName(plugin, symbol);
-        if (matches.size() != 1) throw std::runtime_error("input reaction hook target unavailable");
-        auto* hook = HyprlandAPI::createFunctionHook(plugin, matches.front().address, destination);
-        if (!hook || !hook->hook()) throw std::runtime_error("input reaction hook refused");
-        return hook;
     }
     bool agent_reaction(wl_client* client) const {
         return std::ranges::any_of(owner.lanes_, [&](const auto& lane) { return lane->owns_reaction(client); });
@@ -1855,6 +1860,75 @@ struct InputExperiment::ReactionGuards {
     }
 };
 
+// Driver's agent cursor sits one stacking position above its target window,
+// as on macOS: windows above the target cover it, and it is not drawn while
+// the target is on a hidden workspace. Driver names each cursor layer after
+// its target, so these hooks only move that layer within the frame.
+struct InputExperiment::CursorStacking {
+    using Layer = void (*)(Render::IHyprRenderer*, PHLLS, PHLMONITOR, const Time::steady_tp&, bool, bool);
+    using Window = void (*)(Render::IHyprRenderer*, PHLWINDOW, PHLMONITOR, const Time::steady_tp&, bool, Render::eRenderPassMode, bool, bool);
+    static inline CursorStacking* live = nullptr;
+    void* plugin;
+    CFunctionHook* layer = nullptr;
+    CFunctionHook* window = nullptr;
+
+    explicit CursorStacking(void* handle) : plugin(handle) {
+        if (live) throw std::runtime_error("cursor stacking already installed");
+        live = this;
+        layer = install_hook(plugin, "_ZN6Render13IHyprRenderer11renderLayerEN9Hyprutils6Memory14CSharedPointerIN7Desktop4View13CLayerSurfaceEEENS3_IN7Monitor8CMonitorEEERKNSt6chrono10time_pointINSB_3_V212steady_clockENSB_8durationIlSt5ratioILl1ELl1000000000EEEEEEbb",
+            reinterpret_cast<void*>(render_layer));
+        window = install_hook(plugin, "_ZN6Render13IHyprRenderer12renderWindowEN9Hyprutils6Memory14CSharedPointerIN7Desktop4View7CWindowEEENS3_IN7Monitor8CMonitorEEERKNSt6chrono10time_pointINSB_3_V212steady_clockENSB_8durationIlSt5ratioILl1ELl1000000000EEEEEEbNS_15eRenderPassModeEbb",
+            reinterpret_cast<void*>(render_window));
+    }
+    ~CursorStacking() {
+        if (window) HyprlandAPI::removeFunctionHook(plugin, window);
+        if (layer) HyprlandAPI::removeFunctionHook(plugin, layer);
+        live = nullptr;
+    }
+    static bool target_alive(std::uintptr_t address) {
+        return std::ranges::any_of(Desktop::windowState()->windows(),
+            [&](const auto& w) { return reinterpret_cast<std::uintptr_t>(w.get()) == address && w->m_isMapped; });
+    }
+    static void render_layer(Render::IHyprRenderer* self, PHLLS ls, PHLMONITOR monitor, const Time::steady_tp& time, bool popups, bool lockscreen) {
+        // A cursor whose target is gone falls back to the top of the stack.
+        const auto target = ls ? pinned_cursor_window(ls->m_namespace) : std::nullopt;
+        if (target && target_alive(*target)) return;
+        reinterpret_cast<Layer>(live->layer->m_original)(self, ls, monitor, time, popups, lockscreen);
+    }
+    static void render_window(Render::IHyprRenderer* self, PHLWINDOW w, PHLMONITOR monitor, const Time::steady_tp& time, bool decorate,
+                              Render::eRenderPassMode mode, bool ignore_position, bool standalone) {
+        reinterpret_cast<Window>(live->window->m_original)(self, w, monitor, time, decorate, mode, ignore_position, standalone);
+        // Only the focused tiled window gets a separate popup pass, so the
+        // cursor is drawn after the main pass. The target's own menus cover
+        // it, as on macOS. Single-window captures never include it.
+        if (!w || !monitor || mode == Render::RENDER_PASS_POPUP || standalone || ignore_position || self->m_bRenderingSnapshot ||
+            !w->m_isMapped || w->isHidden())
+            return;
+        const auto address = reinterpret_cast<std::uintptr_t>(w.get());
+        // The cursor slides with its window when the workspace changes.
+        const auto offset = w->m_pinned || !w->m_workspace ? Vector2D{} : w->m_workspace->m_renderOffset->value();
+        for (const auto& ref : monitor->m_layerSurfaceLayers[ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY]) {
+            const auto ls = ref.lock();
+            if (!ls || !ls->m_mapped || pinned_cursor_window(ls->m_namespace) != address) continue;
+            const auto surface = ls->wlSurface()->resource();
+            if (!surface || !surface->m_current.texture) continue;
+            // The layer's own open animation is skipped: the cursor appears
+            // with the window it is pinned to.
+            CSurfacePassElement::SRenderData data;
+            data.pMonitor = monitor;
+            data.when = time;
+            data.pos = ls->m_geometry.pos() + offset;
+            data.surface = surface;
+            data.texture = surface->m_current.texture;
+            data.w = ls->m_geometry.w;
+            data.h = ls->m_geometry.h;
+            data.pLS = ls;
+            data.clipBox = CBox{0, 0, monitor->m_size.x, monitor->m_size.y}.scale(monitor->m_scale).round();
+            self->addPassElement(makeUnique<CSurfacePassElement>(data));
+        }
+    }
+};
+
 InputExperiment::InputExperiment(const std::string& directory, void* plugin) {
     SeatLifetime lifetime(directory);
     for (unsigned i = 0; i < lanes_.size(); ++i) lanes_[i] = std::make_unique<Impl>(directory, i);
@@ -1874,10 +1948,12 @@ InputExperiment::InputExperiment(const std::string& directory, void* plugin) {
     desktop_listeners_ = std::make_unique<DesktopListeners>(*this);
 #ifdef CUA_HYPRLAND_INPUT
     reaction_guards_ = std::make_unique<ReactionGuards>(*this, plugin);
+    cursor_stacking_ = std::make_unique<CursorStacking>(plugin);
 #endif
     lifetime.publish();
 }
 InputExperiment::~InputExperiment() {
+    cursor_stacking_.reset();
     reaction_guards_.reset();
     desktop_listeners_.reset();
     for (auto& lane : lanes_) { lane->retire(); lane->trace = nullptr; lane->peers = {}; }
