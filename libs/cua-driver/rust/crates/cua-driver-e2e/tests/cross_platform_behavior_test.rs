@@ -1543,8 +1543,20 @@ fn native_hyprland_semantic_input_available() -> bool {
     }
 }
 
+fn native_hyprland_plugin_pointer() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        platform_linux::wayland::hyprland_input::enabled()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
+
 fn native_hyprland_semantic_case(
     available: bool,
+    plugin_pointer: bool,
     host: &str,
     action: &str,
     targeting: Targeting,
@@ -1552,14 +1564,14 @@ fn native_hyprland_semantic_case(
 ) -> bool {
     // These fixture controls have proven focus-free AT-SPI actions. Do not
     // extend this to other PX targets merely because they accept a click.
+    // With the input plugin loaded, a PX click is a plugin pointer click.
     available
         && delivery == Delivery::Background
-        && matches!(
-            (host, action, targeting),
-            ("electron" | "tauri", "left_click", Targeting::Px)
-                | ("electron" | "tauri", "child_window", Targeting::Px)
-                | ("electron", "scroll", Targeting::Ax)
-        )
+        && match (host, action, targeting) {
+            ("electron" | "tauri", "left_click" | "child_window", Targeting::Px) => !plugin_pointer,
+            ("electron", "scroll", Targeting::Ax) => true,
+            _ => false,
+        }
 }
 
 fn assert_native_hyprland_semantic_route(
@@ -1577,6 +1589,7 @@ fn assert_native_hyprland_semantic_route(
     if delivery == "background"
         && native_hyprland_semantic_case(
             native_hyprland_semantic_input_available(),
+            native_hyprland_plugin_pointer(),
             fixture.name,
             action,
             targeting,
@@ -1605,6 +1618,7 @@ fn shared_case(spec: &HostSpec, action: &str, addressing: &str, delivery: &str) 
         addressing,
         delivery,
         native_hyprland_semantic_input_available(),
+        native_hyprland_plugin_pointer(),
     )
 }
 
@@ -1614,6 +1628,7 @@ fn shared_case_with_native_hyprland(
     addressing: &str,
     delivery: &str,
     native_hyprland: bool,
+    plugin_pointer: bool,
 ) -> CaseSpec {
     let targeting = match addressing {
         "ax" => Targeting::Ax,
@@ -1627,8 +1642,14 @@ fn shared_case_with_native_hyprland(
     };
     let scenario = format!("{action}_{addressing}_{delivery}");
     let cell_id = format!("{}-{}-{scenario}", std::env::consts::OS, spec.name).replace('_', "-");
-    let native_semantic =
-        native_hyprland_semantic_case(native_hyprland, spec.name, action, targeting, delivery_kind);
+    let native_semantic = native_hyprland_semantic_case(
+        native_hyprland,
+        plugin_pointer,
+        spec.name,
+        action,
+        targeting,
+        delivery_kind,
+    );
     let expected_refusals = if native_semantic {
         Vec::new()
     } else if cfg!(target_os = "windows") && delivery_kind == Delivery::Background {
@@ -1792,7 +1813,8 @@ fn native_hyprland_semantic_declarations_require_delivery_and_all_background_ora
             args: Vec::new(),
             title: "test",
         };
-        let case = shared_case_with_native_hyprland(&spec, action, addressing, "background", true);
+        let case =
+            shared_case_with_native_hyprland(&spec, action, addressing, "background", true, false);
         assert_eq!(case.expected_behavior, ContractExpectation::Deliver);
         assert_eq!(case.driver_route, DriverRoute::LinuxAtSpiAction);
         for oracle in [
@@ -1809,12 +1831,38 @@ fn native_hyprland_semantic_declarations_require_delivery_and_all_background_ora
             Targeting::Px
         };
         assert!(
-            !native_hyprland_semantic_case(false, host, action, targeting, Delivery::Background),
+            !native_hyprland_semantic_case(
+                false,
+                false,
+                host,
+                action,
+                targeting,
+                Delivery::Background
+            ),
             "{host}/{action}: semantic route without native Hyprland input"
         );
         assert!(
-            !native_hyprland_semantic_case(true, host, action, targeting, Delivery::Foreground),
+            !native_hyprland_semantic_case(
+                true,
+                false,
+                host,
+                action,
+                targeting,
+                Delivery::Foreground
+            ),
             "{host}/{action}: foreground delivery must not take the semantic route"
+        );
+        assert_eq!(
+            native_hyprland_semantic_case(
+                true,
+                true,
+                host,
+                action,
+                targeting,
+                Delivery::Background
+            ),
+            addressing == "ax",
+            "{host}/{action}: with the input plugin only element actions stay semantic"
         );
     }
     // Accepting a click is not proof of a focus-free AT-SPI action.
@@ -1826,7 +1874,14 @@ fn native_hyprland_semantic_declarations_require_delivery_and_all_background_ora
         ("webview2", "child_window", Targeting::Px),
     ] {
         assert!(
-            !native_hyprland_semantic_case(true, host, action, targeting, Delivery::Background),
+            !native_hyprland_semantic_case(
+                true,
+                false,
+                host,
+                action,
+                targeting,
+                Delivery::Background
+            ),
             "{host}/{action}/{targeting:?} is not a proven semantic cell"
         );
     }

@@ -336,8 +336,10 @@ constraint. The plugin also withholds popup grabs and cancels drag starts that a
 background app makes in reaction to agent input, so a dropdown cannot take your
 keyboard. GTK menus and combo boxes still open without the grab, and agent keys
 such as Down and Return choose an item. Agent clicks reach only the window's
-main surface, not its menus, so use keys inside a menu. AT-SPI routes retain
-their separate behavior.
+main surface, not its menus, so use keys inside a menu. A click at `x`/`y` is
+always a pointer click, as on macOS, so it places the caret and focuses the
+entry under it. It never fires the accessibility action at that point. A click
+by `element_token` still fires that element's AT-SPI action.
 
 With the input plugin, the agent cursor sits directly above the window it acts
 on, as on macOS. Windows above that window cover it, and it is not drawn while

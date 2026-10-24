@@ -4937,6 +4937,32 @@ fn type_text_routes_isolated_background_before_generic_wayland_refusal() {
 
 #[cfg(test)]
 #[test]
+fn isolated_pixel_click_goes_straight_to_the_plugin_pointer() {
+    // Structural, like the tests above: the branch needs a live plugin. An
+    // AT-SPI action in front of the pointer opened Ghostty's tab overview.
+    let source = include_str!("impl_.rs");
+    let pixel_path = source
+        .rsplit_once("impl Tool for ClickTool {")
+        .unwrap()
+        .1
+        .split_once("impl Tool for TypeTextTool {")
+        .unwrap()
+        .0
+        .split_once("// Coordinate-based path.")
+        .unwrap()
+        .1;
+    let before_plugin = pixel_path
+        .split_once("if isolated_background {")
+        .unwrap()
+        .1
+        .split_once("return isolated_hyprland_action(")
+        .expect("isolated pixel clicks must use the plugin pointer")
+        .0;
+    assert!(!before_plugin.contains("atspi"), "{before_plugin}");
+}
+
+#[cfg(test)]
+#[test]
 fn coordinate_click_keeps_wayland_background_refusal_ahead_of_screenshot_context() {
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -6447,7 +6473,8 @@ impl Tool for ClickTool {
                 delivery first resolves the accessible under the point and fires its action \
                 (the result says `hit: <role> \"<name>\" action=...`; a file / list item is \
                 selected through its container: `selected: ...`), else presses the real \
-                virtual pointer there. A click that opens a popup menu names it (`popup: \
+                virtual pointer there. With the Hyprland input plugin, a pixel click is \
+                always a real pointer click. A click that opens a popup menu names it (`popup: \
                 {window_id, bounds}`): pass that window_id to get_window_state to index its \
                 items. The token is stale once the next get_window_state of the same \
                 window replaces its snapshot — \
@@ -7165,17 +7192,10 @@ impl Tool for ClickTool {
                     "modified clicks are unsupported by isolated input",
                 );
             }
-            if button == 1 && count == 1 {
-                let semantic = tokio::task::spawn_blocking(move || {
-                    crate::atspi::perform_action_at_screen_point(pid, xid, output_x, output_y)
-                })
-                .await;
-                if matches!(semantic, Ok(Ok(Some(_)))) {
-                    return ToolResult::text("Dispatched AT-SPI click.").with_structured(json!({
-                        "path": "wayland_atspi", "verified": false, "effect": "unverifiable"
-                    }));
-                }
-            }
+            // A pixel click is a pointer click here, as on macOS. Don't put the
+            // AT-SPI action under the point in front of it: that action is not
+            // a click. It opened Ghostty's tab overview from a full-window
+            // `overview.open` node, and left the caret where it was in Code.
             return isolated_hyprland_action(
                 &args,
                 pid,

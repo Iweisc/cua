@@ -83,6 +83,7 @@ are capabilities, not one uniform API.
 PX background left-click rows may resolve the screen point to an actionable
 AT-SPI node. Such a pass proves the public PX-addressed behavior and its desktop
 side effects, but it does not prove raw pixel delivery to canvases or games.
+On Hyprland with the input plugin, a PX click is always a plugin pointer click.
 
 The [accepted Hyprland foreground extension](https://github.com/trycua/cua/issues/3550#issuecomment-5564996417)
 is planned support, not an empirical pass in this table. Production protocol v3
