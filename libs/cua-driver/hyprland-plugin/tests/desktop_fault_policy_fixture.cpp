@@ -143,7 +143,7 @@ int main() {
     }
     // Every passive safety guard still applies during either desktop fault.
     for (bool session_fault : {true, false}) {
-        for (int bad = 0; bad < 8; ++bad) {
+        for (int bad = 0; bad < 7; ++bad) {
             Lane l; l.desktop_transition();
             if (session_fault) l.session = false; else l.layout = false;
             switch (bad) {
@@ -152,12 +152,16 @@ int main() {
                 case 2: l.pointers.front()->dead = true; break;
                 case 3: l.pointers.front()->resource_live = false; break;
                 case 4: l.pointers.front()->focus.reset(); break;
-                case 5: l.primary_busy = true; break;
-                case 6: l.peer_busy = true; break;
-                case 7: l.window.reset(); break;
+                case 5: l.peer_busy = true; break;
+                case 6: l.window.reset(); break;
             }
             l.guard_targets(); l.check_inert(false);
         }
+        // The agent seat's resting pointer may share an app with the human.
+        Lane l; l.desktop_transition();
+        if (session_fault) l.session = false; else l.layout = false;
+        l.primary_busy = true;
+        l.guard_targets(); l.check_inert();
     }
     // Active safety failures and explicit human takeover continue to leave.
     for (int bad = 0; bad < 6; ++bad) {

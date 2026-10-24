@@ -570,6 +570,12 @@ struct InputExperiment::Impl {
     bool primary_conflict(const Client& c) const {
         if (c.route == InputRoute::primary_foreground)
             return foreground_started && !foreground_activating && !foreground_guard(c).can_dispatch(foreground_needs_pointer);
+        // The agent seat has its own pointer and keyboard, so it may share a
+        // native app with the human, as on macOS. An X app has one client
+        // pointer for all its windows, and its reactions to the agent would
+        // reach the human's keyboard, so X targets and the routes that borrow
+        // the human's own resources still stay out of the human's app.
+        if (c.route == InputRoute::independent && !c.xwayland) return false;
         return primary_conflict(c.surface.lock());
     }
     // XWayland is a single Wayland client for every X app. Each input user has
@@ -1425,9 +1431,10 @@ struct InputExperiment::Impl {
         if (c.xwayland && cap != 2 && g_pSeatManager->m_state.keyboardFocus.lock() != c.human_focus.lock()) {
             send(c, refusal("xwayland_focus_changed")); return;
         }
-        // Every X raw listener sees agent pointer events, and a game that locks
-        // or confines the human's pointer usually reads exactly those.
-        if (c.xwayland && cap != 2 && g_pInputManager->isConstrained()) {
+        // Every X raw listener sees agent pointer motion, and a game that locks
+        // or confines the human's pointer usually reads exactly that. Clicks
+        // and scrolls send no motion, so only a drag waits for the game.
+        if (c.xwayland && cap == 8 && g_pInputManager->isConstrained()) {
             send(c, refusal("primary_constraint")); return;
         }
         if (c.route == InputRoute::primary_foreground) {
@@ -1668,7 +1675,7 @@ struct InputExperiment::Impl {
             // Availability controls admission, not passive pointer presence.
             // Retention never excuses a changed target, binding, or conflict.
             if (!geometry || *geometry != pointer_target.geometry() ||
-                !bound || primary_conflict(surface) || agent_conflict(surface)) revoke("cancelled");
+                !bound || agent_conflict(surface)) revoke("cancelled");
         }
     }
     void step() {
@@ -1764,8 +1771,7 @@ struct InputExperiment::DesktopListeners {
     }
     void primary_changed() {
         for (auto& lane : owner.lanes_) {
-            if ((lane->lease && lane->primary_conflict(*lane->lease)) ||
-                (lane->pointer_target.entered() && lane->primary_conflict(lane->pointer_target.surface())))
+            if (lane->lease && lane->primary_conflict(*lane->lease))
                 lane->cancel_authority("primary_target_busy", false);
         }
     }
