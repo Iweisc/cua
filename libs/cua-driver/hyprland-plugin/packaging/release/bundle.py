@@ -23,6 +23,7 @@ cmake/VerifyRuntime.cmake
 include/cua_hyprland/protocol.hpp
 include/cua_hyprland/session.hpp
 include/cua_hyprland/status.hpp
+src/cursor_layer.hpp
 src/drag_geometry.hpp
 src/foreground_route.hpp
 src/inject_server.cpp
@@ -45,6 +46,7 @@ src/target_identity.hpp
 tests/agent_key_repeat_test.py
 tests/cmake-api/CMakeLists.txt
 tests/cmake-api/include/src/plugins/PluginAPI.hpp
+tests/cursor_layer_test.cpp
 tests/desktop_fault_policy_fixture.cpp
 tests/desktop_fault_policy_test.py
 tests/drag_geometry_test.cpp
