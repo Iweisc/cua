@@ -227,9 +227,10 @@ While that window is mapped, the plugin leaves the layer out of Hyprland's
 layer pass and draws it right after the window's main pass, at the window's
 workspace offset. Windows stacked above the target and the target's own
 popups cover the cursor, and a hidden workspace hides it. Single-window
-captures and snapshots never include it. Once the window is gone, the layer
-renders as an ordinary overlay layer. The plain `cua-agent-cursor` layer stays
-above every window.
+captures never include it. Hyprland snapshots a window only to animate its
+close, and that snapshot includes the cursor, so it fades out with the window.
+A pinned layer is never drawn above every window. The plain
+`cua-agent-cursor` layer stays above every window.
 
 ## XWayland extension
 

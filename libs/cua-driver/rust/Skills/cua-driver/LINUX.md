@@ -332,9 +332,8 @@ their separate behavior.
 
 With the input plugin, the agent cursor sits directly above the window it acts
 on, as on macOS. Windows above that window cover it, and it is not drawn while
-that window is on a hidden workspace. If the window closes, the cursor returns
-above every window. On other Wayland compositors the cursor stays above every
-window.
+that window is on a hidden workspace. When the window closes, the cursor fades
+out with it. On other Wayland compositors the cursor stays above every window.
 
 XWayland windows (SDL games, Wine, Java, Steam, and other apps with no
 accessibility tree) use the same tools with screenshot coordinates and stock
