@@ -143,6 +143,17 @@ fn master_name(seat: u32) -> String {
     format!("cua-xwayland-{seat}")
 }
 
+/// A master pointer `isolate` added for some seat, never another client's.
+fn agent_pointer(device: &Device) -> bool {
+    device.kind == DeviceType::MASTER_POINTER
+        && device
+            .name
+            .strip_prefix("cua-xwayland-")
+            .and_then(|rest| rest.strip_suffix(" pointer"))
+            .and_then(|seat| seat.parse().ok())
+            .is_some_and(|seat| device.name == format!("{} pointer", master_name(seat)))
+}
+
 fn named<'a>(devices: &'a [Device], name: &str, kinds: &[DeviceType]) -> Option<&'a Device> {
     devices
         .iter()
@@ -509,6 +520,42 @@ impl X {
         }
         Ok(false)
     }
+
+    /// Hand every app still on an agent pair back to the core pointer, except
+    /// those `keep` names. Driver only points an app at a pair through one of
+    /// its top-level windows, so walking those finds every such app.
+    fn hand_back_all(&self, keep: impl Fn(u32) -> bool) -> Result<(), Fail> {
+        let devices = self.devices()?;
+        let agents: Vec<u16> = devices
+            .iter()
+            .filter(|device| agent_pointer(device))
+            .map(|device| device.id)
+            .collect();
+        if agents.is_empty() {
+            return Ok(());
+        }
+        let core = core_pointer(&devices).ok_or(refuse(ISOLATION_FAILED))?;
+        for window in self.conn.query_tree(self.root)?.reply()?.children {
+            // A window can be destroyed between these requests.
+            let current = match self.conn.xinput_xi_get_client_pointer(window)?.reply() {
+                Ok(reply) => reply.deviceid,
+                Err(ReplyError::X11Error(_)) => continue,
+                Err(error) => return Err(error.into()),
+            };
+            if !agents.contains(&current) || keep(window) {
+                continue;
+            }
+            match self
+                .conn
+                .xinput_xi_set_client_pointer(window, core)?
+                .check()
+            {
+                Ok(()) | Err(ReplyError::X11Error(_)) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
 }
 
 impl State {
@@ -615,6 +662,24 @@ impl Drop for Prepared {
                 .spawn(release_loop)
                 .is_ok();
         }
+    }
+}
+
+/// Only the process that moved an app onto an agent pair hands it back. A
+/// Driver killed within the hold leaves the app there, so its pointer queries
+/// and grabs keep using the agent pointer. A new daemon repairs that once at
+/// startup. The pairs themselves stay for reuse.
+pub(crate) fn recover() {
+    let mut state = STATE.lock().unwrap_or_else(|poison| poison.into_inner());
+    // An action this daemon already started holds its app on purpose.
+    let held: Vec<u32> = state.pending.iter().map(|p| p.window).collect();
+    let Ok(x) = state.connection() else {
+        return;
+    };
+    let mask = x.resource_mask;
+    let result = x.hand_back_all(|window| held.iter().any(|&p| same_client(p, window, mask)));
+    if let Err(code) = state.settle(result) {
+        tracing::warn!(code, "could not hand X apps back from stale agent pointers");
     }
 }
 
@@ -755,6 +820,35 @@ mod tests {
         let mut devices = stock(true);
         devices.iter_mut().find(|d| d.id == 18).unwrap().attachment = 3;
         assert_eq!(master_pair(&devices, 71), None);
+    }
+
+    #[test]
+    fn recovery_recognizes_only_the_masters_isolate_adds() {
+        let mut devices = stock(true);
+        devices.push(device(
+            30,
+            "cua-xwayland-72 pointer",
+            DeviceType::MASTER_POINTER,
+            31,
+        ));
+        let agents: Vec<u16> = devices
+            .iter()
+            .filter(|device| agent_pointer(device))
+            .map(|device| device.id)
+            .collect();
+        assert_eq!(agents, vec![18, 30]);
+        for (name, kind) in [
+            ("cua-xwayland-71 keyboard", DeviceType::MASTER_KEYBOARD),
+            ("cua-xwayland-71 XTEST pointer", DeviceType::SLAVE_POINTER),
+            ("cua-xwayland-71 pointer", DeviceType::SLAVE_POINTER),
+            ("cua-xwayland-071 pointer", DeviceType::MASTER_POINTER),
+            ("cua-xwayland-+71 pointer", DeviceType::MASTER_POINTER),
+            ("cua-xwayland- pointer", DeviceType::MASTER_POINTER),
+            ("xcua-xwayland-71 pointer", DeviceType::MASTER_POINTER),
+            ("CUA v1.AAAA.AAAA.AAAA pointer", DeviceType::MASTER_POINTER),
+        ] {
+            assert!(!agent_pointer(&device(40, name, kind, 41)), "{name}");
+        }
     }
 
     #[test]

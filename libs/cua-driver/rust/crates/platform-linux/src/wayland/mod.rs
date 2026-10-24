@@ -23,7 +23,7 @@ mod primary_seat;
 pub mod shell_helper;
 pub mod sway_ipc;
 mod virtual_keyboard;
-mod xwayland_seat;
+pub(crate) mod xwayland_seat;
 // RemoteDesktop/libei input is portable and ships in release binaries.
 // PipeWire ScreenCast capture remains separately gated for modern/Nix builds.
 #[cfg(feature = "portal-input")]

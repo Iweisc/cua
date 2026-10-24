@@ -351,8 +351,9 @@ and keyboard, so before each action Driver gives the agent seat its own
 XInput2 master pair, focuses that keyboard on the target, and points the
 target app's X client pointer at it. The app's own grabs and focus changes then
 land on agent devices, not yours, and Driver hands the app back after it
-settles. Apps that wait for the window manager to offer focus (Wine, Java) get
-that offer before typing.
+settles. If Driver dies before then, the next `cua-driver serve` hands the app
+back when it starts. Apps that wait for the window manager to offer focus
+(Wine, Java) get that offer before typing.
 
 - An agent cannot use an X app while you are in it, and refuses with
   `primary_target_busy`. The app has one X client pointer for all its windows,
