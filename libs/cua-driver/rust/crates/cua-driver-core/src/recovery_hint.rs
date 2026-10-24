@@ -20,10 +20,11 @@
 //! level so agents read one place.
 //!
 //! Everything lives in one table ([`RULES`]) plus the unverifiable-action
-//! rules ([`effect_hint`]). [`annotate`] runs once, at the dispatch seam in
-//! `ToolRegistry`, so every platform, every tool and every nested
-//! `run_steps`/`run_script` call is covered. A producer that already set
-//! `hint` or `next_call` keeps its own value.
+//! rules ([`effect_hint`]) and the partial-action rules ([`partial_hint`]).
+//! [`annotate`] runs once, at the dispatch seam in `ToolRegistry`, so every
+//! platform, every tool and every nested `run_steps`/`run_script` call is
+//! covered. A producer that already set `hint` or `next_call` keeps its own
+//! value.
 
 use serde_json::{json, Map, Value};
 
@@ -139,6 +140,19 @@ impl<'a> Ctx<'a> {
 
     fn reason(&self) -> Option<&str> {
         self.structured.get("reason").and_then(Value::as_str)
+    }
+
+    /// How much of a partial action landed. With an unknown delivery mode more
+    /// may have landed than was acknowledged, so there is no exact count.
+    fn delivered(&self) -> Option<u64> {
+        if let Some(chars) = self.structured.get("delivered_chars") {
+            return chars.as_u64();
+        }
+        let delivery = self.structured.get("delivery")?;
+        if delivery.get("mode").and_then(Value::as_str) == Some("unknown") {
+            return None;
+        }
+        delivery.get("delivered_count").and_then(Value::as_u64)
     }
 
     /// `detail` of a browser refusal, when there is one.
@@ -503,18 +517,7 @@ static RULES: &[Rule] = &[
     // Typing and values.
     Rule {
         codes: &["type_text_incomplete"],
-        build: |c| {
-            let delivered = c
-                .structured
-                .get("delivered_chars")
-                .and_then(Value::as_u64)
-                .map(|n| format!("Only the first {n} characters landed. "))
-                .unwrap_or_default();
-            RecoveryHint::new(format!(
-                "{delivered}Read the field to confirm, then type only the missing rest; do not resend it all."
-            ))
-            .call(c.read_changes())
-        },
+        build: type_text_incomplete,
     },
     Rule {
         codes: &["write_not_applied", "set_value_unavailable"],
@@ -831,6 +834,32 @@ fn background_unavailable(c: &Ctx) -> RecoveryHint {
     }
 }
 
+fn type_text_incomplete(c: &Ctx) -> RecoveryHint {
+    let delivered = c
+        .delivered()
+        .map(|n| format!("Only the first {n} characters landed. "))
+        .unwrap_or_default();
+    RecoveryHint::new(format!(
+        "{delivered}Read the field to confirm, then type only the missing rest; do not resend it all."
+    ))
+    .call(c.read_changes())
+}
+
+/// The hint for an action that stopped partway. Its code may name a refusal
+/// that suggests a retry, but a retry would repeat what already landed.
+fn partial_hint(c: &Ctx) -> RecoveryHint {
+    match (c.tool, c.reason()) {
+        // That hint already says to send only the remaining keys, and when.
+        (_, Some("primary_keyboard_busy")) => background_unavailable(c),
+        ("type_text" | "type_text_chars", _) => type_text_incomplete(c),
+        _ => RecoveryHint::new(
+            "The action stopped partway, so part of it already landed. Read what changed and finish \
+             only what is missing; do not repeat it whole.",
+        )
+        .call(c.read_changes()),
+    }
+}
+
 fn browser_consent_required(c: &Ctx) -> RecoveryHint {
     if c.tool == "browser_prepare" {
         return RecoveryHint::new(
@@ -998,6 +1027,9 @@ pub fn recovery_for(
 ) -> Option<RecoveryHint> {
     let ctx = Ctx::new(tool, seed, structured);
     let effect = structured.get("effect").and_then(Value::as_str);
+    if effect == Some("partial") && ACTION_TOOLS.contains(&tool) {
+        return Some(partial_hint(&ctx));
+    }
     let refused = is_error
         || effect == Some("refused")
         || structured.get("status").and_then(Value::as_str) == Some("refused");

@@ -90,7 +90,7 @@ They appear on three kinds of result:
 | --- | --- |
 | An error result (`isError: true`) with a `code` | next to `code` in `structuredContent` |
 | A browser refusal (`status: "refused"`, `refusal.code`) | next to `refusal` in `structuredContent` |
-| An `ActionResult` with `effect` `unverifiable`, `suspected_noop` or `refused` | `hint` and `next_call` on the `ActionResult` |
+| An `ActionResult` with `effect` `unverifiable`, `suspected_noop`, `partial` or `refused` | `hint` and `next_call` on the `ActionResult` |
 
 For example, a background drag that macOS cannot drop returns:
 
@@ -102,6 +102,10 @@ For example, a background drag that macOS cannot drop returns:
   "next_call": {"tool": "get_window_state", "arguments": {"pid": 811, "window_id": 659}}
 }
 ```
+
+A result with `effect: partial` stopped after part of it landed. Its hint says
+how much landed, when the count is exact, and never suggests repeating the
+whole action, even when its `code` names a refusal.
 
 A producer that already sets `hint` or `next_call` keeps its own value. In
 `run_steps`, a failed step's report carries the same `hint` and `next_call`; in

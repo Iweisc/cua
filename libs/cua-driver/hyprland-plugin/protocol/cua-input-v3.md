@@ -167,6 +167,11 @@ final reply preserves that count but sets `delivery.mode:unknown`; later input
 may have landed without acknowledgement. A missing initial reply has unknown
 delivery with no count. Neither case permits replay.
 
+Driver sends text and multi-packet scrolls as a sequence of `KEY` or `SCROLL`
+actions, one key per character. A refusal or a lost connection after some of
+them were acknowledged maps to `effect:partial` with that many in
+`delivery.delivered_count`, on either route.
+
 Refusals use `{"ok":false,"code":"<code>","detail":"<code>"}`. Codes
 include `lane_busy`, `lane_not_claimed`, `stale_target`, `stale_geometry`,
 `session_unavailable`, `unsupported_layout`, `primary_target_busy`,

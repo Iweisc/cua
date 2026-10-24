@@ -469,6 +469,62 @@ fn an_incomplete_type_text_names_how_much_landed() {
 }
 
 #[test]
+fn a_partial_action_never_gets_retry_advice() {
+    let seed = window_seed();
+    let read_changes = json!({
+        "tool": "get_window_state",
+        "arguments": {"pid": 4242, "window_id": 17, "session": "run-1", "since": "latest"},
+    });
+    // Hyprland reports the delivered prefix under its route refusal code.
+    let interrupted = |mode: &str| {
+        json!({"code": "background_unavailable", "reason": "text_interrupted", "effect": "partial",
+            "delivery": {"mode": mode, "delivered_count": 71}})
+    };
+    let typed = hint_for("type_text", &seed, true, interrupted("background"));
+    assert_eq!(
+        typed.hint,
+        "Only the first 71 characters landed. Read the field to confirm, then type only the missing \
+         rest; do not resend it all."
+    );
+    assert_eq!(call_value(&typed), read_changes);
+    // Unknown delivery may have landed more than the acknowledged count.
+    let unknown = hint_for("type_text", &seed, true, interrupted("unknown"));
+    assert!(unknown.hint.starts_with("Read the field to confirm"));
+    // macOS names the same prefix in characters.
+    let macos = hint_for(
+        "type_text",
+        &seed,
+        true,
+        json!({"code": "type_text_incomplete", "effect": "partial", "delivered_chars": 12}),
+    );
+    assert!(macos
+        .hint
+        .starts_with("Only the first 12 characters landed."));
+    for (tool, value) in [
+        (
+            "scroll",
+            json!({"code": "background_unavailable", "effect": "partial",
+                "delivery": {"mode": "background", "delivered_count": 2}}),
+        ),
+        (
+            "drag",
+            json!({"code": "foreground_unavailable", "effect": "partial",
+                "delivery": {"mode": "foreground", "delivered_count": 1}}),
+        ),
+        ("click", json!({"effect": "partial"})),
+    ] {
+        let hint = hint_for(tool, &seed, true, value);
+        assert_eq!(
+            hint.hint,
+            "The action stopped partway, so part of it already landed. Read what changed and finish \
+             only what is missing; do not repeat it whole.",
+            "{tool}"
+        );
+        assert_eq!(call_value(&hint), read_changes, "{tool}");
+    }
+}
+
+#[test]
 fn an_unattached_browser_names_the_attach_call() {
     let seed = seed(json!({"pid": 659, "window_id": 12, "session": "web"}));
     let hint = hint_for(
@@ -689,13 +745,6 @@ fn confirmed_results_and_other_tools_get_no_hint() {
         &seed,
         false,
         &structured(json!({"effect": "confirmed"}))
-    )
-    .is_none());
-    assert!(recovery_for(
-        "click",
-        &seed,
-        false,
-        &structured(json!({"effect": "partial"}))
     )
     .is_none());
     // Not an action tool: its `effect` field means something else.
