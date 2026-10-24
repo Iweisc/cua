@@ -25,6 +25,9 @@ const MAX_LANES: usize = 2;
 /// `STALE_GEOMETRY_BACKOFF * attempt` before each (at most ~0.6 s in all).
 const MAX_STALE_GEOMETRY_RETRIES: usize = 4;
 const STALE_GEOMETRY_BACKOFF: Duration = Duration::from_millis(60);
+/// The tools' documented refusal for a window-local point outside the target,
+/// shared with the X11 route. The bounds here are the attested TARGET geometry.
+pub(crate) const POINT_OUTSIDE_WINDOW: &str = "point_outside_window";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DeliveryRoute {
@@ -720,6 +723,15 @@ impl Client {
                 width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0,
                 "invalid target geometry"
             );
+            // Before the X side is touched: an outside point would otherwise
+            // read as a covered X window.
+            if let Some((x, y)) = action.outside_point(width, height) {
+                let detail = format!(
+                    "window-local point ({x}, {y}) lies outside the window's {width}x{height} \
+                     logical size; no input was sent"
+                );
+                return Ok(json!({"ok":false,"code":POINT_OUTSIDE_WINDOW,"detail":detail}));
+            }
             // Held until this attempt ends, so the X side is released on every path.
             let _isolation = if binding == TargetBinding::Xwayland {
                 let field = |name| {
@@ -913,6 +925,21 @@ impl Action {
         }
     }
 
+    /// The first point the action would send outside the target's attested
+    /// logical `width` x `height`. Both ends of a drag must be inside.
+    fn outside_point(&self, width: f64, height: f64) -> Option<(f64, f64)> {
+        let points = match self {
+            Self::Activate | Self::Key { .. } | Self::TextKey { .. } => vec![],
+            Self::Click { x, y, .. } => vec![(*x, *y)],
+            Self::Scroll { point, .. } => vec![Self::scroll_point(*point, width, height)],
+            Self::Drag { from, to, .. } => vec![*from, *to],
+        };
+        points.into_iter().find(|&(x, y)| {
+            !(x.is_finite() && y.is_finite() && x >= 0.0 && y >= 0.0 && x < width && y < height)
+        })
+    }
+
+    /// Callers check `outside_point` against the same geometry first.
     fn packet(
         &self,
         sequence: u64,
@@ -921,13 +948,6 @@ impl Action {
         width: f64,
         height: f64,
     ) -> Result<String> {
-        let point = |x: f64, y: f64| -> Result<()> {
-            ensure!(
-                x.is_finite() && y.is_finite() && x >= 0.0 && y >= 0.0 && x < width && y < height,
-                "input point outside attested logical target geometry"
-            );
-            Ok(())
-        };
         let prefix = format!("{sequence} {token} {revision}");
         Ok(match self {
             Self::Activate => format!("ACTIVATE {prefix}"),
@@ -941,7 +961,6 @@ impl Action {
                 button,
                 count,
             } => {
-                point(*x, *y)?;
                 ensure!(
                     (1..=2).contains(count),
                     "isolated input supports only single or double clicks"
@@ -975,7 +994,6 @@ impl Action {
                 amount,
             } => {
                 let (x, y) = Self::scroll_point(*position, width, height);
-                point(x, y)?;
                 ensure!((1..=100).contains(amount), "unsupported scroll amount");
                 let (axis, sign) = match direction.as_str() {
                     "up" => (0, -1),
@@ -992,8 +1010,6 @@ impl Action {
                 to: (x2, y2),
                 duration_ms,
             } => {
-                point(*x1, *y1)?;
-                point(*x2, *y2)?;
                 ensure!(
                     (50..=2000).contains(duration_ms),
                     "isolated drag duration must be 50–2000 ms"
@@ -3016,17 +3032,64 @@ mod tests {
     }
 
     #[test]
-    fn unsafe_geometry_and_unsupported_actions_refuse() {
-        for x in [f64::NAN, f64::INFINITY, -1.0, 100.0] {
-            assert!(Action::Click {
-                x,
-                y: 1.0,
-                button: 1,
-                count: 1
-            }
-            .packet(1, TOKEN, 1, 100.0, 80.0)
-            .is_err());
+    fn outside_points_refuse_with_the_documented_code_and_send_nothing() {
+        let click = |x, y| Action::Click {
+            x,
+            y,
+            button: 1,
+            count: 1,
+        };
+        let drag = |from, to| Action::Drag {
+            from,
+            to,
+            duration_ms: 100,
+        };
+        for (action, capability) in [
+            (click(f64::NAN, 1.0), 1),
+            (click(f64::INFINITY, 1.0), 1),
+            (click(-1.0, 1.0), 1),
+            (click(100.0, 1.0), 1),
+            (click(1.0, 80.0), 1),
+            (
+                Action::Scroll {
+                    point: Some((1.0, 80.0)),
+                    direction: "down".into(),
+                    amount: 1,
+                },
+                4,
+            ),
+            (drag((-1.0, 1.0), (2.0, 2.0)), 8),
+            (drag((1.0, 1.0), (100.0, 2.0)), 8),
+        ] {
+            let (mut client, peer) = production_test_client();
+            let server = std::thread::spawn(move || {
+                assert_eq!(read_packet(&peer), format!("TARGET 1 1 {capability}"));
+                peer.send(
+                    json!({"ok":true,"target":TOKEN,"revision":1,"width":100,"height":80})
+                        .to_string()
+                        .as_bytes(),
+                )
+                .unwrap();
+                assert_peer_receives_nothing_more(&peer);
+            });
+            let reply = client
+                .execute_routed_with_attest(
+                    action,
+                    None,
+                    DeliveryRoute::Background,
+                    record_test_attestation,
+                )
+                .unwrap();
+            assert_eq!(reply["ok"], false);
+            assert_eq!(reply["code"], "point_outside_window");
+            assert!(reply.get("effect").is_none() && reply.get("delivery").is_none());
+            drop(client);
+            server.join().unwrap();
         }
+    }
+
+    #[test]
+    fn unsupported_actions_refuse() {
         assert!(Action::Key {
             key: "🙂".into(),
             modifiers: vec![]

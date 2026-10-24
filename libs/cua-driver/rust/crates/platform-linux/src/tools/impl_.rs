@@ -4508,7 +4508,14 @@ fn hyprland_input_result(result: anyhow::Result<Value>, foreground: bool) -> Too
                 .unwrap_or("input refused")
                 .to_owned();
             value["reason"] = json!(code);
-            value["code"] = json!(unavailable);
+            // An outside point is the caller's mistake, not a route limit, so
+            // it keeps the code the tools document for it, as X11 reports it.
+            let message = if code == crate::wayland::hyprland_input::POINT_OUTSIDE_WINDOW {
+                format!("{code}: {detail}")
+            } else {
+                value["code"] = json!(unavailable);
+                format!("{unavailable} ({code}): {detail}")
+            };
             value["route"] = json!(if foreground {
                 "global_input"
             } else {
@@ -4536,7 +4543,7 @@ fn hyprland_input_result(result: anyhow::Result<Value>, foreground: bool) -> Too
             .detail(&detail)
             .build()
             .expect("isolated input outcome is valid");
-            ToolResult::error(format!("{unavailable} ({code}): {detail}"))
+            ToolResult::error(message)
                 .with_structured(value)
                 .with_action_record(outcome)
         }
@@ -5339,6 +5346,32 @@ fn experimental_dispatch_does_not_claim_application_success() {
     assert_eq!(value["effect"], "unverifiable");
     assert_eq!(value["route"], "synthetic_events");
     assert!(value.get("verified").is_none());
+}
+
+#[cfg(test)]
+#[test]
+fn hyprland_outside_point_keeps_the_cross_platform_refusal_code() {
+    // A multi-packet scroll reports its refusal with an empty delivery.
+    for (reply, foreground) in [
+        (json!({"ok":false,"code":"point_outside_window","detail":"outside"}), false),
+        (json!({"ok":false,"code":"point_outside_window","detail":"outside"}), true),
+        (
+            json!({"ok":false,"code":"point_outside_window","detail":"outside","effect":"none",
+                "delivery":{"mode":"background","delivered_count":0}}),
+            false,
+        ),
+    ] {
+        let result = hyprland_input_result(Ok(reply), foreground);
+        assert_eq!(result.is_error, Some(true));
+        let value = result.structured_content.as_ref().unwrap();
+        assert_eq!(value["code"], "point_outside_window");
+        assert_eq!(value["effect"], "refused");
+        assert!(value.get("delivery").is_none());
+        let public = result.action_record.unwrap().public_result().unwrap();
+        public.validate_invariants().unwrap();
+        assert_eq!(public.effect, cua_driver_contract::ActionEffect::Refused);
+        assert!(public.delivery.is_none());
+    }
 }
 
 #[cfg(test)]

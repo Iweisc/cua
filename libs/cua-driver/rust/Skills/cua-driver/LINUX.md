@@ -310,7 +310,9 @@ recorded native evidence covers Calc from `libreoffice-fresh 26.2.5-3` and
 Inkscape `1.4.4-6`; for every app, verify the effect from fresh state.
 
 The plugin separately binds the exact live native surface and checks geometry,
-desktop availability, and other-lane conflicts. The agent seat has its own
+desktop availability, and other-lane conflicts. A click, scroll, or drag at a
+point outside that window, including the end of a drag, is refused with
+`point_outside_window` before any input is sent. The agent seat has its own
 pointer, so an agent can click, scroll, and drag in a native app you are using,
 including another window of it, without taking your focus. Keys are different:
 while your keyboard focus is in the target's app, `type_text`, `press_key`, and
