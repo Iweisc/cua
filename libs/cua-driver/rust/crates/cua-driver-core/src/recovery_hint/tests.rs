@@ -239,6 +239,28 @@ fn keys_refused_in_the_users_app_keep_pointer_and_element_routes_open() {
 }
 
 #[test]
+fn a_locked_or_dark_screen_asks_to_wait_whatever_the_tool_or_route() {
+    // Scroll and invoke_menu have their own background hints; the lock wins.
+    for tool in ["click", "set_value", "scroll", "invoke_menu"] {
+        for code in ["background_unavailable", "foreground_unavailable"] {
+            let hint = hint_for(
+                tool,
+                &window_seed(),
+                true,
+                json!({"code": code, "reason": "session_unavailable", "effect": "refused"}),
+            );
+            assert!(
+                hint.hint.starts_with("The user's screen is locked or the display is off"),
+                "{tool} {code}: {}",
+                hint.hint
+            );
+            assert!(hint.hint.chars().count() <= MAX_HINT_CHARS);
+            assert_eq!(hint.next_call, None, "{tool} {code}");
+        }
+    }
+}
+
+#[test]
 fn a_next_call_never_asks_for_the_foreground() {
     let seed = window_seed();
     for (tool, value) in [

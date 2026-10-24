@@ -4543,6 +4543,93 @@ fn isolated_hyprland_refusal(detail: impl Into<String>) -> ToolResult {
     }))
 }
 
+/// The Hyprland plugin refuses its input while the screen is locked or the
+/// display is off. AT-SPI reaches the app without the plugin, so element
+/// actions, `set_value` and `invoke_menu` read the same state first and refuse
+/// the same way. Pixel actions skip this: the plugin itself refuses them.
+async fn hyprland_session_refusal(
+    delivery: crate::input::delivery::DeliveryMode,
+) -> Option<ToolResult> {
+    let foreground = delivery.is_foreground();
+    tokio::task::spawn_blocking(move || {
+        hyprland_session_gate(
+            crate::wayland::hyprland_input::enabled(),
+            foreground,
+            crate::wayland::hyprland::plugin_status,
+        )
+    })
+    .await
+    .unwrap_or_else(|error| {
+        Some(hyprland_session_unavailable(
+            foreground,
+            format!("could not read the session state: {error}"),
+        ))
+    })
+}
+
+fn hyprland_session_gate(
+    plugin: bool,
+    foreground: bool,
+    status: impl FnOnce() -> anyhow::Result<Value>,
+) -> Option<ToolResult> {
+    if !plugin {
+        return None;
+    }
+    // With the plugin there, a status we cannot read may hide a lock.
+    match status().and_then(|status| crate::wayland::hyprland_input::session_available(&status)) {
+        Ok(true) => None,
+        Ok(false) => Some(hyprland_session_unavailable(
+            foreground,
+            "the screen is locked or the display is off".into(),
+        )),
+        Err(error) => Some(hyprland_session_unavailable(
+            foreground,
+            format!("could not read the session state: {error:#}"),
+        )),
+    }
+}
+
+/// Shaped like the plugin's own `session_unavailable` refusal in
+/// `hyprland_input_result`, minus the route: nothing was sent anywhere.
+fn hyprland_session_unavailable(foreground: bool, detail: String) -> ToolResult {
+    let code = if foreground {
+        "foreground_unavailable"
+    } else {
+        "background_unavailable"
+    };
+    ToolResult::error(format!("{code} (session_unavailable): {detail}")).with_structured(json!({
+        "ok": false, "code": code, "reason": "session_unavailable", "detail": detail,
+        "verified": false, "effect": "refused"
+    }))
+}
+
+#[cfg(test)]
+#[test]
+fn hyprland_element_actions_refuse_while_the_session_is_unavailable() {
+    let status = |input: Value| move || Ok(json!({ "input": input }));
+    assert!(
+        hyprland_session_gate(false, false, || panic!("read without the plugin")).is_none(),
+        "without the plugin nothing is read or refused"
+    );
+    assert!(hyprland_session_gate(true, false, status(json!({"session_available": true}))).is_none());
+    for (foreground, code) in [(false, "background_unavailable"), (true, "foreground_unavailable")] {
+        let refusals = [
+            hyprland_session_gate(true, foreground, status(json!({"session_available": false}))),
+            // An older plugin without the field, and a failed read, refuse too.
+            hyprland_session_gate(true, foreground, status(json!({}))),
+            hyprland_session_gate(true, foreground, || anyhow::bail!("Hyprland IPC query timed out")),
+        ];
+        for refusal in refusals {
+            let refusal = refusal.expect("an unavailable session refuses");
+            assert_eq!(refusal.is_error, Some(true));
+            let structured = refusal.structured_content.unwrap();
+            assert_eq!(structured["code"], code);
+            assert_eq!(structured["reason"], "session_unavailable");
+            assert_eq!(structured["effect"], "refused");
+        }
+    }
+}
+
 fn isolated_hyprland_result(result: anyhow::Result<Value>) -> ToolResult {
     hyprland_input_result(result, false)
 }
@@ -6823,6 +6910,9 @@ impl Tool for ClickTool {
         }
 
         if let Some(idx) = elem_idx_resolved {
+            if let Some(refusal) = hyprland_session_refusal(delivery).await {
+                return refusal;
+            }
             // The observed element: its proven AT-SPI identity and the frame
             // the snapshot recorded. Every route below acts on that identity
             // (or its cached frame); the live ordinal `idx` is only an
@@ -7791,6 +7881,11 @@ impl Tool for TypeTextTool {
             }
         };
         let delivery = crate::input::delivery::DeliveryMode::from_args(&args);
+        if resolved_elem_idx.is_some() {
+            if let Some(refusal) = hyprland_session_refusal(delivery).await {
+                return refusal;
+            }
+        }
         if isolated_hyprland_background(delivery)
             && resolved_elem_idx.is_none()
             && args.get("x").is_none()
@@ -8743,6 +8838,11 @@ impl Tool for PressKeyTool {
         // background path (the focus-click already handled fronting when fg). Pass x,y
         // (no element_token) for Chromium/Electron surfaces the AX path can't focus.
         let delivery = crate::input::delivery::DeliveryMode::from_args(&args);
+        if resolved_element_index.is_some() {
+            if let Some(refusal) = hyprland_session_refusal(delivery).await {
+                return refusal;
+            }
+        }
         if isolated_hyprland_background(delivery) {
             if xid_opt.is_none() {
                 return isolated_hyprland_refusal(
@@ -9189,6 +9289,11 @@ impl Tool for HotkeyTool {
         let key_for_wayland = key.clone();
         let mods_for_wayland = mods.clone();
         let delivery = crate::input::delivery::DeliveryMode::from_args(&args);
+        if resolved_element_index.is_some() {
+            if let Some(refusal) = hyprland_session_refusal(delivery).await {
+                return refusal;
+            }
+        }
 
         if isolated_hyprland_background(delivery) {
             if xid_opt.is_none() {
@@ -9524,6 +9629,9 @@ impl Tool for SetValueTool {
         let value_for_task = value.clone();
         let xid_opt = Some(xid);
         let delivery = crate::input::delivery::DeliveryMode::from_args(&args);
+        if let Some(refusal) = hyprland_session_refusal(delivery).await {
+            return refusal;
+        }
         let cursor_id = resolve_cursor_key(&args);
         position_named_session_keyboard_cursor(&self.state, &args, pid, xid, Some(idx), None, true)
             .await;
@@ -10131,6 +10239,11 @@ impl Tool for ScrollTool {
             return ToolResult::error(
                 "Pass either element_token (ax) or x,y (px) to scroll, not both.",
             );
+        }
+        if resolved_element_index.is_some() {
+            if let Some(refusal) = hyprland_session_refusal(delivery).await {
+                return refusal;
+            }
         }
 
         if named_session_cursor_key(&args).is_some() {
@@ -14298,6 +14411,9 @@ impl Tool for InvokeMenuTool {
             .any(|window| window.xid == window_id && window.pid == Some(pid))
         {
             return menu_refusal("invoke_menu: window_id does not belong to pid".into());
+        }
+        if let Some(refusal) = hyprland_session_refusal(delivery).await {
+            return refusal;
         }
 
         if !crate::wayland::is_wayland() && !delivery.is_foreground() {

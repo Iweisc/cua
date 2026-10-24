@@ -302,6 +302,18 @@ pub fn enabled() -> bool {
             }))
 }
 
+/// False while the screen is locked or the display is off, when the plugin
+/// refuses all its input. Read from `hyprctl -j cua:status`. A status without
+/// the field, as from an older plugin, is an error, never "available".
+pub(crate) fn session_available(status: &Value) -> Result<bool> {
+    // The nonshipping test plugin reports the same object as `experiment`.
+    status
+        .get("input")
+        .or_else(|| status.get("experiment"))
+        .and_then(|input| input["session_available"].as_bool())
+        .context("cua:status does not report session_available")
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InputProtocol {
     Production,

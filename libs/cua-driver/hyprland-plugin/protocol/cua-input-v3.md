@@ -466,6 +466,32 @@ establish exact-target delivery and is not a fallback. Background refusal never
 escalates to foreground. Both routes use Driver's existing permission and
 lifecycle admission, without a separate approval UI.
 
+## Locked and display-off sessions
+
+Target selection and every operation refuse with `session_unavailable` while
+the session is locked (`ext-session-lock`), the display is off (DPMS), the
+session is inactive, or Hyprland is shutting down. `hyprctl -j cua:status`
+reports the same state as `input.session_available`.
+
+Driver's AT-SPI actions reach the app without a lane. On a desktop with the
+input sockets, Driver reads `input.session_available` once before each element
+action (`click`, `double_click`, `right_click`, `type_text`, `press_key`,
+`hotkey`, or `scroll` with `element_token` or `element_index`), `set_value`,
+and `invoke_menu`. While it is false, the action refuses before any AT-SPI call
+with code `background_unavailable` (`foreground_unavailable` for a foreground
+request), reason `session_unavailable`, and `effect:refused`. A status that
+cannot be read within the IPC query bound (one second per attempt, three in
+all), or that has no `session_available` field, refuses the same way. Pixel
+actions skip the read, because the plugin refuses them itself. The read is one
+attested IPC round trip, about 0.1 ms on an idle desktop. Without the input
+sockets, or on another compositor, Driver reads nothing and AT-SPI actions
+still run while the screen is locked. macOS defines no equivalent refusal.
+
+Reads still answer. `list_windows` and the accessibility tree are unchanged. A
+window screenshot (`get_window_state`, `zoom`) shows the window as the app
+last drew it. A desktop screenshot shows the lock surface while locked, and is
+black while the display is off.
+
 ## Cancellation and recovery
 
 `CANCEL` and `STOP` both require the connection's lane claim. They revoke only

@@ -168,6 +168,12 @@ std::string refusal(std::string_view code, ForegroundFailure failure) {
 constexpr auto kDelivered = R"({"ok":true,"effect":"unverifiable","route":"synthetic_events"})";
 constexpr auto kForegroundDelivered = R"({"ok":true,"effect":"unverifiable","route":"primary_foreground"})";
 constexpr auto kPrimaryBackgroundDelivered = R"({"ok":true,"effect":"unverifiable","route":"primary_background"})";
+// Locked, display off, another VT, or shutting down. cua:status reports this
+// too, because Driver's AT-SPI actions never pass through a lane.
+bool session_available() {
+    return g_pCompositor->m_sessionActive && g_pCompositor->m_dpmsStateOn &&
+        !g_pCompositor->m_isShuttingDown && !g_pSessionLockManager->isSessionLocked();
+}
 } // namespace
 
 struct InputExperiment::Impl {
@@ -496,10 +502,7 @@ struct InputExperiment::Impl {
         if (keymap_fd >= 0) close(keymap_fd);
     }
     std::uint32_t serial() const { return wl_display_next_serial(g_pCompositor->m_wlDisplay); }
-    bool available() const {
-        return !retired && !suspended && g_pCompositor->m_sessionActive && g_pCompositor->m_dpmsStateOn &&
-            !g_pCompositor->m_isShuttingDown && !g_pSessionLockManager->isSessionLocked();
-    }
+    bool available() const { return !retired && !suspended && session_available(); }
     static void bind_seat(wl_client* client, void* data, std::uint32_t version, std::uint32_t id) {
         auto& self = *static_cast<Impl*>(data);
         if (self.seats.size() >= kMaxResources) { wl_client_post_no_memory(client); return; }
@@ -2188,8 +2191,8 @@ std::string InputExperiment::status_json() const {
             lane->held_button, lane->held_keys.size(), lane->drag.has_value(), pointer_focus, keyboard_focus);
     }
     // Aggregate legacy fields remain available to existing test probes.
-    return std::format(R"({{"protocol":{},"test_only":{},"seat_lifetime":"compositor","upgrade":"desktop_restart","transport_ready":{},"epoch":"{}","lease_active":{},"seat_resources":{},"pointer_resources":{},"keyboard_resources":{},"dispatches":{},"primary_background":{},"refused_popup_grabs":{},"refused_drag_starts":{},"withheld_initial_focus":{},"lanes":[{}]}})",
-        kProduction ? 3 : 0, !kProduction, !lanes_[0]->suspended && !lanes_[1]->suspended, lanes_[0]->epoch, lanes_[0]->lease != nullptr || lanes_[1]->lease != nullptr,
+    return std::format(R"({{"protocol":{},"test_only":{},"seat_lifetime":"compositor","upgrade":"desktop_restart","transport_ready":{},"session_available":{},"epoch":"{}","lease_active":{},"seat_resources":{},"pointer_resources":{},"keyboard_resources":{},"dispatches":{},"primary_background":{},"refused_popup_grabs":{},"refused_drag_starts":{},"withheld_initial_focus":{},"lanes":[{}]}})",
+        kProduction ? 3 : 0, !kProduction, !lanes_[0]->suspended && !lanes_[1]->suspended, session_available(), lanes_[0]->epoch, lanes_[0]->lease != nullptr || lanes_[1]->lease != nullptr,
         lanes_[0]->seats.size() + lanes_[1]->seats.size(), lanes_[0]->pointers.size() + lanes_[1]->pointers.size(),
         lanes_[0]->keyboards.size() + lanes_[1]->keyboards.size(), lanes_[0]->dispatches + lanes_[1]->dispatches,
         kProduction, reaction_guards_ ? reaction_guards_->refused_grabs : 0, reaction_guards_ ? reaction_guards_->refused_drags : 0,

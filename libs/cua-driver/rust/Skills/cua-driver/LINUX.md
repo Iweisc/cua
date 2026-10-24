@@ -375,6 +375,18 @@ when the toolkit's own hit test finds them there. That works in a covered window
 and on a hidden workspace. An element scrolled out of view, or one whose toolkit
 does not answer the hit test, keeps its AT-SPI action.
 
+While the screen is locked or the display is off, every agent action on the
+window refuses with reason `session_unavailable` and `effect:"refused"`, and
+nothing reaches the app. Element actions, `set_value`, and `invoke_menu` use
+AT-SPI rather than the plugin, so Driver reads the plugin's session state
+before each one, and refuses also when it cannot read that state. Neither a
+retry nor the foreground route helps until the user is back. Reads still work:
+`list_windows` and the accessibility tree are unchanged, a window screenshot
+shows the window as the app last drew it, and a desktop screenshot shows the
+lock screen, or black while the display is off. Without the plugin, or on
+another compositor, AT-SPI actions still run while the screen is locked. macOS
+has no such refusal.
+
 With the input plugin, the agent cursor sits directly above the window it acts
 on, as on macOS. Windows above that window cover it, and it is not drawn while
 that window is on a hidden workspace. When the window closes, the cursor fades

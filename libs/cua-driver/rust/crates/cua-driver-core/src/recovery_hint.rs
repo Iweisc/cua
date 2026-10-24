@@ -285,6 +285,9 @@ static RULES: &[Rule] = &[
     Rule {
         codes: &["foreground_unavailable"],
         build: |c| {
+            if c.reason() == Some("session_unavailable") {
+                return session_unavailable();
+            }
             RecoveryHint::new(
                 "The window could not be brought forward, so nothing was sent. List the app's windows, \
                  check the window still exists, then retry or act by element instead.",
@@ -790,6 +793,7 @@ fn background_unavailable(c: &Ctx) -> RecoveryHint {
              (get_window_state, then element_token) or invoke_menu. {foreground}"
         ))
         .call(c.read_window()),
+        (_, Some("session_unavailable")) => session_unavailable(),
         // Hyprland: the person's keyboard focus is in the target's app.
         (_, Some("primary_keyboard_busy")) => RecoveryHint::new(
             "The user is typing in this app, so keys are refused: they could reach the user's window. \
@@ -832,6 +836,15 @@ fn background_unavailable(c: &Ctx) -> RecoveryHint {
         ))
         .call(c.read_window()),
     }
+}
+
+/// Hyprland: the screen is locked or the display is off. There is no next call
+/// that moves the task until the user is back.
+fn session_unavailable() -> RecoveryHint {
+    RecoveryHint::new(
+        "The user's screen is locked or the display is off, so nothing was sent. Neither a retry \
+         nor foreground delivery helps until the user is back. Then read the window again and retry.",
+    )
 }
 
 fn type_text_incomplete(c: &Ctx) -> RecoveryHint {
