@@ -12,7 +12,9 @@
 //!
 //! X stacking decides which window a pointer event reaches, and Hyprland
 //! leaves windows on hidden workspaces mapped. Pointer actions therefore
-//! refuse when another app's X window covers the target at that point.
+//! refuse when another app's X window covers the target at that point, unless
+//! the server carries `libs/cua-driver/xwayland/agent-focus.patch`, which keeps
+//! agent pointers inside the window the agent entered.
 
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -27,6 +29,8 @@ pub(super) const UNAVAILABLE: &str = "xwayland_unavailable";
 pub(super) const SEAT_UNAVAILABLE: &str = "xwayland_seat_unavailable";
 pub(super) const COVERED: &str = "xwayland_target_covered";
 pub(super) const ISOLATION_FAILED: &str = "xwayland_isolation_failed";
+/// Set by `libs/cua-driver/xwayland/build.sh` as the server vendor string.
+const AGENT_FOCUS_VENDOR: &[u8] = b"The X.Org Foundation (cua-xwayland-agent-focus)";
 
 pub(super) fn detail(code: &str) -> &'static str {
     match code {
@@ -88,6 +92,7 @@ struct X {
     active_window: u32,
     wm_protocols: u32,
     wm_take_focus: u32,
+    agent_focus: bool,
 }
 
 struct State {
@@ -249,6 +254,7 @@ impl X {
         }
         let root = conn.setup().roots[screen].root;
         let resource_mask = conn.setup().resource_id_mask;
+        let agent_focus = conn.setup().vendor == AGENT_FOCUS_VENDOR;
         let atom =
             |name: &[u8]| -> Result<u32, Fail> { Ok(conn.intern_atom(false, name)?.reply()?.atom) };
         let active_window = atom(b"_NET_ACTIVE_WINDOW")?;
@@ -261,6 +267,7 @@ impl X {
             active_window,
             wm_protocols,
             wm_take_focus,
+            agent_focus,
         })
     }
 
@@ -416,6 +423,9 @@ impl X {
             point,
         )
         .ok_or(refuse(COVERED))?;
+        if self.agent_focus {
+            return Ok(());
+        }
         let child = self
             .conn
             .translate_coordinates(self.root, self.root, x, y)?

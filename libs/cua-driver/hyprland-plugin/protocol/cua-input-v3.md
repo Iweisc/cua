@@ -246,7 +246,10 @@ These rules differ from native targets:
 - Pointer actions refuse with `xwayland_focus_changed` when the human's keyboard
   focus changed after `XWAYLAND_TARGET`. Hyprland restacks X windows on focus,
   and X stacking decides which window a pointer event reaches. Driver checks
-  that the target is uncovered at the action point after admission.
+  that the target is uncovered at the action point after admission, unless the
+  server carries the optional patch in
+  [`../../xwayland`](../../xwayland/README.md), which keeps agent pointers
+  inside the window they entered.
 - Pointer actions refuse with `primary_constraint` while the human's pointer is
   locked or confined. Every XI2 raw listener sees agent pointer events, and a
   game holding such a constraint usually reads them.

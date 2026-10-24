@@ -355,7 +355,9 @@ packaged Calc and Inkscape qualification covers native windows only.
 - Pointer actions refuse with `xwayland_target_covered` when another app's X
   window covers the target at that point. X sends pointer input by X stacking,
   and Hyprland keeps windows on hidden workspaces mapped, so this is common.
-  Keyboard actions still work there.
+  Keyboard actions still work there. The optional Xwayland build in
+  `libs/cua-driver/xwayland` keeps agent pointers inside the target window, and
+  Driver then allows these actions.
 - While your pointer is locked or confined, as in a game, X pointer actions
   refuse with `primary_constraint`, because every X raw-input listener sees
   them. Keyboard actions still work.
