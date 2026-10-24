@@ -782,8 +782,16 @@ struct InputExperiment::Impl {
         const auto n = ::send(c.fd, packet.data(), packet.size(), MSG_DONTWAIT | MSG_NOSIGNAL);
         if (n < 0 || static_cast<std::size_t>(n) != packet.size()) c.dead = true;
     }
+    void reap_clients() {
+        if (lease && lease->dead) revoke("disconnected", true);
+        if (reservation && reservation->dead) reservation = nullptr;
+        std::erase_if(clients, [](auto& c) { return c->dead; });
+    }
     static int accept_ready(int, std::uint32_t, void* data) {
         auto& self = *static_cast<Impl*>(data);
+        // Closed connections stay in clients until reaped. Without this, a
+        // burst of reconnects within one timer tick hits the limit.
+        self.reap_clients();
         for (unsigned i = 0; i < 8; ++i) {
             const auto fd = accept4(self.listener, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
             if (fd < 0) break;
@@ -1714,9 +1722,7 @@ struct InputExperiment::Impl {
                 send(*d.client, kDelivered);
             }
         }
-        if (lease && lease->dead) revoke("disconnected", true);
-        if (reservation && reservation->dead) reservation = nullptr;
-        std::erase_if(clients, [](auto& c) { return c->dead; });
+        reap_clients();
         std::erase_if(pointers, [](auto& p) { return p->dead; });
         std::erase_if(keyboards, [](auto& k) { return k->dead; });
         std::erase_if(touches, [](auto& t) { return t->dead; });
