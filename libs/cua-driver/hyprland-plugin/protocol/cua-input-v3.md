@@ -6,8 +6,8 @@ primary-seat foreground route. It is not native certification or a release
 announcement. The default plugin build remains discovery-only, and discovery
 protocol v2 is unchanged.
 
-Driver completes common permission, resource, lifecycle, and application
-compatibility checks before each action. The plugin trusts the desktop account
+Driver completes common permission, resource, and lifecycle checks before
+each action. The plugin trusts the desktop account
 under a local trust model. Same-UID transport checks prevent accidental
 cross-account use; they do not authenticate human consent or contain hostile
 code running as that user. There is no external signer, `APPROVE` command,
@@ -68,8 +68,9 @@ The request sequence for every Driver-admitted action is:
 
 `TARGET` binds the exact live native top-level surface, generates a fresh token,
 and grants at most five seconds of steady-clock technical lifetime. It first
-retires any unused previous grant. It refuses unavailable desktops, primary
-focus on the target's Wayland client, and another lane targeting that client.
+retires any unused previous grant. It refuses unavailable desktops and another
+lane targeting the target's Wayland client. Human focus on that client does
+not refuse, because the agent seat has its own pointer and keyboard.
 Background seats always publish a private canonical `evdev`/`pc105`/`us`
 keymap, so user layout options and remaps do not alter agent key semantics.
 They advertise the user seat's key repeat rate and delay, falling back to
@@ -116,7 +117,7 @@ after drag release; some clients coalesce motion and requeue the release.
 There is no fixed completion delay or trace-only timing behavior.
 
 Passive focus has no held input or authority, but still participates in
-primary-client and inter-lane conflicts. Owner cancellation, EOF, and the
+inter-lane conflicts. Owner cancellation, EOF, and the
 connection's idle timeout release held buttons and all keyboard state and
 revoke authority without requiring pointer leave. Passive target references
 are weak and independent of the transport owner; a disconnected owner retains
@@ -135,8 +136,8 @@ cause `agent_target_busy`; ordinary dispatch and conflict checks never evict
 them. This permits opposite-order reuse when both new connections reserve
 their lanes before either selects a target, without retrying any input.
 
-Target replacement, unmap, destruction, geometry change, primary-client
-conflict, and desktop/keymap/configuration transitions clear passive focus.
+Target replacement, unmap, destruction, geometry change, and
+desktop/keymap/configuration transitions clear passive focus.
 An observed physical keymap transition cancels existing authority, but fresh
 background admission after that transition uses the unchanged private agent
 keymap.
@@ -211,8 +212,9 @@ either background route could therefore take the human's keyboard focus or tie
 a drop to the human's next button release. The plugin withholds the popup grab,
 leaving the popup mapped, and cancels the drag source when the requesting
 client is under an agent lease or drag, or received background dispatch in the
-last two seconds, and the human's focus is not on that client. Toolkits that
-require the grab to show a menu, such as GTK, then show no menu.
+last two seconds, and the human's focus is not on that client. GTK still maps
+such a menu and handles agent keys in it. Agent pointer actions address only
+the bound top-level surface, so they do not reach the popup.
 `hyprctl -j cua:status` reports `input.primary_background`,
 `input.refused_popup_grabs`, and `input.refused_drag_starts`.
 
@@ -235,8 +237,11 @@ when XWayland has not bound this lane's seat. Actions acknowledge with
 
 These rules differ from native targets:
 
-- Conflicts compare X processes, because XWayland is one Wayland client for
-  every X app. Human focus on another X app does not refuse.
+- Human focus on the target's X process refuses with `primary_target_busy`.
+  An X app has one client pointer for all its windows, so its reactions to
+  agent input would reach the human's keyboard. Conflicts compare X processes,
+  because XWayland is one Wayland client for every X app, so human focus on
+  another X app does not refuse.
 - Pointer actions enter the target at the action point and send no motion.
   XWayland turns motion into XI2 raw motion, which every raw listener
   receives, including a relative-mouse game the human is playing. Drags still
@@ -250,9 +255,10 @@ These rules differ from native targets:
   server carries the optional patch in
   [`../../xwayland`](../../xwayland/README.md), which keeps agent pointers
   inside the window they entered.
-- Pointer actions refuse with `primary_constraint` while the human's pointer is
-  locked or confined. Every XI2 raw listener sees agent pointer events, and a
-  game holding such a constraint usually reads them.
+- Drags refuse with `primary_constraint` while the human's pointer is locked or
+  confined. Every XI2 raw listener sees agent pointer motion, and a game
+  holding such a constraint usually reads it. Clicks and scrolls send no
+  motion and proceed.
 - Pointer coordinates are scaled by the window's X surface scale, as Hyprland
   does for the human's pointer under `xwayland:force_zero_scaling`.
 - A new X window from an X process this lane leases, or delivered to in the
@@ -350,10 +356,10 @@ of bounded cleanup latency.
 
 ## Compatibility and build gates
 
-For background `TARGET`, Driver restricts app/package/version/operation
-eligibility before connecting. Its qualification scope remains native Calc and
-Inkscape. X windows need the user's own entry. Foreground `FOREGROUND_TARGET` has no Calc/Inkscape package gate; its
-scope is ordinary native top-level surfaces. Native GTK3, Electron, and Tauri
+Background `TARGET`, `PRIMARY_TARGET`, and `XWAYLAND_TARGET` have no app or
+package gate, as on macOS. Recorded native app evidence covers Calc and
+Inkscape. Foreground `FOREGROUND_TARGET` covers ordinary native top-level
+surfaces. Native GTK3, Electron, and Tauri
 foreground coverage is planned and still requires certification. The plugin checks
 native surface identity, geometry, client conflicts, and exact compiled XKB
 content against the default `evdev`/`pc105`/`us` keymap. Variants, options,
@@ -363,8 +369,7 @@ candidate. Layout names alone never establish eligibility. Existing semantic
 Driver routes retain their own behavior.
 
 Driver expands bounded ASCII text into complete key operations under the exact
-US keymap. The protocol adds no text or IME stream. Background application
-qualification is unchanged by this foreground extension.
+US keymap. The protocol adds no text or IME stream.
 
 Build against the exact Hyprland 0.56.2 ABI with `CUA_HYPRLAND_INPUT=ON`.
 This option defaults to `OFF` and is mutually exclusive with

@@ -64,16 +64,18 @@ client. This RFC replaces it.
   the lane's agent seat. Plain `TARGET` keeps refusing X windows, so an older
   Driver never reaches them. The reply adds `seat`, the agent seat's Wayland
   global name that XWayland uses in its device names, and `xid`.
-- Human and agent conflicts compare X processes, because XWayland is one
-  Wayland client for every X app.
+- Human focus on the target's X process refuses with `primary_target_busy`.
+  An X app has one client pointer for all its windows, so its reactions to
+  agent input would reach the person's keyboard. Conflicts compare X
+  processes, because XWayland is one Wayland client for every X app.
 - Pointer actions enter at the action point and send no motion, since XWayland
   turns motion into XI2 raw motion that every raw listener receives. Scroll
   sends an empty axis event first so XI2 clients have a baseline. Coordinates
   use the window's X surface scale.
 - Pointer actions refuse with `xwayland_focus_changed` if the person's keyboard
   focus changed after admission, because Hyprland restacks X windows on focus.
-  They refuse with `primary_constraint` while the person's pointer is locked
-  or confined.
+  Drags refuse with `primary_constraint` while the person's pointer is locked
+  or confined. Clicks and scrolls send no motion and proceed.
 - A new X window from an X process the agent just drove opens without initial
   focus unless the person is in that process.
 
@@ -87,17 +89,16 @@ client. This RFC replaces it.
   their device lists.
 - Key actions set the master keyboard's focus with `XISetFocus`. Apps using
   ICCCM `WM_TAKE_FOCUS` (Wine, Java) get that offer when the focus moved or the
-  app was handed back.
+  app was handed back, unless X focus is already in that app.
 - Pointer actions check with `TranslateCoordinates` that the root child at the
-  action point belongs to the target's X client, and refuse with
-  `xwayland_target_covered` otherwise.
+  action point is the target window or a menu its app mapped over it, and
+  refuse with `xwayland_target_covered` otherwise. Another window of the same
+  app counts as covering, since the person may be using it.
 - The target app's client pointer moves to the agent pair with
   `XISetClientPointer`, so the app's core grabs, focus requests, and pointer
   queries land on agent devices. Driver hands it back two seconds after the
   last action once the agent pointer holds no grab, at once when the person
   activates that app, and after 60 seconds regardless.
-- X windows need the user's `hyprland-apps.txt` entry; the package matrix
-  covers native windows only.
 
 ### Optional XWayland build
 
@@ -121,6 +122,7 @@ the coverage refusal only when it sees that vendor string.
 | XTest or XSendEvent | Rejected. XTest drives the person's core devices. Many toolkits drop `send_event` input. |
 | Restack the target through Hyprland's XWM | Rejected. It changes the person's X stacking, so their own clicks would reach a hidden window. |
 | Same-client conflicts for all X apps | Rejected. The person could not use any X app while an agent works in another. |
+| Allow the agent in the X app the person is using | Rejected. In the recorded run the app moved its X focus in reaction to the agent, and the person's next keys went into the agent's window. |
 | Probe the person's pointer for grabs | Rejected. A probe grabs the person's device. |
 
 ## Compatibility and migration
@@ -134,15 +136,16 @@ XWayland restarts with Hyprland.
 
 The plugin cannot see X device state and relies on Driver to isolate the seat
 before `XWAYLAND_TARGET`, consistent with RFC 3550's same-user trust model.
-Admission is still a compatibility gate, not a sandbox against same-user code.
+The plugin is not a sandbox against same-user code.
 No new telemetry.
 
 ## Known limits
 
 - Without the optional build, pointer actions refuse on covered X windows.
-- The pointer-constraint guard recognizes games that lock or confine the
-  person's pointer. A game reading raw input without either still sees agent
-  drags.
+- An agent cannot use an X app while the person is in it.
+- The pointer-constraint guard covers drags and recognizes games that lock or
+  confine the person's pointer. A game reading raw input without either still
+  sees agent drags.
 - Qt and Chromium grab every X master pointer while one of their menus is open,
   so a menu the agent opens there captures the person's pointer over X windows
   until it closes.
@@ -170,7 +173,11 @@ Xwayland 24.1.13, nested under headless mutter, through the release Driver:
 - Wine's Edit menu and Java's combo popup open without taking focus
   (`withheld_initial_focus`).
 - A person playing a relative-mouse SDL game: agent clicks, scroll, and typing
-  produce no game input; pointer actions refuse with `primary_constraint`.
+  produce no game input; drags refuse with `primary_constraint`.
+- One X GTK process with two windows, the person typing in one: the agent
+  refuses with `primary_target_busy` in the other and the person's text stays
+  intact. With that refusal removed, the person's next keys went into the
+  agent's window.
 - Scale 2, with and without `xwayland:force_zero_scaling`: clicks and drags
   land at the screenshot point.
 - With the optional build: agent clicks reach an SDL window covered by the

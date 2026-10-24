@@ -4,8 +4,8 @@ Cua Driver reaches X windows on Hyprland with stock Xwayland. It gives each
 agent seat its own XInput2 master pair, so agent input never moves your X
 pointer or focus. One case needs the X server itself: X picks the window under
 a pointer by X stacking, and Hyprland leaves windows on hidden workspaces
-mapped. An agent click on an X window that another app's X window covers in X
-stacking would reach the covering window, so Driver refuses it with
+mapped. An agent click on an X window that another X window covers in X stacking
+would reach the covering window, so Driver refuses it with
 `xwayland_target_covered`.
 
 `agent-focus.patch` changes one function in `hw/xwayland/xwayland-input.c`.

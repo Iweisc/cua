@@ -35,13 +35,11 @@ testing, packaging, and release requirements.
 Bounded instrumented app proof and an uninstrumented smoke are retained from
 source `f180e8828b8f31cc153e3c44eaa89a9c13c5bc68`, with an unchanged plugin
 tree and uninstrumented module hash at
-`1133a06e4f205cf80188a7ac9e41102f37611fea`. Raw background qualification is
-limited to native Calc from `libreoffice-fresh 26.2.5-3`, Inkscape `1.4.4-6`,
-the plain compiled `evdev`/`pc105`/`us` keymap, and the two seats `Cua-Agent`
-and `Cua-Agent-2`. The proof covers the recorded actions and observation
-intervals. Users can admit further apps in
-`$XDG_CONFIG_HOME/cua-driver/hyprland-apps.txt`; those results say the user
-qualified the app. Chromium and Electron reach background input through
+`1133a06e4f205cf80188a7ac9e41102f37611fea`. That proof covers native Calc from
+`libreoffice-fresh 26.2.5-3`, Inkscape `1.4.4-6`, the plain compiled
+`evdev`/`pc105`/`us` keymap, and the two seats `Cua-Agent` and `Cua-Agent-2`,
+for the recorded actions and observation intervals. Background input has no
+app gate, as on macOS. Chromium and Electron reach background input through
 the `PRIMARY_TARGET` route described in
 [the protocol](protocol/cua-input-v3.md#primary-seat-background-extension).
 X windows reach background input through `XWAYLAND_TARGET` on stock
@@ -308,6 +306,6 @@ that isolated background input ships in stable `0.23.2` or nightly. The plugin
 remains discovery-only in its normal build. The separate physical run has explicit foreground
 activation observation, GTK3, GTK4, Qt6, LibreOffice, Chromium/Ozone, Electron,
 DPMS-off refusal, and one-shot and long-lived graphical-session client rows;
-see `tests/README.md` for the required evidence. Those broader application rows
-do not widen the raw-background qualification beyond the exact Calc/Inkscape
+see `tests/README.md` for the required evidence. Background input has no app
+gate, but its recorded native evidence stays limited to the exact Calc/Inkscape
 packages, plain US keymap, and two seats documented in the input v3 contract.

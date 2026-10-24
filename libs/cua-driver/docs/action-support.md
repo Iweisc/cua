@@ -95,9 +95,8 @@ coverage still requires the complete canonical Linux suite in native Hyprland.
 Foreground delivery may activate the target and move the primary cursor, with
 no restoration promise. Held keys/buttons, grabs, constraints, and drag-and-drop
 must refuse before takeover; foreground drag interruption still requires review
-and native verification. This route has no Calc/Inkscape package gate. Background
-`TARGET` retains its Calc/Inkscape qualification and never escalates to
-foreground. Observation followed by global `wtype` input is not an exact-target
+and native verification. Background `TARGET` never escalates to foreground.
+Observation followed by global `wtype` input is not an exact-target
 fallback. Both routes retain the common permission and lifecycle contract.
 
 ## Maintenance rule

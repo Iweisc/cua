@@ -259,7 +259,7 @@ driver selects a backend from compositor capabilities:
   wlr-screencopy, virtual pointer, and virtual keyboard protocols.
 - Hyprland has separate discovery and capture adapters. Its optional plugin
   defaults to discovery-only; the opt-in input v3 source candidate has the
-  qualification and validation limits below. Do not inherit Sway coverage.
+  validation limits below. Do not inherit Sway coverage.
 - GNOME/Mutter uses the bundled WinRects Shell helper for target geometry and
   activation, plus portal/libei for foreground raw input.
 - KDE/KWin uses AT-SPI and portal facilities where available. Target-specific
@@ -279,7 +279,7 @@ control. Other focus-bound background pointer and keyboard shapes return an
 exact `background_unavailable` result. They do not report success after a
 silent drop.
 
-Outside an explicitly enabled, qualified compositor-owned background route,
+Outside an explicitly enabled compositor-owned background route,
 raw Wayland input requires explicitly authorized `delivery_mode:"foreground"`.
 The driver activates the selected target through a verified compositor adapter
 before dispatch. If
@@ -303,29 +303,16 @@ toolchain; v3 uses `CUA_HYPRLAND_INPUT=ON`, separate from the historical
 Driver admits each action through its normal shared permission, resource, and
 lifecycle policy. There is no additional Omarchy approval panel or external
 signer. The plugin accepts the trusted desktop account over same-user local
-sockets; this does not sandbox native code running as that user. Application
-qualification is a compatibility check, not authorization.
+sockets; this does not sandbox native code running as that user.
 
-The initial native qualification scope is Calc from `libreoffice-fresh 26.2.5-3`
-and Inkscape `1.4.4-6`, subject to per-operation native evidence. Before each
-action, Driver matches `/proc/<pid>/exe` to the canonical executable path
-(`/usr/lib/libreoffice/program/soffice.bin` or `/usr/bin/inkscape`), checks the
-exact package name and version in the local pacman database and its executable
-file listing, and rechecks process identity. Unknown or unavailable package
-identity refuses. Package eligibility does not certify every LibreOffice
-application or operation.
-
-To admit another app you have qualified yourself, list its absolute executable
-path, one per line, in `$XDG_CONFIG_HOME/cua-driver/hyprland-apps.txt`
-(usually `~/.config/cua-driver/hyprland-apps.txt`). Blank lines and `#`
-comments are ignored, and symlinks resolve to their real binary. Driver matches
-the entry against the canonical `/proc/<pid>/exe` and rechecks process identity
-as for packaged apps. The result summary for such an app says you qualified it
-in `hyprland-apps.txt`, because Cua has not run its operation matrix against it. Unlisted apps refuse
-with `client_not_qualified` as before.
+Background input reaches any app, as on macOS. There is no app list. Cua's
+recorded native evidence covers Calc from `libreoffice-fresh 26.2.5-3` and
+Inkscape `1.4.4-6`; for every app, verify the effect from fresh state.
 
 The plugin separately binds the exact live native surface and checks geometry,
-desktop availability, and primary-client and other-lane conflicts. Each
+desktop availability, and other-lane conflicts. The agent seat has its own
+pointer and keyboard, so an agent can work in a native app you are using,
+including another window of it, without taking your focus or typing. Each
 background lane publishes a private canonical `evdev`/`pc105`/`us` keymap, so
 user options such as Caps Lock remapped to Ctrl or Super do not alter agent key
 semantics. A physical keymap transition cancels existing authority; use a fresh
@@ -338,8 +325,10 @@ cursor. The result route remains `synthetic_events`. It refuses while your point
 keyboard focus is on that app, and during a grab, drag-and-drop, or pointer
 constraint. The plugin also withholds popup grabs and cancels drag starts that a
 background app makes in reaction to agent input, so a dropdown cannot take your
-keyboard. GTK menus need that grab and do not open in the background. AT-SPI
-routes retain their separate behavior.
+keyboard. GTK menus and combo boxes still open without the grab, and agent keys
+such as Down and Return choose an item. Agent clicks reach only the window's
+main surface, not its menus, so use keys inside a menu. AT-SPI routes retain
+their separate behavior.
 
 XWayland windows (SDL games, Wine, Java, Steam, and other apps with no
 accessibility tree) use the same tools with screenshot coordinates and stock
@@ -349,18 +338,23 @@ XInput2 master pair, focuses that keyboard on the target, and points the
 target app's X client pointer at it. The app's own grabs and focus changes then
 land on agent devices, not yours, and Driver hands the app back after it
 settles. Apps that wait for the window manager to offer focus (Wine, Java) get
-that offer before typing. List the app's executable in `hyprland-apps.txt`; the
-packaged Calc and Inkscape qualification covers native windows only.
+that offer before typing.
 
-- Pointer actions refuse with `xwayland_target_covered` when another app's X
-  window covers the target at that point. X sends pointer input by X stacking,
-  and Hyprland keeps windows on hidden workspaces mapped, so this is common.
+- An agent cannot use an X app while you are in it, and refuses with
+  `primary_target_busy`. The app has one X client pointer for all its windows,
+  so its reactions to agent input, such as moving its own focus, would reach
+  your keyboard.
+- Pointer actions refuse with `xwayland_target_covered` when another X window
+  covers the target at that point, including another window of the same app.
+  A menu the app opened over the target does not count. X sends pointer input
+  by X stacking, and Hyprland keeps windows on hidden workspaces mapped, so
+  this is common.
   Keyboard actions still work there. The optional Xwayland build in
   `libs/cua-driver/xwayland` keeps agent pointers inside the target window, and
   Driver then allows these actions.
-- While your pointer is locked or confined, as in a game, X pointer actions
-  refuse with `primary_constraint`, because every X raw-input listener sees
-  them. Keyboard actions still work.
+- While your pointer is locked or confined, as in a game, X drags refuse with
+  `primary_constraint`, because every X raw-input listener sees their motion.
+  Clicks, scrolls, and keys send no motion and still work.
 - Menus and dialogs an X app opens in reaction to agent input open without
   taking your focus, but they appear on your current workspace. Close them in
   the same task.
@@ -385,7 +379,7 @@ The candidate also adds an explicitly requested foreground route, advertised
 by the plugin as `foreground_target:true`. It binds the exact native top-level
 surface on the compositor thread and intentionally changes primary focus and,
 for pointer actions, cursor position. It does not restore the previous focus or
-cursor. This route has no Calc/Inkscape background package gate. The canonical
+cursor. The canonical
 native harness covers defined GTK3, Electron, and Tauri foreground cases. It refuses
 held physical input, grabs, constraints, drag-and-drop, ambiguous primary seat
 bindings, and non-neutral keyboard modifiers. Background refusal never selects
@@ -450,7 +444,7 @@ ask the user.
 | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | X11/Openbox             | AT-SPI trees and actions, foreground pointer and keyboard input, window and desktop capture, and video                         | Raw background delivery remains toolkit-specific; unsupported shapes refuse                                                                                                                                    |
 | Sway/wlroots            | AT-SPI, native discovery, full-display and cropped-window screencopy, foreground input, semantic background actions, and video | Raw background pointer and keyboard input remains focus-bound                                                                                                                                                  |
-| Hyprland/Omarchy        | Experimental source candidate with separate discovery-foundation and bounded two-seat app evidence                             | Default plugin is discovery-only; raw background v3 qualification is limited to the exact native Calc/Inkscape packages and a private agent US keymap; user Caps-to-Ctrl/Super remaps do not alter agent semantics; complete native harness and release acceptance are separate gates |
+| Hyprland/Omarchy        | Experimental source candidate with separate discovery-foundation and bounded two-seat app evidence                             | Default plugin is discovery-only; raw background v3 uses a private agent US keymap and has recorded native app evidence for Calc and Inkscape only; user Caps-to-Ctrl/Super remaps do not alter agent semantics; complete native harness and release acceptance are separate gates |
 | GNOME/Mutter            | AT-SPI, WinRects geometry and activation, capture, and portal/libei foreground input                                           | Requires the helper and portal grant; portal video parity remains open                                                                                                                                         |
 | KDE/KWin                | AT-SPI and generic discovery where exposed                                                                                     | Target-specific activation and behavioral coverage remain experimental                                                                                                                                         |
 | Nested `cua-compositor` | Versioned direct per-surface input, native GTK 31/31, capture/scope 5/5, and partial Electron coverage                         | The complete shared matrix remains experimental; do not infer standard-Wayland support                                                                                                                         |

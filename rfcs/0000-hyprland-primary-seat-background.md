@@ -3,7 +3,7 @@ title: Background input to single-seat clients on Hyprland
 authors:
   - Iweisc
 created: 2026-10-19
-last_updated: 2026-10-19
+last_updated: 2026-10-24
 status: draft
 discussion: TBD (rename this file to <issue>-hyprland-primary-seat-background.md)
 rfc_pr:
@@ -28,8 +28,8 @@ constraint. Driver chooses it only after the plugin reports `agent_bound:false`,
 and requires the plugin to acknowledge every action on that route as
 `primary_background`, so an agent-seat acknowledgement never stands in for it.
 This RFC also adds two guards that stop a background
-client's reaction to agent input from taking the person's focus, and a
-user-maintained admission list for apps outside the qualified package matrix
+client's reaction to agent input from taking the person's focus, and removes
+the app package gate from background input, as on macOS
 ([#4779](https://github.com/trycua/cua/issues/4779)).
 
 ## Motivation
@@ -58,20 +58,18 @@ refusal codes. It does not propose the second.
 - A client reacting to agent input cannot take keyboard focus through
   `xdg_popup.grab`, or tie a drop to the person's next button release through
   `wl_data_device.start_drag`.
-- Users can admit an app themselves, and result summaries say the user
-  qualified it.
+- Background input reaches any app, with no package gate or app list, as on
+  macOS.
 
 ## Non-goals
 
-- Same-client multi-user input. The route refuses when the person is on the
-  target client.
+- Same-client input on this route. It borrows the person's own resources, so
+  it refuses when the person is on the target client.
 - XWayland clients.
 - Text/IME. Keys use the same canonical US keycodes as the agent seats.
-- Showing GTK menus in the background. GTK requires the popup grab this RFC
-  withholds.
+- Agent clicks inside popups. Pointer actions address only the bound
+  top-level surface. Agent keys operate GTK menus.
 - Changing the agent-seat route or `FOREGROUND_TARGET`.
-- Admission as a security boundary against same-user code. Like the package
-  list, the user list is a compatibility gate.
 
 ## Terminology
 
@@ -89,9 +87,10 @@ refusal codes. It does not propose the second.
   ([`input_experiment.cpp`](../libs/cua-driver/hyprland-plugin/src/input_experiment.cpp)).
 - Agent-seat dispatch to such a client refuses with `client_not_bound`.
 - Background admission accepts only the native LibreOffice Calc and Inkscape
-  packages in `PACKAGES`
-  ([`hyprland_compatibility.rs`](../libs/cua-driver/rust/crates/platform-linux/src/wayland/hyprland_compatibility.rs)).
-  Every other executable refuses with `client_not_qualified`.
+  packages in `PACKAGES` (`hyprland_compatibility.rs`). Every other executable
+  refuses with `client_not_qualified`.
+- `TARGET` refuses with `primary_target_busy` while the person's pointer or
+  keyboard focus is on the target client.
 - Hyprland 0.56.2 accepts `xdg_popup.grab` and `wl_data_device.start_drag`
   serials without checking which seat issued them.
 
@@ -156,13 +155,19 @@ requires the binding and the action acknowledgement to carry
 advertise the extension keeps the existing `client_not_bound` refusal. An
 acknowledgement with the wrong route is an unknown outcome, never a retry.
 
-### User admission
+### Admission and shared apps
 
-`$XDG_CONFIG_HOME/cua-driver/hyprland-apps.txt` lists one absolute executable
-path per line. Blank lines and `#` comments are ignored. Entries are
-canonicalized, so a symlink admits its real binary. Package qualification is
-checked first. The summary of a successful action admitted by the list says
-the user qualified the app in `hyprland-apps.txt`.
+Driver drops the package gate, so background input reaches any app. macOS has
+no app list either. The gate was a compatibility check, not authorization, and
+an unlisted app sent agents to foreground input, which takes the person's
+focus.
+
+`TARGET` no longer refuses when the person is on the target client. The agent
+seat has its own pointer and keyboard, so the agent can work in one window of
+a native app while the person types in another, as on macOS. Passive agent
+pointer focus also stays when the person enters that client. `PRIMARY_TARGET`
+and X windows still refuse with `primary_target_busy`, because their input or
+the app's reactions reach the person's own devices.
 
 ### Doctor
 
@@ -180,8 +185,8 @@ bus name alone answers while that address is a dead socket.
 | Make Chromium bind the agent seats              | Needs changes in Chromium's Ozone backend and every Electron build. Not in Cua's control.                                                              |
 | `FOREGROUND_TARGET` for single-seat clients     | Works today, but takes the person's focus. Background is the user-facing goal.                                                                        |
 | Fall back to `PRIMARY_TARGET` inside the plugin | Hides the route change from Driver and from results. Driver chooses explicitly so the result names the route.                                         |
-| Show GTK menus by granting the grab             | The grab moves keyboard focus to the popup, which takes the person's typing. Withholding it is the safe default.                                      |
-| User admission by app ID or window class        | Window classes are client-chosen and shared by unrelated processes. An executable path matches what the package gate already checks.                  |
+| Grant GTK popup grabs                           | The grab moves keyboard focus to the popup, which takes the person's typing. GTK menus still open without it and take agent keys.                     |
+| Keep the package gate with a user list          | macOS has no app gate, the gate was not authorization, and every unlisted app fell back to foreground input.                                          |
 
 ## Compatibility and migration
 
@@ -189,8 +194,8 @@ All changes are additive. An older plugin does not advertise
 `primary_background`, and Driver keeps its current behavior with it. An older
 Driver ignores `agent_bound` and the new `HELLO` field. Driver's public result
 contract does not change: the route stays `synthetic_events` for both
-background bindings, and only the summary text names a user-qualified app. Rollback is unloading the new plugin build, or removing the
-user list.
+background bindings. Apps that refused with `client_not_qualified` now
+receive background input. Rollback is unloading the new plugin build.
 
 ## Security, privacy, and telemetry
 
@@ -198,16 +203,19 @@ The route sends events only to the target client's own resources, and only
 while the person is not on that client. It sends nothing to the person's
 focused client. The reaction guards close the two known ways a background
 client could take the person's focus or pointer through Hyprland's serial
-handling. Admission remains a compatibility gate and does not protect against
-same-user code, the same as RFC 3550. No new telemetry.
+handling. Removing the package gate does not change the trust model: it was a
+compatibility check, and the plugin trusts same-user code, the same as RFC
+3550. No new telemetry.
 
 ## Implementation plan
 
 1. Plugin: `PRIMARY_TARGET`, the guard, and the status fields, with the route
    binding and guard-order unit tests (commit `75003182b`).
 2. Protocol document (commit `a31854e4a`).
-3. Driver: route selection, user admission, result text, doctor probes.
-4. This RFC.
+3. Driver: route selection and doctor probes.
+4. Plugin and Driver: no package gate, and native agent-seat targets may share
+   an app with the person.
+5. This RFC.
 
 ## Test and acceptance plan
 
@@ -229,18 +237,24 @@ disposable container, plus a nested instance:
 - A Chromium HTML5 drag started by agent input: drag source cancelled
   (`refused_drag_starts: 1`, page title `dragend`), and human typing still
   lands in B.
-- The release Driver with `CUA_DRIVER_RS_ENABLE_WAYLAND=1` and Chromium listed
-  in `hyprland-apps.txt`: `get_window_state`, `click`, `type_text`, and
+- The release Driver with `CUA_DRIVER_RS_ENABLE_WAYLAND=1`, recorded while an
+  earlier user list admitted Chromium: `get_window_state`, `click`, `type_text`, and
   `press_key` on background Chromium A appended ` ok` and `x` to its field
   (title `typed hello! okx okx` after two runs) while the active window and
   cursor stayed on B. Each result is
-  `delivery.mode: background`, `effect: unverifiable`, and its summary names
-  the user list. `cua-driver doctor` reports
+  `delivery.mode: background` and `effect: unverifiable`. `cua-driver doctor`
+  reports
   `background input ready (protocol 3, primary_background true)`.
-- Code - OSS (Electron 42) in the background with Electron listed in
-  `hyprland-apps.txt`: Driver `type_text` put `agent ` into its editor
+- Code - OSS (Electron 42) in the background, recorded the same way: Driver `type_text` put `agent ` into its editor
   (`agent start`, tab marked modified) while the human typed `asdxc` into
   Chromium B, and the active window and cursor stayed on B.
+- Without a package gate or app list, in a nested Hyprland 0.56.2 under
+  headless mutter: one native GTK process with two windows, the person typing
+  `hund` into one while the agent clicked and typed `agent` into the other on
+  a hidden workspace. Each window received only its own text.
+- A GTK combo box and a GTK popup menu opened by agent clicks on a hidden
+  workspace took agent Down and Return (`picked two`, `menu alpha`), with the
+  popup grab withheld and the person's window still active.
 
 Before acceptance, also record: one more Electron app, and two lanes
 targeting different Chromium windows at once.
@@ -249,10 +263,7 @@ targeting different Chromium windows at once.
 
 - Should the reaction window be configurable, or is two seconds enough for
   slow apps?
-- Should Driver report the GTK no-menu case as a refusal instead of an
-  unverifiable success?
-- Should `hyprland-apps.txt` support per-operation entries (click only, no
-  drag) to match the package matrix?
+- Should agent pointer actions reach popups of the bound window?
 
 ## Decision record
 
