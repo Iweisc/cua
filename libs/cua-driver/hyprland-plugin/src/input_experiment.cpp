@@ -24,6 +24,7 @@
 #include <src/desktop/state/FocusState.hpp>
 #include <src/managers/input/InputManager.hpp>
 #include <src/managers/fullscreen/FullscreenController.hpp>
+#include <src/managers/EventManager.hpp>
 #include <src/pointer/PointerManager.hpp>
 #include <src/protocols/core/Seat.hpp>
 #include <src/protocols/core/DataDevice.hpp>
@@ -732,27 +733,22 @@ struct InputExperiment::Impl {
         const auto recent = recent_target.lock();
         return recent && recent->client() == client && Clock::now() - recent_dispatch < kReactionWindow;
     }
-    // X apps show menus and dialogs as new windows. One from an X app the
-    // agent just drove is a reaction, unless the human is in that app.
-    bool owns_x_reaction(const SP<CWLSurfaceResource>& surface) const {
-        if (!surface || same_app(g_pSeatManager->m_state.pointerFocus.lock(), surface) ||
-            same_app(g_pSeatManager->m_state.keyboardFocus.lock(), surface)) return false;
-        if (lease && lease->xwayland && same_app(lease->surface.lock(), surface)) return true;
-        const auto recent = recent_target.lock();
-        return recent && same_app(recent, surface) && Clock::now() - recent_dispatch < kReactionWindow;
-    }
     static pid_t pid_of(const SP<CWLSurfaceResource>& surface) {
         pid_t pid = 0;
         if (surface && surface->client()) wl_client_get_credentials(surface->client(), &pid, nullptr, nullptr);
         return pid;
     }
-    // Electron shows its GTK dialogs over a second Wayland connection, so a
-    // new native window is matched to the agent's app by process, not client.
-    bool owns_process_reaction(pid_t pid) const {
-        const auto in = [&](const SP<CWLSurfaceResource>& surface) { return pid > 0 && pid_of(surface) == pid; };
-        if (in(g_pSeatManager->m_state.pointerFocus.lock()) || in(g_pSeatManager->m_state.keyboardFocus.lock())) return false;
-        if (lease && lease->route != InputRoute::primary_foreground && in(lease->surface.lock())) return true;
-        return in(recent_target.lock()) && Clock::now() - recent_dispatch < kReactionWindow;
+    // The window this lane drives in the app of a new window, unless the
+    // human is in that app. Apps are processes: X apps share one client, and
+    // Electron shows its GTK dialogs over a second Wayland connection.
+    SP<CWLSurfaceResource> app_target(const SP<CWLSurfaceResource>& surface, bool x) const {
+        const auto same = [&](const SP<CWLSurfaceResource>& other) {
+            return x ? same_app(other, surface) : pid_of(surface) > 0 && pid_of(other) == pid_of(surface);
+        };
+        if (!surface || same(g_pSeatManager->m_state.pointerFocus.lock()) || same(g_pSeatManager->m_state.keyboardFocus.lock())) return nullptr;
+        if (const auto s = lease && lease->route != InputRoute::primary_foreground ? lease->surface.lock() : nullptr; same(s)) return s;
+        if (const auto s = recent_target.lock(); Clock::now() - recent_dispatch < kReactionWindow && same(s)) return s;
+        return nullptr;
     }
     // The window this lane is driving, or drove within the reaction window.
     bool drives(const SP<CWLSurfaceResource>& surface) const {
@@ -1874,10 +1870,14 @@ struct InputExperiment::ReactionGuards {
             // Hyprland focuses a new window after openEarly unless this is set, and
             // sets it itself for X menus that declare their type.
             open_early = Event::bus()->m_events.window.openEarly.listen([this](PHLWINDOW window) {
-                if (!window || window->m_noInitialFocus || !agent_window(window)) return;
+                if (!window || window->m_noInitialFocus) return;
+                const auto anchor = anchor_of(window);
+                if (!anchor) return;
                 window->m_noInitialFocus = true;
                 // Otherwise it would join the human's focused group as its visible tab.
                 window->m_groupRules |= Desktop::View::GROUP_BARRED;
+                open_on(window, anchor->m_workspace);
+                window->m_isFloating = reaction_floats(window->m_isFloating, Fullscreen::controller()->hasFullscreen(window->m_workspace));
                 withheld = window;
                 ++withheld_focus;
             });
@@ -1902,25 +1902,43 @@ struct InputExperiment::ReactionGuards {
     bool agent_reaction(wl_client* client) const {
         return std::ranges::any_of(owner.lanes_, [&](const auto& lane) { return lane->owns_reaction(client); });
     }
-    bool agent_window(const PHLWINDOW& window) const {
+    // The window a new window reacts to, or null when it is not a reaction.
+    PHLWINDOW anchor_of(const PHLWINDOW& window) const {
         const auto surface = window->resource();
-        if (!surface) return false;
+        if (!surface) return nullptr;
         std::vector<PHLWINDOW> parents;
         // X parents come from the client's WM_TRANSIENT_FOR, which can loop.
         for (auto parent = window->parent(); parent && parents.size() < 8; parent = parent->parent()) parents.push_back(parent);
         const auto driven = [&](const PHLWINDOW& parent) {
             return std::ranges::any_of(owner.lanes_, [&](const auto& lane) { return lane->drives(parent->resource()); });
         };
-        const bool agent_app = std::ranges::any_of(owner.lanes_, [&](const auto& lane) {
-            return window->m_isX11 ? lane->owns_x_reaction(surface) : lane->owns_process_reaction(Impl::pid_of(surface));
-        });
-        return opened_by_agent(parents, Desktop::focusState()->window(), driven, agent_app);
+        PHLWINDOW app_window;
+        for (const auto& lane : owner.lanes_) {
+            const auto target = lane->app_target(surface, window->m_isX11);
+            if (const auto view = target ? Desktop::View::CWLSurface::fromResource(target) : nullptr) {
+                app_window = Desktop::View::CWindow::fromView(view->view());
+                break;
+            }
+        }
+        return reaction_anchor(parents, Desktop::focusState()->window(), driven, app_window);
     }
-    // The window still appears, but never over the human's window, as a
-    // background app's window does on macOS.
+    // As Hyprland's `workspace N silent` rule does, before the window is laid
+    // out, so it never shows on the human's workspace. The workspace may be
+    // hidden or special.
+    static void open_on(const PHLWINDOW& window, const PHLWORKSPACE& workspace) {
+        if (!workspace || workspace == window->m_workspace) return;
+        window->m_workspace = workspace;
+        window->m_monitor = workspace->m_monitor;
+        // Hyprland has already announced the window on the human's workspace.
+        const auto address = reinterpret_cast<std::uintptr_t>(window.get());
+        g_pEventManager->postEvent(SHyprIPCEvent{"movewindow", std::format("{:x},{}", address, workspace->m_name)});
+        g_pEventManager->postEvent(SHyprIPCEvent{"movewindowv2", std::format("{:x},{},{}", address, workspace->m_id, workspace->m_name)});
+    }
+    // On the human's workspace the window still appears, but never over the
+    // human's window, as a background app's window does on macOS.
     static void keep_below_human(const PHLWINDOW& window) {
         const auto human = Desktop::focusState()->window();
-        if (!human || human == window) return;
+        if (!human || human == window || human->m_workspace != window->m_workspace) return;
         // Hyprland can only move a window to either end of its stack. This
         // moves the new window alone, directly under the human's.
         stack_below(const_cast<std::vector<PHLWINDOW>&>(Desktop::windowState()->windows()), window, human);

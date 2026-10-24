@@ -269,22 +269,28 @@ the bound top-level surface, so they do not reach the popup.
 `hyprctl -j cua:status` reports `input.primary_background`,
 `input.refused_popup_grabs`, and `input.refused_drag_starts`.
 
-Hyprland also gives every new top-level window keyboard focus, raises a new
-floating window over the others and over a fullscreen window, and makes a new
-tiled window the visible tab of the human's focused group. A new window is a
-reaction to agent input when the nearest window in its parent chain that is
-either the human's focused window or a window a lane leases or delivered to in
-the last two seconds is the lane's. With neither in its parent chain, it is a
-reaction when it comes from the process of such a lane window and the human's
-pointer and keyboard focus are not in that process. The rule compares
-processes, not clients, because Electron shows its GTK dialogs over a second
-Wayland connection. So a dialog of the agent's window is a reaction even
-while the human uses another window of the same app, and a dialog of the
-human's own window never is. A reaction window opens without initial focus,
-stays out of the human's group, and stacks directly under the human's window,
-also when that window is fullscreen. It still opens on the human's current
-workspace, and Hyprland draws floating windows over tiled ones.
-`input.withheld_initial_focus` counts these windows.
+Hyprland also opens every new top-level window on the human's workspace,
+gives it keyboard focus, raises a new floating window over the others and over
+a fullscreen window, ends a fullscreen or maximized window when a new tiled
+window opens on its workspace, and makes a new tiled window the visible tab of
+the human's focused group. A new window is a reaction to agent input when the
+nearest window in its parent chain that is either the human's focused window
+or a window a lane leases or delivered to in the last two seconds is the
+lane's. With neither in its parent chain, it is a reaction when it comes from
+the process of such a lane window and the human's pointer and keyboard focus
+are not in that process. The rule compares processes, not clients, because
+Electron shows its GTK dialogs over a second Wayland connection. So a dialog
+of the agent's window is a reaction even while the human uses another window
+of the same app, and a dialog of the human's own window never is. A reaction
+window opens on the workspace of its parent, or with no parent, of the lane
+window in its app, as Hyprland's `workspace N silent` rule would place it.
+That workspace may be hidden or special. The plugin then sends `movewindow`
+and `movewindowv2`, because Hyprland has already sent `openwindow` naming the
+human's workspace. The window opens without initial focus, stays out of the
+human's group, and floats when its workspace has a fullscreen or maximized
+window. On the human's workspace it stacks directly under the human's window,
+also when that window is fullscreen, but Hyprland draws floating windows over
+tiled ones. `input.withheld_initial_focus` counts these windows.
 
 ## Agent cursor stacking
 

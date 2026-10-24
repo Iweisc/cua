@@ -348,13 +348,16 @@ constraint. The plugin also withholds popup grabs and cancels drag starts that a
 background app makes in reaction to agent input, so a dropdown cannot take your
 keyboard. GTK menus and combo boxes still open without the grab, and agent keys
 such as Down and Return choose an item. A window or dialog an app opens in
-reaction to agent input opens without taking your focus and stacks under your
-window, even when it is a dialog of the agent's window in the app you are
-using. A dialog of your own window still takes your focus. Such windows open on
-your current workspace, and Hyprland draws floating windows over tiled ones, so
-close them in the same task. With `misc:focus_on_activate` enabled, an app that
-asks to be activated in reaction to agent input can still take your focus. It
-is off by default. Agent clicks reach only the window's main surface, not its
+reaction to agent input opens on the workspace of the window it belongs to,
+even a hidden or special one, without taking your focus. It never ends your
+fullscreen or maximized window, and on your workspace it stacks under your
+window. This holds even for a dialog of the agent's window in the app you are
+using. A dialog of your own window still opens on your workspace and takes
+your focus. Hyprland draws floating windows over tiled ones, so a dialog on
+your workspace can still cover part of a tiled window. Close such windows in
+the same task. With `misc:focus_on_activate` enabled, an app that asks to be
+activated in reaction to agent input can still take your focus. It is off by
+default. Agent clicks reach only the window's main surface, not its
 menus, so use keys inside a menu. A click at `x`/`y` is
 always a pointer click, as on macOS, so it places the caret and focuses the
 entry under it. It never fires the accessibility action at that point. A click
