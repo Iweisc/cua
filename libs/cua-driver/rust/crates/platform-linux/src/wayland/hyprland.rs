@@ -300,10 +300,17 @@ fn wayland_connection_with_timeout(timeout: Duration) -> Result<wayland_client::
 
 /// Bind the Wayland connection to the IPC compositor before accepting pixels.
 pub(super) fn verify_capture_peer(connection: &wayland_client::Connection) -> Result<()> {
-    let ipc = ipc_connection()?;
-    if peer_pid(ipc.as_raw_fd())? != peer_pid(connection.backend().poll_fd().as_raw_fd())? {
+    attest_capture_peer(ipc_connection()?, connection.backend().poll_fd().as_raw_fd())
+}
+
+fn attest_capture_peer(mut ipc: UnixStream, wayland: RawFd) -> Result<()> {
+    if peer_pid(ipc.as_raw_fd())? != peer_pid(wayland)? {
         bail!("Hyprland IPC and WAYLAND_DISPLAY name different compositor processes");
     }
+    // Hyprland replies to every connection, even one that sent nothing, and
+    // logs an error when the reply hits a closed socket. That ran on every
+    // capture and input connection, so ask for something tiny and read it.
+    read_reply(&mut ipc, b"j/cursorpos", QUERY_TIMEOUT)?;
     Ok(())
 }
 
@@ -1045,6 +1052,23 @@ mod tests {
         let start = Instant::now();
         assert!(read_reply(&mut client, b"j/clients", Duration::from_millis(30)).is_err());
         assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn capture_attestation_reads_the_reply_hyprland_always_writes() {
+        let (ipc, mut server) = UnixStream::pair().unwrap();
+        let (wayland, _compositor) = UnixStream::pair().unwrap();
+        // Like Hyprland: read whatever arrives, even nothing, then reply.
+        let hyprland = std::thread::spawn(move || {
+            let mut request = [0; 128];
+            let count = server.read(&mut request).unwrap();
+            let written = server.write_all(br#"{"x": 1.0,"y": 2.0}"#);
+            (request[..count].to_vec(), written.map_err(|error| error.kind()))
+        });
+        attest_capture_peer(ipc, wayland.as_raw_fd()).unwrap();
+        let (request, written) = hyprland.join().unwrap();
+        assert_eq!(request, b"j/cursorpos");
+        assert_eq!(written, Ok(()));
     }
 
     fn replying_ipc(bytes: Vec<u8>, delay: Duration) -> UnixStream {
