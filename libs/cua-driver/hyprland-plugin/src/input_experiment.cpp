@@ -1862,8 +1862,9 @@ struct InputExperiment::ReactionGuards {
 
 // Driver's agent cursor sits one stacking position above its target window,
 // as on macOS: windows above the target cover it, and it is not drawn while
-// the target is on a hidden workspace. Driver names each cursor layer after
-// its target, so these hooks only move that layer within the frame.
+// the target is on a hidden workspace or after it closes. Driver names each
+// cursor layer after its target, so these hooks only move that layer within
+// the frame.
 struct InputExperiment::CursorStacking {
     using Layer = void (*)(Render::IHyprRenderer*, PHLLS, PHLMONITOR, const Time::steady_tp&, bool, bool);
     using Window = void (*)(Render::IHyprRenderer*, PHLWINDOW, PHLMONITOR, const Time::steady_tp&, bool, Render::eRenderPassMode, bool, bool);
@@ -1885,14 +1886,8 @@ struct InputExperiment::CursorStacking {
         if (layer) HyprlandAPI::removeFunctionHook(plugin, layer);
         live = nullptr;
     }
-    static bool target_alive(std::uintptr_t address) {
-        return std::ranges::any_of(Desktop::windowState()->windows(),
-            [&](const auto& w) { return reinterpret_cast<std::uintptr_t>(w.get()) == address && w->m_isMapped; });
-    }
     static void render_layer(Render::IHyprRenderer* self, PHLLS ls, PHLMONITOR monitor, const Time::steady_tp& time, bool popups, bool lockscreen) {
-        // A cursor whose target is gone falls back to the top of the stack.
-        const auto target = ls ? pinned_cursor_window(ls->m_namespace) : std::nullopt;
-        if (target && target_alive(*target)) return;
+        if (ls && pinned_cursor_window(ls->m_namespace)) return;
         reinterpret_cast<Layer>(live->layer->m_original)(self, ls, monitor, time, popups, lockscreen);
     }
     static void render_window(Render::IHyprRenderer* self, PHLWINDOW w, PHLMONITOR monitor, const Time::steady_tp& time, bool decorate,
@@ -1900,9 +1895,10 @@ struct InputExperiment::CursorStacking {
         reinterpret_cast<Window>(live->window->m_original)(self, w, monitor, time, decorate, mode, ignore_position, standalone);
         // Only the focused tiled window gets a separate popup pass, so the
         // cursor is drawn after the main pass. The target's own menus cover
-        // it, as on macOS. Single-window captures never include it.
-        if (!w || !monitor || mode == Render::RENDER_PASS_POPUP || standalone || ignore_position || self->m_bRenderingSnapshot ||
-            !w->m_isMapped || w->isHidden())
+        // it, as on macOS. Single-window captures never include it. Hyprland
+        // snapshots a window only to animate its close, so the cursor in that
+        // snapshot fades out with the window.
+        if (!w || !monitor || mode == Render::RENDER_PASS_POPUP || standalone || ignore_position || !w->m_isMapped || w->isHidden())
             return;
         const auto address = reinterpret_cast<std::uintptr_t>(w.get());
         // The cursor slides with its window when the workspace changes.
