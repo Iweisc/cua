@@ -54,6 +54,9 @@ int main() {
 
     check(agent_grab({.agent_seat = true, .human_window = true}), "a grab on an agent seat is the agent's, even in the human's window");
     check(agent_grab({.agent_serial = true, .human_window = true}), "a grab quoting an agent serial is the agent's, even in the human's window");
+    check(!agent_grab({.human_newer = true, .agent_seat = true, .human_window = true, .agent_window = true, .agent_app = true}),
+        "the human's own menu, right-clicked after the agent's latest input in that window, is theirs though GTK3 quotes a stale agent seat");
+    check(agent_grab({.agent_serial = true, .human_newer = true}), "an agent serial outweighs the human's newer input");
     check(!agent_grab({.human_window = true, .agent_window = true, .agent_app = true}), "otherwise a grab in the human's window is theirs");
     check(agent_grab({.agent_window = true}), "otherwise a grab in a window the agent drives is the agent's");
     check(agent_grab({.agent_app = true}), "otherwise a grab in an app the agent drives and the human is not in is the agent's");

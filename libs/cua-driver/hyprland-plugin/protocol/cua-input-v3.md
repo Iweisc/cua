@@ -302,12 +302,16 @@ a drop to the human's next button release. The plugin withholds the popup grab,
 leaving the popup mapped, and cancels the drag source when the request reacts
 to agent input. Hyprland drops the seat and serial that both requests quote,
 so the plugin reads them with a libwayland protocol logger, which sees each
-request just before Hyprland handles it. A request quoting an agent seat, or a
-serial an agent seat sent, is the agent's even while the human uses another
-window of the same app. Otherwise a request from the human's focused window is
-theirs, one from a window a lane leases or delivered to in the last two
-seconds is the agent's, and one from an app such a lane drives is the agent's
-when the human's focus is not in that app. Borrowed primary-seat resources take
+request just before Hyprland handles it. A request quoting a serial an agent
+seat sent is the agent's even while the human uses another window of the same
+app. Next, a request from a window the human clicked, or gave a Ctrl, Alt or
+Super chord, after the agent's latest input there is theirs. Only then does a
+request quoting an agent seat count as the agent's, because GTK3 quotes the
+seat its menu last grabbed with, so the human's own menu can quote one.
+Otherwise a request from the human's focused window is theirs, one from a
+window a lane leases or delivered to in the last two seconds is the agent's,
+and one from an app such a lane drives is the agent's when the human's focus
+is not in that app. Borrowed primary-seat resources take
 their serials from Hyprland, but they only act in apps the human's focus is
 not in. GTK and Qt send every key of an app to its open menu, wherever the
 compositor sends the key, so a popup whose grab was withheld gets

@@ -49,8 +49,13 @@ template <typename Time>
 // What a popup grab or drag start says about who caused it. Clients quote
 // the seat and serial of the input they react to.
 struct GrabSignals {
-    // It quotes an agent seat, or a serial an agent seat sent.
-    bool agent_seat = false, agent_serial = false;
+    // It quotes a serial an agent seat sent.
+    bool agent_serial = false;
+    // The human clicked its window, or gave it a modifier chord, after the
+    // agent's latest input there.
+    bool human_newer = false;
+    // It quotes an agent seat.
+    bool agent_seat = false;
     // Its window has the human's keyboard focus.
     bool human_window = false;
     // Its window is one the agent drives.
@@ -59,10 +64,14 @@ struct GrabSignals {
     bool agent_app = false;
 };
 
-// An agent seat or serial makes it the agent's, whoever else uses the app.
-// Otherwise its window decides, then its app.
+// An agent serial makes it the agent's, whoever else uses the app. Then the
+// human's newer input in its window makes it theirs. The quoted seat comes
+// after that: GTK3 quotes the seat its menu last grabbed with, so the human's
+// own menu can quote an agent seat. Then its window decides, then its app.
 [[nodiscard]] constexpr bool agent_grab(const GrabSignals& s) {
-    if (s.agent_seat || s.agent_serial) return true;
+    if (s.agent_serial) return true;
+    if (s.human_newer) return false;
+    if (s.agent_seat) return true;
     if (s.human_window) return false;
     return s.agent_window || s.agent_app;
 }

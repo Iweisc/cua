@@ -782,6 +782,13 @@ struct InputExperiment::Impl {
         if (lease && lease->route != InputRoute::primary_foreground && lease->surface.lock() == surface) return true;
         return recent_target.lock() == surface && Clock::now() - recent_dispatch < kReactionWindow;
     }
+    // When this lane last delivered to the window whose own surface is `surface`.
+    std::optional<Clock::time_point> last_dispatch_to(const SP<CWLSurfaceResource>& surface) const {
+        if (!surface) return std::nullopt;
+        if (lease && lease->route != InputRoute::primary_foreground && lease->surface.lock() == surface) return Clock::now();
+        if (recent_target.lock() == surface) return recent_dispatch;
+        return std::nullopt;
+    }
     void revoke(std::string_view reason, bool retain_pointer = false, ForegroundFailure failure = {ForegroundFailureReason::none}) {
         if (lease && trace && reason != "completed") trace->mark("agent_cancel", lane + 1);
         if (drag && drag->client && !drag->client->dead)
@@ -2050,6 +2057,15 @@ struct InputExperiment::ReactionGuards {
             signals.agent_serial = std::ranges::any_of(owner.lanes_, [&](const auto& lane) { return lane->agent_serials.contains(quoted.serial); });
         }
         quoted = {};
+        if (root) {
+            std::optional<Clock::time_point> human, agent;
+            for (const auto& c : human_commands)
+                if (const auto s = c.surface.lock(); s && (s == root || root->findFirstPreorder([&](const auto& sub) { return sub == s; })) && (!human || c.at > *human))
+                    human = c.at;
+            for (const auto& lane : owner.lanes_)
+                if (const auto at = lane->last_dispatch_to(root); at && (!agent || *at > *agent)) agent = at;
+            signals.human_newer = human && (!agent || !agent_commanded_last(*agent, human));
+        }
         signals.human_window = root && root == g_pSeatManager->m_state.keyboardFocus.lock();
         signals.agent_window = root && std::ranges::any_of(owner.lanes_, [&](const auto& lane) { return lane->drives(root); });
         signals.agent_app = agent_reaction(surface->client());
