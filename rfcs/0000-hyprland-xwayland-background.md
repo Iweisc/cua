@@ -24,7 +24,8 @@ agent seat its own XInput2 master pointer and keyboard inside the X server,
 using only standard X requests. Agent input then never moves the person's X
 pointer, X focus, or held keys. Pointer actions refuse where another app's X
 window covers the target, because X routes pointer input by X stacking. No
-XWayland patch is needed.
+XWayland patch is needed. An optional one-function XWayland patch removes that
+refusal for people who want it.
 
 ## Motivation
 
@@ -52,7 +53,6 @@ client. This RFC replaces it.
 
 ## Non-goals
 
-- Clicking an X window covered by another app's X window at that point.
 - Relative-mouse input for games the agent drives.
 - Text beyond the existing US-keymap key stream.
 
@@ -99,11 +99,25 @@ client. This RFC replaces it.
 - X windows need the user's `hyprland-apps.txt` entry; the package matrix
   covers native windows only.
 
+### Optional XWayland build
+
+`libs/cua-driver/xwayland/agent-focus.patch` changes only `xwl_xy_to_window`.
+For a pointer whose XWayland seat is attached to a master other than the core
+pointer, XWayland resolves the pointer inside the toplevel that seat entered
+through Wayland, using X's own `miSpriteTrace` from that toplevel. If the
+toplevel is not realized or not a root child, the event goes to the root
+window. The core pointer never takes the new branch. `build.sh` builds the
+system's exact release with the distribution's configuration, installs only
+the binary into a private prefix, and sets the server vendor string to
+`The X.Org Foundation (cua-xwayland-agent-focus)`. Hyprland finds Xwayland
+through its own `PATH`, so the build applies to Hyprland alone. Driver skips
+the coverage refusal only when it sees that vendor string.
+
 ## Alternatives considered
 
 | Alternative | Disposition |
 | --- | --- |
-| Patch XWayland | Rejected. A custom X server, changes in shared dix event paths, and a crash takes every X app. The one capability it adds, clicks on covered windows, does not justify that. |
+| Patch XWayland broadly | Rejected. The earlier prototype changed shared dix event paths, device queries, focus, and grabs. Only covered-window clicks need the server, so the optional patch changes one XWayland function. |
 | XTest or XSendEvent | Rejected. XTest drives the person's core devices. Many toolkits drop `send_event` input. |
 | Restack the target through Hyprland's XWM | Rejected. It changes the person's X stacking, so their own clicks would reach a hidden window. |
 | Same-client conflicts for all X apps | Rejected. The person could not use any X app while an agent works in another. |
@@ -125,6 +139,10 @@ No new telemetry.
 
 ## Known limits
 
+- Without the optional build, pointer actions refuse on covered X windows.
+- The pointer-constraint guard recognizes games that lock or confine the
+  person's pointer. A game reading raw input without either still sees agent
+  drags.
 - Qt and Chromium grab every X master pointer while one of their menus is open,
   so a menu the agent opens there captures the person's pointer over X windows
   until it closes.
@@ -155,6 +173,11 @@ Xwayland 24.1.13, nested under headless mutter, through the release Driver:
   produce no game input; pointer actions refuse with `primary_constraint`.
 - Scale 2, with and without `xwayland:force_zero_scaling`: clicks and drags
   land at the screenshot point.
+- With the optional build: agent clicks reach an SDL window covered by the
+  person's xterm and by a second hidden window, which receive nothing, while
+  the person's own clicks on that spot still reach the xterm. Stock XWayland
+  with the same Driver still refuses those clicks. The app set above and the
+  game check repeat with the same results.
 - Plugin CTest 20/20; Driver Hyprland and XWayland unit tests pass.
 
 Before acceptance, also record a physical desktop with a real mouse, two
@@ -162,8 +185,8 @@ agents on different X apps at once, and a Proton game.
 
 ## Unresolved questions
 
-- Should an optional XWayland change restrict the agent sprite to its Wayland
-  focus window, so covered windows become clickable?
+- Should the agent-focus change be proposed to XWayland upstream, so the
+  optional build is no longer needed?
 - Should the new-window guard also cover native apps and move reaction windows
   to their parent's workspace?
 
