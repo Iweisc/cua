@@ -2814,8 +2814,8 @@ fn non_ax_escalation_for(wayland: bool, hyprland_input: bool) -> Value {
             "recommended": "px",
             "reason": "non-AX surface — act by pixel (x,y) off the screenshot in this \
                        response, keeping delivery_mode:\"background\". Hyprland's plugin \
-                       addresses this window directly for a qualified app (see \
-                       hyprland-apps.txt). A refusal is not a reason to bring it forward."
+                       addresses this window directly. A refusal is not a reason to bring \
+                       it forward."
         })
     } else if wayland {
         json!({
@@ -4472,20 +4472,15 @@ fn hyprland_input_result(result: anyhow::Result<Value>, foreground: bool) -> Too
         "background_unavailable"
     };
     match result {
-        Ok(value) if value["ok"] == true => {
-            // A user-listed app has not been through Cua's operation matrix.
-            let text = if value["qualified_by"] == "user" {
-                "Dispatched exact-target Hyprland input to an app you qualified in hyprland-apps.txt; application effect is unverifiable."
-            } else {
-                "Dispatched exact-target Hyprland input; application effect is unverifiable."
-            };
-            ToolResult::text(text).with_action_record(
-                record(ActionEffect::Unverifiable)
-                    .actual_delivery(actual)
-                    .build()
-                    .expect("isolated input record is valid"),
-            )
-        }
+        Ok(value) if value["ok"] == true => ToolResult::text(
+            "Dispatched exact-target Hyprland input; application effect is unverifiable.",
+        )
+        .with_action_record(
+            record(ActionEffect::Unverifiable)
+                .actual_delivery(actual)
+                .build()
+                .expect("isolated input record is valid"),
+        ),
         Ok(mut value) => {
             if foreground && value["code"] == "foreground_partial_unknown" {
                 return hyprland_input_result(
@@ -5357,23 +5352,6 @@ fn foreground_hyprland_reports_foreground_and_preserves_partial_progress() {
         assert_eq!(value["delivery"]["mode"], "unknown");
         assert_ne!(value["effect"], "refused");
     }
-}
-
-#[cfg(test)]
-#[test]
-fn user_qualified_hyprland_dispatch_says_who_qualified_the_app() {
-    let text = |qualified_by| {
-        let result = hyprland_input_result(
-            Ok(
-                json!({"ok":true,"effect":"unverifiable","route":"primary_background",
-                "qualified_by":qualified_by}),
-            ),
-            false,
-        );
-        serde_json::to_string(&result.content).unwrap()
-    };
-    assert!(text("user").contains("you qualified in hyprland-apps.txt"));
-    assert!(!text("package").contains("hyprland-apps.txt"));
 }
 
 #[cfg(test)]

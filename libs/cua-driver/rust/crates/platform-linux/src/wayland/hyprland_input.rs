@@ -299,19 +299,6 @@ pub fn enabled() -> bool {
             }))
 }
 
-/// Whether background (isolated seat) input is admitted for `pid`'s windows,
-/// the check a background action makes before dispatch. `Err` carries the
-/// refusal reason (`client_not_qualified`, ...). Only meaningful while
-/// [`enabled`]: without the isolated seats the tools route background input
-/// elsewhere.
-pub fn background_admission(pid: u32) -> std::result::Result<(), &'static str> {
-    if protocol() == InputProtocol::Production {
-        super::hyprland_compatibility::qualify(pid, false).map(|_| ())
-    } else {
-        Ok(())
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum InputProtocol {
     Production,
@@ -1342,18 +1329,10 @@ fn execute_actions_routed(
         route == DeliveryRoute::Background || protocol() == InputProtocol::Production,
         "foreground input requires production protocol; no downgrade is permitted"
     );
-    let isolated = route == DeliveryRoute::Background && protocol() == InputProtocol::Production;
-    let xwayland = isolated
+    let xwayland = route == DeliveryRoute::Background
+        && protocol() == InputProtocol::Production
         && super::hyprland::window_for_address(address)
             .is_some_and(|window| window.pid == pid && window.xwayland == Some(true));
-    let qualification = if isolated {
-        match super::hyprland_compatibility::qualify(pid, xwayland) {
-            Ok(qualification) => Some(qualification),
-            Err(reason) => return Ok(json!({"ok":false,"code":reason,"detail":reason})),
-        }
-    } else {
-        None
-    };
     let client = session_client(&owner)?;
     let mut slot = client.lock(&cancellation)?;
     if let Some(client) = slot.as_ref() {
@@ -1382,12 +1361,7 @@ fn execute_actions_routed(
     let connected = slot.as_mut().context("missing input connection")?;
     connected.cancellation = cancellation;
     connected.xwayland = xwayland;
-    let mut reply =
-        dispatch_actions_in_slot(&mut slot, actions, started, route, text, Client::attest)?;
-    if let Some(qualification) = qualification {
-        reply["qualified_by"] = json!(qualification.label());
-    }
-    Ok(reply)
+    dispatch_actions_in_slot(&mut slot, actions, started, route, text, Client::attest)
 }
 
 fn dispatch_actions_in_slot(
