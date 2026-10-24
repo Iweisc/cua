@@ -4611,13 +4611,24 @@ fn hyprland_element_actions_refuse_while_the_session_is_unavailable() {
         hyprland_session_gate(false, false, || panic!("read without the plugin")).is_none(),
         "without the plugin nothing is read or refused"
     );
-    assert!(hyprland_session_gate(true, false, status(json!({"session_available": true}))).is_none());
-    for (foreground, code) in [(false, "background_unavailable"), (true, "foreground_unavailable")] {
+    assert!(
+        hyprland_session_gate(true, false, status(json!({"session_available": true}))).is_none()
+    );
+    for (foreground, code) in [
+        (false, "background_unavailable"),
+        (true, "foreground_unavailable"),
+    ] {
         let refusals = [
-            hyprland_session_gate(true, foreground, status(json!({"session_available": false}))),
+            hyprland_session_gate(
+                true,
+                foreground,
+                status(json!({"session_available": false})),
+            ),
             // An older plugin without the field, and a failed read, refuse too.
             hyprland_session_gate(true, foreground, status(json!({}))),
-            hyprland_session_gate(true, foreground, || anyhow::bail!("Hyprland IPC query timed out")),
+            hyprland_session_gate(true, foreground, || {
+                anyhow::bail!("Hyprland IPC query timed out")
+            }),
         ];
         for refusal in refusals {
             let refusal = refusal.expect("an unavailable session refuses");
@@ -5545,8 +5556,14 @@ fn experimental_dispatch_does_not_claim_application_success() {
 fn hyprland_outside_point_keeps_the_cross_platform_refusal_code() {
     // A multi-packet scroll reports its refusal with an empty delivery.
     for (reply, foreground) in [
-        (json!({"ok":false,"code":"point_outside_window","detail":"outside"}), false),
-        (json!({"ok":false,"code":"point_outside_window","detail":"outside"}), true),
+        (
+            json!({"ok":false,"code":"point_outside_window","detail":"outside"}),
+            false,
+        ),
+        (
+            json!({"ok":false,"code":"point_outside_window","detail":"outside"}),
+            true,
+        ),
         (
             json!({"ok":false,"code":"point_outside_window","detail":"outside","effect":"none",
                 "delivery":{"mode":"background","delivered_count":0}}),

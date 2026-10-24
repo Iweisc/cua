@@ -250,7 +250,8 @@ fn a_locked_or_dark_screen_asks_to_wait_whatever_the_tool_or_route() {
                 json!({"code": code, "reason": "session_unavailable", "effect": "refused"}),
             );
             assert!(
-                hint.hint.starts_with("The user's screen is locked or the display is off"),
+                hint.hint
+                    .starts_with("The user's screen is locked or the display is off"),
                 "{tool} {code}: {}",
                 hint.hint
             );

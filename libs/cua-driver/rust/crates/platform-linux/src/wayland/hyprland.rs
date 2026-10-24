@@ -306,7 +306,10 @@ fn wayland_connection_with_timeout(timeout: Duration) -> Result<wayland_client::
 
 /// Bind the Wayland connection to the IPC compositor before accepting pixels.
 pub(super) fn verify_capture_peer(connection: &wayland_client::Connection) -> Result<()> {
-    attest_capture_peer(ipc_connection()?, connection.backend().poll_fd().as_raw_fd())
+    attest_capture_peer(
+        ipc_connection()?,
+        connection.backend().poll_fd().as_raw_fd(),
+    )
 }
 
 fn attest_capture_peer(mut ipc: UnixStream, wayland: RawFd) -> Result<()> {
@@ -1215,7 +1218,10 @@ mod tests {
             let mut request = [0; 128];
             let count = server.read(&mut request).unwrap();
             let written = server.write_all(br#"{"x": 1.0,"y": 2.0}"#);
-            (request[..count].to_vec(), written.map_err(|error| error.kind()))
+            (
+                request[..count].to_vec(),
+                written.map_err(|error| error.kind()),
+            )
         });
         attest_capture_peer(ipc, wayland.as_raw_fd()).unwrap();
         let (request, written) = hyprland.join().unwrap();
