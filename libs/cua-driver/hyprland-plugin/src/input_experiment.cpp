@@ -2068,6 +2068,15 @@ struct InputExperiment::CursorStacking {
     void uninstall() {
         if (window) HyprlandAPI::removeFunctionHook(plugin, window);
         if (layer) HyprlandAPI::removeFunctionHook(plugin, layer);
+        // Without the hooks Hyprland draws a pinned layer above every window.
+        // Each one, bound or not yet mapped, is closed, and hidden until Driver
+        // destroys it. Driver finds the input sockets gone and draws its
+        // cursors in its plain layer.
+        for (const auto& ls : Desktop::layerState()->layers())
+            if (ls && pinned_cursor_window(ls->m_namespace)) {
+                ls->alpha()[Desktop::View::LS_ALPHA_FADE]->setValueAndWarp(0.F);
+                close_layer(ls);
+            }
         live = nullptr;
     }
     static void render_layer(Render::IHyprRenderer* self, PHLLS ls, PHLMONITOR monitor, const Time::steady_tp& time, bool popups, bool lockscreen) {

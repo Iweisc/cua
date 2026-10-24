@@ -356,6 +356,15 @@ that took its target's address, and never stays at a point its moved target
 left. The cursor fades with the window's fade alpha, including a special
 workspace fading in or out, but not with its opacity rules.
 
+Without the plugin's hooks Hyprland would draw a pinned layer above every
+window. When the plugin unloads, it hides every pinned layer and sends it
+`closed`. Driver checks that the input sockets exist on each pin and each
+closed pinned layer. Once they are gone, after an unload or a config disable,
+it hides the cursors pinned to a window until their next pin, and draws them
+in the plain layer from then on. A config disable keeps the hooks, so pinned
+layers stay correctly stacked until Driver drops them. After a re-enable, the
+next pin opens window layers again.
+
 ## XWayland extension
 
 XWayland binds every Wayland seat, the agent seats included, and attaches each
