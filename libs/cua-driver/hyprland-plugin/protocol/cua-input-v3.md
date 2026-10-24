@@ -265,6 +265,19 @@ close, and that snapshot includes the cursor, so it fades out with the window.
 A pinned layer is never drawn above every window. The plain
 `cua-agent-cursor` layer stays above every window.
 
+Hyprland reuses a freed window's address for the next window it creates, so
+the plugin binds each pinned layer to the window at its address when the
+layer maps, and draws it only after that window. Driver places the cursor
+relative to the window's top-left corner from the box it read when it acted,
+and does not see the window move, so the plugin also records that box. When
+the window is destroyed, even on a hidden workspace, or its corner moves or
+it shrinks (a move, layout reflow, swap, or fullscreen, float, or group
+toggle), the plugin sends the layer `zwlr_layer_surface_v1.closed`. Driver
+then stops drawing the cursors pinned to that address and opens no layer for
+them until it pins them again. A cursor therefore never moves onto a window
+that took its target's address, and never stays at a point its moved target
+left.
+
 ## XWayland extension
 
 XWayland binds every Wayland seat, the agent seats included, and attaches each

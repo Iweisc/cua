@@ -1886,9 +1886,9 @@ struct InputExperiment::ReactionGuards {
 
 // Driver's agent cursor sits one stacking position above its target window,
 // as on macOS: windows above the target cover it, and it is not drawn while
-// the target is on a hidden workspace or after it closes. Driver names each
-// cursor layer after its target, so these hooks only move that layer within
-// the frame.
+// the target is on a hidden workspace, after it closes, or after it moves or
+// shrinks until Driver acts again. Driver names each cursor layer after its
+// target, so these hooks only move that layer within the frame.
 struct InputExperiment::CursorStacking {
     using Layer = void (*)(Render::IHyprRenderer*, PHLLS, PHLMONITOR, const Time::steady_tp&, bool, bool);
     using Window = void (*)(Render::IHyprRenderer*, PHLWINDOW, PHLMONITOR, const Time::steady_tp&, bool, Render::eRenderPassMode, bool, bool);
@@ -1896,6 +1896,16 @@ struct InputExperiment::CursorStacking {
     void* plugin;
     CFunctionHook* layer = nullptr;
     CFunctionHook* window = nullptr;
+    CursorPins<PHLLSREF, PHLWINDOWREF, CBox> pins;
+    CHyprSignalListener opened, destroyed;
+
+    // The goal box, which hyprctl reports and Driver acts on.
+    static CBox goal_box(const PHLWINDOW& w) { return w->geometricBox(Desktop::View::IGeometric::GEOMETRIC_GOAL); }
+    // Driver stops drawing a cursor whose layer is closed until it pins that
+    // cursor again, which opens a new layer.
+    static void close_layer(const PHLLS& ls) {
+        if (const auto resource = ls->m_layerSurface.lock()) resource->sendClosed();
+    }
 
     explicit CursorStacking(void* handle) : plugin(handle) {
         if (live) throw std::runtime_error("cursor stacking already installed");
@@ -1904,6 +1914,12 @@ struct InputExperiment::CursorStacking {
             reinterpret_cast<void*>(render_layer));
         window = install_hook(plugin, "_ZN6Render13IHyprRenderer12renderWindowEN9Hyprutils6Memory14CSharedPointerIN7Desktop4View7CWindowEEENS3_IN7Monitor8CMonitorEEERKNSt6chrono10time_pointINSB_3_V212steady_clockENSB_8durationIlSt5ratioILl1ELl1000000000EEEEEEbNS_15eRenderPassModeEbb",
             reinterpret_cast<void*>(render_window));
+        opened = Event::bus()->m_events.layer.opened.listen([this](PHLLS ls) {
+            if (ls) pins.open(ls, ls->m_namespace, Desktop::windowState()->windows(), [](const PHLWINDOW& w) { return reinterpret_cast<std::uintptr_t>(w.get()); }, goal_box);
+        });
+        // A window that closed on a hidden workspace never drew its cursor,
+        // and releases its layer here all the same.
+        destroyed = Event::bus()->m_events.window.destroy.listen([this](PHLWINDOWREF) { pins.release(close_layer); });
     }
     ~CursorStacking() {
         if (window) HyprlandAPI::removeFunctionHook(plugin, window);
@@ -1924,12 +1940,15 @@ struct InputExperiment::CursorStacking {
         // snapshot fades out with the window.
         if (!w || !monitor || mode == Render::RENDER_PASS_POPUP || standalone || ignore_position || !w->m_isMapped || w->isHidden())
             return;
-        const auto address = reinterpret_cast<std::uintptr_t>(w.get());
+        // Driver painted the cursor where it acted, from the box it read
+        // then. It cannot see the window move, so the cursor waits for the
+        // next action instead of pointing at another spot.
+        live->pins.release_moved(w, goal_box(w), close_layer);
         // The cursor slides with its window when the workspace changes.
         const auto offset = w->m_pinned || !w->m_workspace ? Vector2D{} : w->m_workspace->m_renderOffset->value();
         for (const auto& ref : monitor->m_layerSurfaceLayers[ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY]) {
             const auto ls = ref.lock();
-            if (!ls || !ls->m_mapped || pinned_cursor_window(ls->m_namespace) != address) continue;
+            if (!ls || !ls->m_mapped || !live->pins.above(ls, w)) continue;
             const auto surface = ls->wlSurface()->resource();
             if (!surface || !surface->m_current.texture) continue;
             // The layer's own open animation is skipped: the cursor appears

@@ -410,12 +410,18 @@ fn apply_keyed_command(
     }
 
     let disabling = matches!(&cmd, OverlayCommand::SetEnabled(false));
+    let pinning = matches!(&cmd, OverlayCommand::PinAbove(_));
     let outcome = render.apply_command(key, cmd);
-    if disabling {
-        if let Some(key) = outcome.applied_key() {
-            if let Some(core) = render.cursors.get_mut(key) {
-                quiesce_hidden(core);
-            }
+    if let Some(core) = outcome
+        .applied_key()
+        .and_then(|key| render.cursors.get_mut(key))
+    {
+        if disabling {
+            quiesce_hidden(core);
+        }
+        if pinning {
+            // See `release_pinned_window`.
+            core.pinned_target_off_workspace = false;
         }
     }
     outcome.is_dirty()
@@ -533,6 +539,12 @@ fn effect_spill_outputs(
         .collect()
 }
 
+/// `paint_cursor` skips a cursor whose target is off screen, and so must the
+/// frame plan and the debug square.
+fn shown(core: &RenderStateCore) -> bool {
+    core.is_revealed() && !core.pinned_target_off_workspace
+}
+
 fn visible_cores_for_output<'a>(
     cores: &'a CursorMap<RenderStateCore>,
     layouts: &[OutputLayout],
@@ -542,7 +554,7 @@ fn visible_cores_for_output<'a>(
     let mut visible_cores: Vec<_> = cores
         .iter()
         .filter(|(_, core)| {
-            core.is_revealed()
+            shown(core)
                 && (select_output(layouts, core.pos.0, core.pos.1)
                     .is_some_and(|selected| selected.id == output_id)
                     // A cursor on another output whose trail or glow reaches
@@ -562,6 +574,33 @@ fn visible_cores_for_output<'a>(
 fn cursor_group(core: &RenderStateCore, stack_with_windows: bool) -> Group {
     core.pinned_wid
         .filter(|&wid| stack_with_windows && wid != 0)
+}
+
+/// The windows that need a layer of their own.
+fn pinned_windows(cores: &CursorMap<RenderStateCore>, stack_with_windows: bool) -> HashSet<u64> {
+    cores
+        .values()
+        .filter(|core| !core.pinned_target_off_workspace)
+        .filter_map(|core| cursor_group(core, stack_with_windows))
+        .collect()
+}
+
+/// The Hyprland plugin closes a pinned layer once its window is gone, since
+/// Hyprland hands that address to the next window it opens, and once its
+/// window moves or shrinks, since the cursor was placed from the old box. The
+/// cursors pinned there paint nothing and get no new layer until they are
+/// pinned again. Hyprland also closes a removed monitor's layers, so those
+/// cursors wait for their next pin too.
+fn release_pinned_window(
+    cores: &mut CursorMap<RenderStateCore>,
+    wid: u64,
+    stack_with_windows: bool,
+) {
+    for core in cores.values_mut() {
+        if cursor_group(core, stack_with_windows) == Some(wid) {
+            core.pinned_target_off_workspace = true;
+        }
+    }
 }
 
 /// The plugin parses this name in `hyprland-plugin/src/cursor_layer.hpp`.
@@ -632,12 +671,7 @@ fn sync_pinned_layers(state: &mut OverlayState, qh: &QueueHandle<OverlayState>) 
     else {
         return;
     };
-    let pinned: HashSet<u64> = state
-        .render
-        .cursors
-        .values()
-        .filter_map(|core| cursor_group(core, state.stack_with_windows))
-        .collect();
+    let pinned = pinned_windows(&state.render.cursors, state.stack_with_windows);
     for (&id, output) in state.outputs.iter_mut() {
         let dropped: Vec<u64> = output
             .pinned
@@ -1078,8 +1112,7 @@ fn redraw_group(
         })
         .copied()
         .collect();
-    let in_group =
-        |core: &&RenderStateCore| core.is_revealed() && cursor_group(core, stack) == group;
+    let in_group = |core: &&RenderStateCore| shown(core) && cursor_group(core, stack) == group;
     let of_group = |set: &HashSet<(u32, Group)>| -> HashSet<u32> {
         set.iter()
             .filter(|(_, g)| *g == group)
@@ -1529,6 +1562,7 @@ impl Dispatch<ZwlrLayerSurfaceV1, LayerData> for OverlayState {
                 state.painted.remove(&(data.id, data.group));
                 state.initialized.remove(&(data.id, data.group));
                 if let Some(wid) = data.group {
+                    release_pinned_window(&mut state.render.cursors, wid, state.stack_with_windows);
                     if let Some(layer) = state
                         .outputs
                         .get_mut(&data.id)
@@ -1784,6 +1818,43 @@ mod tests {
         assert_eq!(keys(Some(0xb), true), vec!["b"]);
         assert!(keys(None, true).is_empty());
         assert_eq!(keys(None, false), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn a_cursor_whose_window_layer_closed_waits_for_its_next_pin() {
+        let mut render = WlRenderMap::new(CursorConfig::default(), ());
+        for (key, wid) in [("a", 0xa), ("b", 0xa), ("c", 0xc)] {
+            let mut core = positioned_core();
+            core.pinned_wid = Some(wid);
+            render.cursors.insert(key.to_owned(), core);
+        }
+        let layouts = three_monitor_layout();
+        let drawn = |render: &WlRenderMap, group| {
+            visible_cores_for_layer(&render.cursors, &layouts, 1, group, true)
+                .into_iter()
+                .map(|(key, _)| key.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(drawn(&render, Some(0xa)), vec!["a", "b"]);
+
+        release_pinned_window(&mut render.cursors, 0xa, true);
+        assert_eq!(pinned_windows(&render.cursors, true), HashSet::from([0xc]));
+        assert!(drawn(&render, Some(0xa)).is_empty());
+        assert_eq!(drawn(&render, Some(0xc)), vec!["c"]);
+
+        // The window that takes the address gets a layer for the cursor
+        // pinned to it anew, and the other old cursor stays hidden.
+        assert!(apply_keyed_command(
+            &mut render,
+            None,
+            "a".to_owned(),
+            OverlayCommand::PinAbove(0xa),
+        ));
+        assert_eq!(
+            pinned_windows(&render.cursors, true),
+            HashSet::from([0xa, 0xc])
+        );
+        assert_eq!(drawn(&render, Some(0xa)), vec!["a"]);
     }
 
     #[test]
