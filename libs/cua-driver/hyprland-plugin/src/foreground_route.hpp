@@ -151,6 +151,18 @@ std::string_view agent_keyboard_refusal(InputRoute route, bool xwayland, std::ui
     return "primary_keyboard_busy";
 }
 
+// Hyprland gives a window keyboard focus before the person's press reaches
+// it, and some apps depend on that: Ghostty swallows a left press on a surface
+// without keyboard focus as a focus-only click. So the agent seat's keyboard
+// enters the window around its own left press, wherever agent keys would be
+// allowed. Ghostty drops only the left press, and a popup keeps its own focus.
+template <typename Surface>
+bool agent_press_enters_keyboard(InputRoute route, bool xwayland, std::uint32_t button, bool popup,
+                                 const Surface& human_keyboard_focus, const Surface& target) {
+    return route == InputRoute::independent && !xwayland && button == 272 && !popup &&
+        agent_keyboard_refusal(route, xwayland, 2, human_keyboard_focus, target).empty();
+}
+
 // The background primary route borrows the client's primary-seat resources.
 // It refuses anything that would make the human's own input reach the target
 // or let an agent gesture start compositor-global state.

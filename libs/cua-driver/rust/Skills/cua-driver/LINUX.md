@@ -335,7 +335,12 @@ app, so an agent key in one of their windows takes your typing away from yours,
 and in any app agent keys in your window mix with your typing. Ghostty, foot,
 and GTK keep keyboard focus per seat and could type into another window
 correctly, but they are refused too: there are no per-app exceptions. Element
-actions such as `set_value` still work there. Each
+actions such as `set_value` still work there. A left click or drag gives the
+agent seat keyboard focus for that one action, as your own click would, except
+while your keyboard focus is in that app. Ghostty ignores a left click on a
+window without keyboard focus, so while you type in one Ghostty window, agent
+left clicks and drags in another window of the same Ghostty process are lost
+and only reported as unverifiable. Each
 background lane publishes a private canonical `evdev`/`pc105`/`us` keymap, so
 user options such as Caps Lock remapped to Ctrl or Super do not alter agent key
 semantics. A physical keymap transition cancels existing authority; use a fresh

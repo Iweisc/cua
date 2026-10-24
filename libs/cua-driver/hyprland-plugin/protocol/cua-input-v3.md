@@ -248,6 +248,25 @@ window while the human types in another, but they are refused too. This is a
 deliberate limit with no per-app or per-toolkit exception: a client's keyboard
 model is not visible to the compositor.
 
+### Left presses take keyboard focus
+
+Hyprland gives a window keyboard focus before the human's press reaches it,
+and some clients depend on that. Ghostty treats a left press on a surface
+without keyboard focus as a focus-only click and drops it, along with its
+release and any drag. On a native `TARGET` binding, a left-button `CLICK` and
+the press of a `DRAG` therefore send the agent seat's `wl_keyboard.enter` to
+the window just before the press, wherever a `KEY` would be allowed: never
+while the human's keyboard focus is on that client. A click leaves after its
+release and a drag right after its press, both within that dispatch, so agent
+keyboard focus never outlives a dispatch, the same as for `KEY`. Ghostty checks
+focus only at the press, so its drag still selects. The client sees a focus
+change around the press, as around each `KEY`. Other buttons, popups, X
+windows, and the primary routes get no keyboard focus.
+
+While the human types in one Ghostty window, the agent's left clicks and drags
+in another window of the same process still arrive without keyboard focus, and
+Ghostty drops them. They are acknowledged as `unverifiable`.
+
 ## Primary-seat background extension
 
 Chromium/Ozone and Electron bind only the first `wl_seat`, so they never see
