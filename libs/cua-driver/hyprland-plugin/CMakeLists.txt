@@ -109,6 +109,12 @@ if(BUILD_TESTING)
     target_compile_options(cua_hyprland_drag_geometry_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
     add_test(NAME cua_hyprland_drag_geometry_test COMMAND cua_hyprland_drag_geometry_test)
 
+    add_executable(cua_hyprland_pointer_hit_test tests/pointer_hit_test.cpp)
+    target_compile_features(cua_hyprland_pointer_hit_test PRIVATE cxx_std_26)
+    target_include_directories(cua_hyprland_pointer_hit_test PRIVATE src)
+    target_compile_options(cua_hyprland_pointer_hit_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    add_test(NAME cua_hyprland_pointer_hit_test COMMAND cua_hyprland_pointer_hit_test)
+
     add_executable(cua_hyprland_target_identity_test tests/target_identity_test.cpp)
     target_compile_features(cua_hyprland_target_identity_test PRIVATE cxx_std_26)
     target_include_directories(cua_hyprland_target_identity_test PRIVATE src)

@@ -46,10 +46,11 @@ its original seat names.
 The request sequence for every Driver-admitted action is:
 
 1. Send `HELLO` once per connection. The response is
-   `{"ok":true,"protocol":3,"epoch":"<epoch>","foreground_target":true,"primary_background":true,"xwayland_target":true,"stable_id":true}`
+   `{"ok":true,"protocol":3,"epoch":"<epoch>","foreground_target":true,"primary_background":true,"xwayland_target":true,"stable_id":true,"popup_input":true}`
    for a production plugin implementing the foreground, primary-background,
-   and XWayland extensions and the stable-id target field. Driver must require
-   each explicit capability before using its route or field.
+   and XWayland extensions, the stable-id target field, and
+   [pointer targets](#pointer-targets) on the window's popups. Driver must
+   require each explicit capability before using its route or field.
 2. Send `CLAIM`. The response is `{"ok":true,"lane":0}` or lane `1`.
 3. For background input, send `TARGET <pid> <hex-address> <capability>`.
    For foreground input, send
@@ -111,10 +112,35 @@ The complete operation requests are:
 | `SCROLL <sequence> <target> <revision> <x> <y> <axis> <value>` | Axis 0=vertical, 1=horizontal; nonzero value in [-1000,1000]. |
 | `DRAG <sequence> <target> <revision> <x1> <y1> <x2> <y2> <duration_ms>` | Left button; duration 50-2000 ms; the grant must cover the duration plus 50 ms. |
 
-Coordinates are finite logical surface-local values, with `0 <= x < width`
-and `0 <= y < height`. Subsurface hits refuse. Sequence numbers increase
+Coordinates are finite logical values relative to the window's top-left
+corner. A point outside `0 <= x < width` and `0 <= y < height`, the end of a
+drag included, refuses with `point_outside_window`, except a `CLICK` or
+`SCROLL` point on one of the window's popups; see
+[Pointer targets](#pointer-targets). Sequence numbers increase
 strictly across the connection, including fresh target selections. Repeated
 or lower sequences return `replay`; no operation is replayed automatically.
+
+### Pointer targets
+
+A background pointer action goes to the window's topmost mapped `xdg_popup`
+whose input region holds its point, else to the window's surface or the
+subsurface of it that takes input there, in that order, as with Hyprland's own
+pointer. The plugin sends the point in that surface's coordinates. Popups are
+not in the window's surface tree, so testing that tree alone would press the
+widget under an open menu. A popup may extend past the window, and a `CLICK` or `SCROLL` there is
+not outside it. Driver sends such a point only when `HELLO` reports
+`popup_input`, and only on `TARGET` and `PRIMARY_TARGET` bindings. A `CLICK`
+or `SCROLL` on a popup that the human's popup grab holds refuses with
+`primary_grab`: that menu is the human's.
+
+A `DRAG` starts only on the window's own surface. It refuses with
+`popup_target` on a popup and with `subsurface_target` on a subsurface. Its
+motion stays on that surface while it runs, popups drawn over it included, and
+it ends when the point crosses a subsurface. `FOREGROUND_TARGET` focuses the
+window's own surface for every pointer action, so it refuses a point on a
+popup or subsurface with `primary_target_busy` and detail
+`foreground_pointer_target` before activation. X windows have no
+`xdg_popup`; their menus are X windows, which XWayland hit-tests itself.
 
 The plugin repeats target, geometry, desktop, keymap, and conflict checks on
 the compositor thread at
@@ -126,7 +152,8 @@ fresh authority returns `action_not_admitted`. Malformed or refused requests
 never imply application rollback.
 
 Background pointer focus has a separate lifetime. After a successful background pointer operation,
-the lane keeps passive pointer focus on that exact live surface. This internal
+the lane keeps passive pointer focus on the exact live surface it entered: the
+window's own, one of its subsurfaces, or one of its popups. This internal
 state is separate from the visible Driver overlay, whose idle fade and
 session-end removal remain unchanged. Fresh
 `TARGET` admission on the same surface and unchanged geometry preserves this
@@ -157,7 +184,7 @@ them. This permits opposite-order reuse when both new connections reserve
 their lanes before either selects a target, without retrying any input.
 
 Target replacement, unmap, destruction, and geometry change clear passive
-focus. Desktop, keymap, and configuration transitions revoke authority and
+focus, and so does unmapping the popup or subsurface that holds it. Desktop, keymap, and configuration transitions revoke authority and
 release held input, but keep passive focus on an unchanged live target, as
 after normal completion.
 An observed physical keymap transition cancels existing authority, but fresh
@@ -195,6 +222,7 @@ include `lane_busy`, `lane_not_claimed`, `stale_target`, `stale_geometry`,
 `session_unavailable`, `unsupported_layout`, `primary_target_busy`,
 `primary_keyboard_busy`, `agent_target_busy`, `lease_expired`,
 `action_not_admitted`, `lease_busy`, `client_not_bound`, `replay`,
+`point_outside_window`, `popup_target`, `subsurface_target`, `primary_grab`,
 `unsupported`, and `invalid_request`.
 
 ### Keys in the person's app
@@ -240,7 +268,9 @@ Admission and every dispatch refuse with these codes:
 - `agent_target_busy`: another lane targets that client.
 - `primary_grab`, `primary_dnd`, `primary_constraint`: a seat grab, layout
   drag, drag-and-drop, or pointer constraint is active.
-- `subsurface_target`: the point lands on a subsurface.
+- `subsurface_target`: a drag starts on a subsurface, or no surface of the
+  window takes input at the point. Clicks and scrolls reach popups and
+  subsurfaces as described in [Pointer targets](#pointer-targets).
 - `unsupported_layout`: a key chord means something different under the human's
   keymap than on a neutral US keyboard. Keys are sent with neutral modifiers, so
   the human's Num Lock does not refuse.
@@ -264,8 +294,8 @@ a drop to the human's next button release. The plugin withholds the popup grab,
 leaving the popup mapped, and cancels the drag source when the requesting
 client is under an agent lease or drag, or received background dispatch in the
 last two seconds, and the human's focus is not on that client. GTK still maps
-such a menu and handles agent keys in it. Agent pointer actions address only
-the bound top-level surface, so they do not reach the popup.
+such a menu and handles agent keys in it, and agent clicks and scrolls reach
+it as described in [Pointer targets](#pointer-targets).
 `hyprctl -j cua:status` reports `input.primary_background`,
 `input.refused_popup_grabs`, and `input.refused_drag_starts`.
 

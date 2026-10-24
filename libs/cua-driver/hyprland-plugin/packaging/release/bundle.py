@@ -36,6 +36,7 @@ src/keymap_equivalence.hpp
 src/owned_socket_path.hpp
 src/passive_pointer_target.hpp
 src/plugin.cpp
+src/pointer_hit.hpp
 src/primary_trace.cpp
 src/primary_trace.hpp
 src/protocol.cpp
@@ -64,6 +65,7 @@ tests/owned_socket_path_test.cpp
 tests/passive_pointer_target_test.cpp
 tests/plugin_api_test.cpp
 tests/plugin_input_lifetime_test.cpp
+tests/pointer_hit_test.cpp
 tests/protocol_test.cpp
 tests/reaction_window_test.cpp
 tests/seat_lifetime_test.cpp

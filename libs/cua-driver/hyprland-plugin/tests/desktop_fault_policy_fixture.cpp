@@ -16,7 +16,11 @@
 using namespace cua::hyprland;
 using Clock = InputGrant::Clock;
 struct Window { bool m_isX11 = false; };
-struct Surface { int client() const { return 1; } bool good() const { return true; } };
+struct Surface {
+    bool m_mapped = true;
+    int client() const { return 1; }
+    bool good() const { return true; }
+};
 using Target = PassivePointerTarget<std::weak_ptr<Window>, std::weak_ptr<Surface>>;
 constexpr int WL_POINTER_BUTTON_STATE_RELEASED = 0, WL_KEYBOARD_KEY_STATE_RELEASED = 0;
 // A primary-seat pointer or keyboard the background primary route borrows.
@@ -49,7 +53,7 @@ struct Client {
 struct Pointer {
     bool dead = false, resource_live = true;
     Pointer* wl = this;
-    std::shared_ptr<Surface> focus;
+    std::weak_ptr<Surface> focus;
     bool resource() const { return resource_live; }
 };
 struct Drag { Client* client; DragGeometry geometry{1}; };
@@ -209,6 +213,15 @@ int main() {
         if (session_fault) l.session = false; else l.layout = false;
         l.primary_busy = true;
         l.guard_targets(); l.check_inert();
+    }
+    // Hover may rest on one of the target's popups and goes when it unmaps.
+    {
+        Lane l; l.desktop_transition();
+        const auto popup = std::make_shared<Surface>();
+        l.pointers.front()->focus = popup;
+        l.guard_targets(); l.check_inert();
+        popup->m_mapped = false;
+        l.guard_targets(); l.check_inert(false);
     }
     // Active safety failures and explicit human takeover continue to leave.
     for (int bad = 0; bad < 6; ++bad) {

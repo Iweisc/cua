@@ -4207,10 +4207,10 @@ enum ElementPress {
 /// reached through its AT-SPI `click` action (the same rule the foreground
 /// route applies).
 ///
-/// The plugin pointer reaches only the window's main surface, never its popup
-/// menus, so menus keep their action there. It reaches a covered window and
-/// one on a hidden workspace, but it presses whatever is at the point, so an
-/// entry scrolled out of its pane keeps its action as well.
+/// The plugin pointer reaches a covered window and one on a hidden workspace,
+/// but it presses whatever is at the point, so an entry scrolled out of its
+/// pane keeps its action. Menus keep their action there too: a menu needs no
+/// focus, and an item of a closed menu has no point to press.
 fn element_press(pointer: Option<ElementPointer>, role: &str) -> ElementPress {
     let focus_taking = element_needs_real_click(role);
     match pointer {
@@ -6612,8 +6612,10 @@ impl Tool for ClickTool {
                 (the result says `hit: <role> \"<name>\" action=...`; a file / list item is \
                 selected through its container: `selected: ...`), else presses the real \
                 virtual pointer there. With the Hyprland input plugin, a pixel click is \
-                always a real pointer click. A click that opens a popup menu names it (`popup: \
-                {window_id, bounds}`): pass that window_id to get_window_state to index its \
+                always a real pointer click on what the window draws there, its open menu \
+                included, even where that menu extends past the window. A click that opens \
+                a popup menu names it (`popup: {window_id, bounds}`): pass that window_id to \
+                get_window_state to index its \
                 items. The token is stale once the next get_window_state of the same \
                 window replaces its snapshot — \
                 re-snapshot every turn before clicking.\n\n\

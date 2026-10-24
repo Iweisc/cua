@@ -13,6 +13,7 @@
 #include "cursor_layer.hpp"
 #include "target_identity.hpp"
 #include "reaction_window.hpp"
+#include "pointer_hit.hpp"
 
 #include <src/Compositor.hpp>
 #include <src/devices/IKeyboard.hpp>
@@ -22,6 +23,7 @@
 #include <src/protocols/core/Compositor.hpp>
 #include <src/state/MonitorState.hpp>
 #include <src/desktop/state/FocusState.hpp>
+#include <src/desktop/view/Popup.hpp>
 #include <src/managers/input/InputManager.hpp>
 #include <src/managers/fullscreen/FullscreenController.hpp>
 #include <src/managers/EventManager.hpp>
@@ -905,6 +907,33 @@ struct InputExperiment::Impl {
     bool point(Client& c, double x, double y) const {
         return std::isfinite(x) && std::isfinite(y) && x >= 0 && y >= 0 && x < c.geometry[2] && y < c.geometry[3];
     }
+    using PointerSurfaceAt = PointerSurface<SP<CWLSurfaceResource>, Vector2D>;
+    // Hyprland places popups from the window's current position, which is
+    // also the corner of c.geometry, so window-local x, y map onto them.
+    PointerSurfaceAt pointer_hit_at(const Client& c, double x, double y) const {
+        using Hit = std::pair<SP<CWLSurfaceResource>, Vector2D>;
+        const auto root = c.surface.lock();
+        const auto window = c.window.lock();
+        if (!root || !window) return {};
+        Hit popup;
+        const Vector2D global{c.geometry[0] + x, c.geometry[1] + y};
+        if (!window->m_isX11 && window->m_popupHead)
+            if (const auto found = window->m_popupHead->at(global, true); found && found->wlSurface() && found->wlSurface()->resource())
+                popup = {found->wlSurface()->resource(), global - found->coordsGlobal()};
+        const Vector2D local{x + c.geometry[0] - c.geometry[4], y + c.geometry[1] - c.geometry[5]};
+        return classify_pointer_hit(root, popup, root->at(local, true));
+    }
+    // Where a pointer action at x, y lands, or nothing after sending its refusal.
+    std::optional<PointerSurfaceAt> pointer_target_at(Client& c, double x, double y, bool drag) {
+        const auto target = pointer_hit_at(c, x, y);
+        const auto grab = g_pSeatManager->m_seatGrab;
+        const bool human_grab = target.hit == PointerHit::popup && grab && grab->accepts(target.surface);
+        if (const auto refused = pointer_refusal(point(c, x, y), target.hit, drag, human_grab); !refused.empty()) {
+            send(c, refusal(refused));
+            return std::nullopt;
+        }
+        return target;
+    }
     bool unique_primary_seat(wl_client* client) const {
         struct Scan {
             const Impl* self;
@@ -967,9 +996,9 @@ struct InputExperiment::Impl {
         const auto root = borrowed_surface.lock();
         return root && root == c.surface.lock() && root->good() && primary_background_guard(c).failure().empty();
     }
-    void borrowed_pointer_enter(const SP<CWLSurfaceResource>& root, const Vector2D& local) {
+    void borrowed_pointer_enter(const SP<CWLSurfaceResource>& surface, const Vector2D& local) {
         for (const auto& weak : borrowed_pointers)
-            if (const auto p = weak.lock(); p && p->good()) { p->sendEnter(root, local); p->sendMotion(event_ms(), local); p->sendFrame(); }
+            if (const auto p = weak.lock(); p && p->good()) { p->sendEnter(surface, local); p->sendMotion(event_ms(), local); p->sendFrame(); }
     }
     void borrowed_button(std::uint32_t code, bool pressed) {
         if (pressed) held_button = code;
@@ -1138,7 +1167,10 @@ struct InputExperiment::Impl {
         if (needs_keyboard && !physical_keyboard_state) throw ForegroundFailure{ForegroundFailureReason::keyboard_state};
         if (needs_pointer && !g_pSeatManager->m_mouse) throw ForegroundFailure{ForegroundFailureReason::physical_pointer};
         const Vector2D local{x + c.geometry[0] - c.geometry[4], y + c.geometry[1] - c.geometry[5]};
-        if (needs_pointer && (!point(c, x, y) || root->at(local, true).first != root)) throw ForegroundFailure{ForegroundFailureReason::pointer_target};
+        // This route focuses the window's own surface, so it refuses a point
+        // where a popup or subsurface is drawn instead of pressing under it.
+        if (needs_pointer && (!point(c, x, y) || pointer_hit_at(c, x, y).hit != PointerHit::root))
+            throw ForegroundFailure{ForegroundFailureReason::pointer_target};
         const auto seat = g_pSeatManager->seatResourceForClient(root->client());
         if (!seat || !seat->good()) throw ForegroundFailure{ForegroundFailureReason::seat_resource};
         foreground_pointers.clear(); foreground_keyboards.clear();
@@ -1217,28 +1249,26 @@ struct InputExperiment::Impl {
                 xkb_state_serialize_layout(physical_keyboard_state, XKB_STATE_LAYOUT_EFFECTIVE));
         }
     }
-    bool pointer_enter(Client& c, double x, double y) {
-        const auto root = c.surface.lock(); if (!root) return false;
-        // Initial experiment refuses subsurface targets instead of misrouting.
-        const Vector2D local{x + c.geometry[0] - c.geometry[4], y + c.geometry[1] - c.geometry[5]};
-        const auto hit = root->at(local, true);
-        if (hit.first != root) return false;
+    // `surface` is the window's own surface, one of its subsurfaces, or one of
+    // its popups, and `local` the point in its coordinates.
+    bool pointer_enter(Client& c, const SP<CWLSurfaceResource>& surface, const Vector2D& local) {
+        const auto root = c.surface.lock(); if (!root || !surface) return false;
         // With xwayland:force_zero_scaling, X surfaces use X pixels. Hyprland
         // scales the human's pointer the same way.
         const auto window = c.window.lock();
         const auto sent = c.xwayland && window ? local * window->m_X11SurfaceScaledBy : local;
         unsigned count = 0;
         for (auto& p : pointers) {
-            if (p->dead || !p->wl->resource() || p->wl->client() != root->client()) continue;
+            if (p->dead || !p->wl->resource() || p->wl->client() != surface->client()) continue;
             // XWayland places the pointer on enter without a raw event. A motion
             // event becomes XI2 raw motion, which every raw listener receives
             // (a relative-mouse game the human is playing turns it into a jump).
             // A drag still moves: XWayland releases held buttons on enter.
             const bool reenter = c.xwayland && !held_button;
-            if (p->focus != root || reenter) {
+            if (p->focus != surface || reenter) {
                 if (const auto old = p->focus.lock(); old && old->good()) p->wl->sendLeave(serial(), old->getResource().get());
-                p->focus = root;
-                p->wl->sendEnter(serial(), root->getResource().get(), wl_fixed_from_double(sent.x), wl_fixed_from_double(sent.y));
+                p->focus = surface;
+                p->wl->sendEnter(serial(), surface->getResource().get(), wl_fixed_from_double(sent.x), wl_fixed_from_double(sent.y));
             }
             if (!reenter) p->wl->sendMotion(event_ms(), wl_fixed_from_double(sent.x), wl_fixed_from_double(sent.y));
             if (p->wl->version() >= 5) p->wl->sendFrame();
@@ -1253,6 +1283,14 @@ struct InputExperiment::Impl {
             pointer_destroy = window->m_events.destroy.listen([this] { revoke("stale_target"); });
         }
         return count > 0;
+    }
+    // A drag's motion goes to the window's own surface, where it started.
+    // Popups are not in that surface's tree, so they never take it over. A
+    // subsurface still ends the drag instead of taking motion meant for the window.
+    bool drag_motion(Client& c, double x, double y) {
+        const auto root = c.surface.lock(); if (!root) return false;
+        const Vector2D local{x + c.geometry[0] - c.geometry[4], y + c.geometry[1] - c.geometry[5]};
+        return root->at(local, true).first == root && pointer_enter(c, root, local);
     }
     void button(std::uint32_t value, bool pressed) {
         for (auto& p : pointers) {
@@ -1300,7 +1338,7 @@ struct InputExperiment::Impl {
             if (f.size() != 1 || c.hello) { send(c, refusal("invalid_request")); return; }
             c.hello = true;
             if (kProduction)
-                send(c, std::format(R"({{"ok":true,"protocol":3,"epoch":"{}","foreground_target":true,"primary_background":true,"xwayland_target":true,"stable_id":true}})", epoch));
+                send(c, std::format(R"({{"ok":true,"protocol":3,"epoch":"{}","foreground_target":true,"primary_background":true,"xwayland_target":true,"stable_id":true,"popup_input":true}})", epoch));
             else
                 send(c, std::format(R"({{"ok":true,"protocol":0,"epoch":"{}","challenge":"{}"}})", epoch, c.challenge));
             return;
@@ -1506,18 +1544,19 @@ struct InputExperiment::Impl {
             for (int i = 3; i >= 0; --i) if ((mods & (1u << i)) && keys[i] != code) key(keys[i], false);
         } else {
             const auto x = real(f[4]), y = real(f[5]);
-            if (!point(c, x, y)) { send(c, refusal("invalid_request")); return; }
+            const auto target = pointer_target_at(c, x, y, command == "DRAG");
+            if (!target) return;
             if (command == "CLICK") {
                 const auto btn = number(f[6]), clicks = number(f[7]);
                 if (btn < 272 || btn > 274 || clicks < 1 || clicks > 2) { send(c, refusal("invalid_request")); return; }
                 if (!consume_grant(c, cap)) return;
-                if (!pointer_enter(c, x, y)) { send(c, refusal("client_not_bound")); return; }
+                if (!pointer_enter(c, target->surface, target->local)) { send(c, refusal("client_not_bound")); return; }
                 for (unsigned i = 0; i < clicks; ++i) { button(btn, true); button(btn, false); }
             } else if (command == "SCROLL") {
                 const auto axis = number(f[6]); const auto value = real(f[7]);
                 if (axis > 1 || value == 0 || std::abs(value) > 1000) { send(c, refusal("invalid_request")); return; }
                 if (!consume_grant(c, cap)) return;
-                if (!pointer_enter(c, x, y)) { send(c, refusal("client_not_bound")); return; }
+                if (!pointer_enter(c, target->surface, target->local)) { send(c, refusal("client_not_bound")); return; }
                 for (auto& p : pointers) {
                     if (p->dead || !p->wl->resource() || !p->focus) continue;
                     const auto wheel = [&](double amount) {
@@ -1532,10 +1571,11 @@ struct InputExperiment::Impl {
                 }
             } else {
                 const auto x2 = real(f[6]), y2 = real(f[7]); const auto duration = number(f[8]);
-                if (!point(c, x2, y2) || duration < 50 || duration > 2000) { send(c, refusal("invalid_request")); return; }
+                if (!point(c, x2, y2)) { send(c, refusal("point_outside_window")); return; }
+                if (duration < 50 || duration > 2000) { send(c, refusal("invalid_request")); return; }
                 if (Clock::now() + std::chrono::milliseconds(duration + 50) >= expires) { send(c, refusal("lease_expired")); return; }
                 if (!consume_grant(c, cap)) return;
-                if (!pointer_enter(c, x, y)) { send(c, refusal("client_not_bound")); return; }
+                if (!pointer_enter(c, target->surface, target->local)) { send(c, refusal("client_not_bound")); return; }
                 if (trace) trace->mark("agent_drag_start", lane + 1);
                 button(272, true);
                 drag.emplace(Drag{&c, x, y, x2, y2, Clock::now(), static_cast<unsigned>(duration), DragGeometry{c.revision}});
@@ -1559,7 +1599,7 @@ struct InputExperiment::Impl {
             }
         } else if (command != "ACTIVATE") {
             x = real(f[4]); y = real(f[5]);
-            if (!point(c, x, y)) { send(c, refusal("invalid_request")); return; }
+            if (!point(c, x, y)) { send(c, refusal("point_outside_window")); return; }
             if (command == "CLICK") {
                 code = number(f[6]); clicks = number(f[7]);
                 if (code < 272 || code > 274 || clicks < 1 || clicks > 2) { send(c, refusal("invalid_request")); return; }
@@ -1568,7 +1608,8 @@ struct InputExperiment::Impl {
                 if (axis > 1 || value == 0 || std::abs(value) > 1000) { send(c, refusal("invalid_request")); return; }
             } else {
                 x2 = real(f[6]); y2 = real(f[7]); duration = number(f[8]);
-                if (!point(c, x2, y2) || duration < 50 || duration > 2000) { send(c, refusal("invalid_request")); return; }
+                if (!point(c, x2, y2)) { send(c, refusal("point_outside_window")); return; }
+                if (duration < 50 || duration > 2000) { send(c, refusal("invalid_request")); return; }
                 if (Clock::now() + std::chrono::milliseconds(duration + 50) >= expires) { send(c, refusal("lease_expired")); return; }
             }
         }
@@ -1620,12 +1661,14 @@ struct InputExperiment::Impl {
         }
         const auto root = c.surface.lock();
         double x = 0, y = 0;
+        std::optional<PointerSurfaceAt> target;
         if (command != "KEY") {
             x = real(f[4]); y = real(f[5]);
-            if (!point(c, x, y)) { send(c, refusal("invalid_request")); return; }
+            target = pointer_target_at(c, x, y, command == "DRAG");
+            if (!target) return;
+            // A point where no surface of the window takes input.
+            if (!target->surface) { send(c, refusal("subsurface_target")); return; }
         }
-        const Vector2D local{x + c.geometry[0] - c.geometry[4], y + c.geometry[1] - c.geometry[5]};
-        if (command != "KEY" && root->at(local, true).first != root) { send(c, refusal("subsurface_target")); return; }
         if (command == "KEY") {
             const auto code = number(f[4]); const auto mods = number(f[5]);
             if (code == 0 || code > 247 || mods > 15 || code == 58 || code == 69 || code == 70) { send(c, refusal("unsupported")); return; }
@@ -1653,7 +1696,7 @@ struct InputExperiment::Impl {
             if (!consume_grant(c, cap)) return;
             borrow_primary(c, true, false);
             if (borrowed_pointers.empty()) { return_primary(); send(c, refusal("client_not_bound")); return; }
-            borrowed_pointer_enter(root, local);
+            borrowed_pointer_enter(target->surface, target->local);
             for (unsigned i = 0; i < clicks; ++i) { borrowed_button(static_cast<std::uint32_t>(btn), true); borrowed_button(static_cast<std::uint32_t>(btn), false); }
         } else if (command == "SCROLL") {
             const auto axis = number(f[6]); const auto value = real(f[7]);
@@ -1661,7 +1704,7 @@ struct InputExperiment::Impl {
             if (!consume_grant(c, cap)) return;
             borrow_primary(c, true, false);
             if (borrowed_pointers.empty()) { return_primary(); send(c, refusal("client_not_bound")); return; }
-            borrowed_pointer_enter(root, local);
+            borrowed_pointer_enter(target->surface, target->local);
             for (const auto& weak : borrowed_pointers)
                 if (const auto p = weak.lock(); p && p->good()) {
                     p->sendAxisSource(WL_POINTER_AXIS_SOURCE_WHEEL);
@@ -1669,12 +1712,13 @@ struct InputExperiment::Impl {
                 }
         } else {
             const auto x2 = real(f[6]), y2 = real(f[7]); const auto duration = number(f[8]);
-            if (!point(c, x2, y2) || duration < 50 || duration > 2000) { send(c, refusal("invalid_request")); return; }
+            if (!point(c, x2, y2)) { send(c, refusal("point_outside_window")); return; }
+            if (duration < 50 || duration > 2000) { send(c, refusal("invalid_request")); return; }
             if (Clock::now() + std::chrono::milliseconds(duration + 50) >= expires) { send(c, refusal("lease_expired")); return; }
             if (!consume_grant(c, cap)) return;
             borrow_primary(c, true, false);
             if (borrowed_pointers.empty()) { return_primary(); send(c, refusal("client_not_bound")); return; }
-            borrowed_pointer_enter(root, local);
+            borrowed_pointer_enter(target->surface, target->local);
             borrowed_button(272, true);
             drag.emplace(Drag{&c, x, y, x2, y2, Clock::now(), static_cast<unsigned>(duration), DragGeometry{c.revision}});
             send(c, R"({"ok":true,"phase":"started"})"); return;
@@ -1718,8 +1762,12 @@ struct InputExperiment::Impl {
             const auto surface = pointer_target.surface();
             const auto window = pointer_target.window();
             const auto geometry = target_geometry(window, surface, window && window->m_isX11);
+            // Hover rests where the last action entered: the window's own
+            // surface, one of its subsurfaces, or one of its popups. A popup
+            // that closes takes the hover with it.
             const bool bound = std::ranges::any_of(pointers, [&](const auto& p) {
-                return !p->dead && p->wl->resource() && surface && p->focus == surface;
+                const auto focus = p->focus.lock();
+                return !p->dead && p->wl->resource() && surface && focus && focus->m_mapped;
             });
             // Availability controls admission, not passive pointer presence.
             // Retention never excuses a changed target, binding, or conflict.
@@ -1747,7 +1795,7 @@ struct InputExperiment::Impl {
                     borrowed_button(272, false); drag.reset(); return_primary(); ++dispatches;
                     note_dispatch(*d.client); complete_action(); send(*d.client, kPrimaryBackgroundDelivered);
                 }
-            } else if (!pointer_enter(*d.client, d.x1 + (d.x2 - d.x1) * progress, d.y1 + (d.y2 - d.y1) * progress)) revoke("client_not_bound");
+            } else if (!drag_motion(*d.client, d.x1 + (d.x2 - d.x1) * progress, d.y1 + (d.y2 - d.y1) * progress)) revoke("client_not_bound");
             else if (progress >= 1) {
                 button(272, false); drag.reset(); ++dispatches;
                 if (trace) trace->mark("agent_drag_end", lane + 1);

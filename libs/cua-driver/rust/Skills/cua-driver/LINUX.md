@@ -322,9 +322,11 @@ when it is first used.
 The plugin separately binds the exact live native surface and checks geometry,
 desktop availability, and other-lane conflicts. A click, scroll, or drag at a
 point outside that window, including the end of a drag, is refused with
-`point_outside_window` before any input is sent. The agent seat has its own
-pointer, so an agent can click, scroll, and drag in a native app you are using,
-including another window of it, without taking your focus. Keys are different:
+`point_outside_window` before any input is sent. A click or scroll on the part
+of the window's own open menu that extends past the window is not outside it.
+The agent seat has its own pointer, so an agent can click, scroll, and drag in
+a native app you are using, including another window of it, without taking your
+focus. Keys are different:
 while your keyboard focus is in the target's app, `type_text`, `press_key`, and
 `hotkey` refuse with reason `primary_keyboard_busy`, and a running `type_text`
 stops at the next key after you click into that app, reporting the keys it had
@@ -357,8 +359,13 @@ your focus. Hyprland draws floating windows over tiled ones, so a dialog on
 your workspace can still cover part of a tiled window. Close such windows in
 the same task. With `misc:focus_on_activate` enabled, an app that asks to be
 activated in reaction to agent input can still take your focus. It is off by
-default. Agent clicks reach only the window's main surface, not its
-menus, so use keys inside a menu. A click at `x`/`y` is
+default. An agent click or scroll at `x`/`y` goes to what the window draws
+there, as your pointer would: its open menu, popover, or dropdown list when one
+covers the point. Toolkits ignore a click on the window behind their open menu,
+so click the item itself. A drag must start on the window, not on its menu or
+an embedded surface, and refuses with reason `popup_target` or
+`subsurface_target`. A menu you opened yourself stays yours: a click on it
+refuses with reason `primary_grab`. A click at `x`/`y` is
 always a pointer click, as on macOS, so it places the caret and focuses the
 entry under it. It never fires the accessibility action at that point. A click
 by `element_token` fires that element's AT-SPI action, except on a text field,

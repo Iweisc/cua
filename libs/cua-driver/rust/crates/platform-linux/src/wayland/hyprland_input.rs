@@ -376,6 +376,9 @@ struct Client {
     xwayland_supported: bool,
     // TARGET takes the window's stable id after the capability.
     stable_id_supported: bool,
+    // Background clicks and scrolls reach the target's popups, which may
+    // extend past the window, so the plugin judges points outside it.
+    popup_input_supported: bool,
     // The target is an X window; set per call from Hyprland's client list.
     xwayland: bool,
     // The stable id the window at `address` must carry; set per call.
@@ -538,6 +541,7 @@ impl Client {
             primary_background_supported: false,
             xwayland_supported: false,
             stable_id_supported: false,
+            popup_input_supported: false,
             xwayland: false,
             stable_id: None,
             delivery_route: None,
@@ -584,6 +588,8 @@ impl Client {
             self.protocol == InputProtocol::Production && hello["xwayland_target"] == true;
         self.stable_id_supported =
             self.protocol == InputProtocol::Production && hello["stable_id"] == true;
+        self.popup_input_supported =
+            self.protocol == InputProtocol::Production && hello["popup_input"] == true;
         if self.protocol == InputProtocol::Experiment {
             self.challenge = hex_field(&hello, "challenge")?;
         } else {
@@ -733,7 +739,18 @@ impl Client {
             );
             // Before the X side is touched: an outside point would otherwise
             // read as a covered X window.
-            if let Some((x, y)) = action.outside_point(width, height) {
+            let outside = action.outside_point(width, height);
+            // The plugin sees the target's popups, which may extend past the
+            // window, and refuses with the same code when none is there.
+            let plugin_judges = |(x, y): (f64, f64)| {
+                self.popup_input_supported
+                    && route == DeliveryRoute::Background
+                    && binding != TargetBinding::Xwayland
+                    && action.may_land_on_popup()
+                    && x.is_finite()
+                    && y.is_finite()
+            };
+            if let Some((x, y)) = outside.filter(|&point| !plugin_judges(point)) {
                 let detail = format!(
                     "window-local point ({x}, {y}) lies outside the window's {width}x{height} \
                      logical size; no input was sent"
@@ -782,6 +799,12 @@ impl Client {
             {
                 std::thread::sleep(STALE_GEOMETRY_BACKOFF * (attempt as u32 + 1));
                 continue;
+            }
+            if let Some((x, y)) = outside.filter(|_| reply["code"] == POINT_OUTSIDE_WINDOW) {
+                reply["detail"] = json!(format!(
+                    "window-local point ({x}, {y}) lies outside the window's {width}x{height} \
+                     logical size and its open popups; no input was sent"
+                ));
             }
             if reply["ok"] == false && self.protocol == InputProtocol::Experiment {
                 // Never report a pending operator grant as successful dispatch.
@@ -950,6 +973,12 @@ impl Action {
         points.into_iter().find(|&(x, y)| {
             !(x.is_finite() && y.is_finite() && x >= 0.0 && y >= 0.0 && x < width && y < height)
         })
+    }
+
+    /// A click or scroll goes to the target's popup at its point. A drag stays
+    /// on the window's own surface.
+    fn may_land_on_popup(&self) -> bool {
+        matches!(self, Self::Click { .. } | Self::Scroll { .. })
     }
 
     /// Callers check `outside_point` against the same geometry first.
@@ -2479,7 +2508,8 @@ mod tests {
             assert_eq!(read_packet(&peer), "HELLO");
             peer.send(
                 json!({"ok":true,"protocol":3,"epoch":TOKEN,"foreground_target":true,
-                    "primary_background":true,"xwayland_target":true,"stable_id":true})
+                    "primary_background":true,"xwayland_target":true,"stable_id":true,
+                    "popup_input":true})
                 .to_string()
                 .as_bytes(),
             )
@@ -2492,6 +2522,7 @@ mod tests {
         assert!(client.primary_background_supported);
         assert!(client.xwayland_supported);
         assert!(client.stable_id_supported);
+        assert!(client.popup_input_supported);
         server.join().unwrap();
     }
 
@@ -3153,6 +3184,117 @@ mod tests {
     }
 
     #[test]
+    fn a_popup_capable_plugin_judges_outside_background_clicks_and_scrolls() {
+        let click = |x, y| Action::Click {
+            x,
+            y,
+            button: 1,
+            count: 1,
+        };
+        let refused =
+            json!({"ok":false,"code":"point_outside_window","detail":"point_outside_window"});
+        let delivered = json!({"ok":true,"effect":"unverifiable","route":"synthetic_events"});
+        // A menu past the window's right edge takes the click. No popup is
+        // above the window, so the scroll refuses.
+        for (action, capability, packet, plugin_reply) in [
+            (
+                click(150.0, 10.0),
+                1,
+                format!("CLICK 1 {TOKEN} 1 150 10 272 1"),
+                delivered,
+            ),
+            (
+                Action::Scroll {
+                    point: Some((10.0, -20.0)),
+                    direction: "down".into(),
+                    amount: 1,
+                },
+                4,
+                format!("SCROLL 1 {TOKEN} 1 10 -20 0 10"),
+                refused,
+            ),
+        ] {
+            let (mut client, peer) = production_test_client();
+            client.popup_input_supported = true;
+            let expected = plugin_reply.clone();
+            let server = std::thread::spawn(move || {
+                assert_eq!(read_packet(&peer), format!("TARGET 1 1 {capability}"));
+                peer.send(
+                    json!({"ok":true,"target":TOKEN,"revision":1,"width":100,"height":80})
+                        .to_string()
+                        .as_bytes(),
+                )
+                .unwrap();
+                assert_eq!(read_packet(&peer), packet);
+                peer.send(plugin_reply.to_string().as_bytes()).unwrap();
+            });
+            let reply = client
+                .execute_routed_with_attest(
+                    action,
+                    None,
+                    DeliveryRoute::Background,
+                    record_test_attestation,
+                )
+                .unwrap();
+            if expected["ok"] == true {
+                assert_eq!(reply, expected);
+            } else {
+                assert_eq!(reply["code"], "point_outside_window");
+                assert_eq!(
+                    reply["detail"],
+                    "window-local point (10, -20) lies outside the window's 100x80 logical size \
+                     and its open popups; no input was sent"
+                );
+            }
+            drop(client);
+            server.join().unwrap();
+        }
+
+        // A nonfinite point, a drag, and the foreground route, which never
+        // presses a popup, still refuse here.
+        for (action, route, target, target_reply) in [
+            (
+                click(f64::NAN, 1.0),
+                DeliveryRoute::Background,
+                "TARGET 1 1 1",
+                json!({"ok":true,"target":TOKEN,"revision":1,"width":100,"height":80}),
+            ),
+            (
+                Action::Drag {
+                    from: (1.0, 1.0),
+                    to: (150.0, 2.0),
+                    duration_ms: 100,
+                },
+                DeliveryRoute::Background,
+                "TARGET 1 1 8",
+                json!({"ok":true,"target":TOKEN,"revision":1,"width":100,"height":80}),
+            ),
+            (
+                click(150.0, 10.0),
+                DeliveryRoute::Foreground,
+                "FOREGROUND_TARGET 1 1 1",
+                json!({"ok":true,"target":TOKEN,"revision":1,"width":100,"height":80,
+                    "route":"primary_foreground"}),
+            ),
+        ] {
+            let (mut client, peer) = production_test_client();
+            client.popup_input_supported = true;
+            let server = std::thread::spawn(move || {
+                assert_eq!(read_packet(&peer), target);
+                peer.send(target_reply.to_string().as_bytes()).unwrap();
+                assert_peer_receives_nothing_more(&peer);
+            });
+            let reply = client
+                .execute_routed_with_attest(action, None, route, record_test_attestation)
+                .unwrap();
+            assert_eq!(reply["code"], "point_outside_window");
+            assert!(!reply["detail"].as_str().unwrap().contains("popups"));
+            drop(client);
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
     fn unsupported_actions_refuse() {
         assert!(Action::Key {
             key: "🙂".into(),
@@ -3232,6 +3374,7 @@ mod tests {
                 primary_background_supported: false,
                 xwayland_supported: false,
                 stable_id_supported: false,
+                popup_input_supported: false,
                 xwayland: false,
                 stable_id: None,
                 delivery_route: None,
