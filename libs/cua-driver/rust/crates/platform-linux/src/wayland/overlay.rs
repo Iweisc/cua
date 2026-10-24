@@ -586,11 +586,11 @@ fn pinned_windows(cores: &CursorMap<RenderStateCore>, stack_with_windows: bool) 
 }
 
 /// The Hyprland plugin closes a pinned layer once its window is gone, since
-/// Hyprland hands that address to the next window it opens, and once its
-/// window moves or shrinks, since the cursor was placed from the old box. The
-/// cursors pinned there paint nothing and get no new layer until they are
-/// pinned again. Hyprland also closes a removed monitor's layers, so those
-/// cursors wait for their next pin too.
+/// Hyprland hands that address to the next window it opens, when it opens
+/// after that, and once its window moves or shrinks, since the cursor was
+/// placed from the old box. The cursors pinned there paint nothing and get no
+/// new layer until they are pinned again. Hyprland also closes a removed
+/// monitor's layers, so those cursors wait for their next pin too.
 fn release_pinned_window(
     cores: &mut CursorMap<RenderStateCore>,
     wid: u64,

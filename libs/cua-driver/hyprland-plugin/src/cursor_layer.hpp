@@ -48,26 +48,30 @@ template <typename Box>
 // creates, so the address alone does not name a pinned layer's window. A
 // layer belongs to the window at its address when the layer opened, if that
 // window carries the stable id the name gives, and to no other window after
-// that one is gone. It also stops matching once the window moves or shrinks.
-// Driver opens a new layer when it pins a cursor again. References are weak,
-// so a pin never keeps either alive.
+// that one is gone. It also stops matching once the window moves or shrinks,
+// and a layer that matches no window when it opens is closed at once. Driver
+// opens a new layer when it pins a cursor again. References are weak, so a
+// pin never keeps either alive.
 template <typename LayerRef, typename WindowRef, typename Box>
 class CursorPins {
   public:
-    template <typename Layer, typename Windows, typename Address, typename StableId, typename BoxOf>
+    template <typename Layer, typename Windows, typename Address, typename StableId, typename BoxOf, typename Close>
     void open(const Layer& layer, std::string_view name, const Windows& windows, Address address,
-              StableId stable_id, BoxOf box) {
+              StableId stable_id, BoxOf box, Close close) {
         const auto pinned = pinned_cursor_window(name);
         if (!pinned) return;
         std::erase_if(pins_, [](const Pin& pin) { return pin.layer.expired(); });
-        // A layer opened after its window was gone stays unbound and is never
-        // drawn, even when another window has taken the address meanwhile.
         for (const auto& window : windows)
-            if (address(window) == pinned->address) {
-                if (target_identity_matches(pinned->stable_id, stable_id(window)))
-                    pins_.push_back({layer, window, box(window)});
+            if (address(window) == pinned->address && target_identity_matches(pinned->stable_id, stable_id(window))) {
+                pins_.push_back({layer, window, box(window)});
                 return;
             }
+        // The layer opened after its window was gone, maybe once another
+        // window took the address. Driver keeps one layer per address, so this
+        // one would keep the cursor it pins to that window from being drawn.
+        // Once it is closed, Driver's next pin opens a layer named for the
+        // window it now has there.
+        close(layer);
     }
     template <typename Layer, typename Window>
     [[nodiscard]] bool above(const Layer& layer, const Window& window) const {

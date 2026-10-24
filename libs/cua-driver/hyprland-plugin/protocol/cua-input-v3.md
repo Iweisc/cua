@@ -340,9 +340,11 @@ A pinned layer is never drawn above every window. The plain
 Hyprland reuses a freed window's address for the next window it creates, so
 the plugin binds each pinned layer to the window at its address when the
 layer maps, and draws it only after that window. A layer whose name carries a
-stable id binds only to a window with that id, so a layer that maps after its
-target closed and another window took the address stays unbound and is never
-drawn. Driver places the cursor
+stable id binds only to a window with that id. A layer that maps after its
+target closed, even once another window took the address, binds to no window,
+and the plugin sends it `zwlr_layer_surface_v1.closed` at once, so Driver's
+next pin opens a layer named for the window it then has at that address.
+Driver places the cursor
 relative to the window's top-left corner from the box it read when it acted,
 and does not see the window move, so the plugin also records that box. When
 the window is destroyed, even on a hidden workspace, or its corner moves or

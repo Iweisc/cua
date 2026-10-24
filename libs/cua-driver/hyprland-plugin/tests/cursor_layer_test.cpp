@@ -27,6 +27,7 @@ using Pins = cua::hyprland::CursorPins<std::weak_ptr<Layer>, std::weak_ptr<Windo
 const auto address = [](const std::shared_ptr<Window>& window) { return window->address; };
 const auto stable_id = [](const std::shared_ptr<Window>& window) { return window->stable_id; };
 const auto box = [](const std::shared_ptr<Window>& window) { return window->box; };
+const auto keep_open = [](const std::shared_ptr<Layer>&) { check(false); };
 }
 
 int main() {
@@ -53,8 +54,8 @@ int main() {
     const auto layer = std::make_shared<Layer>();
     const auto unpinned = std::make_shared<Layer>();
     std::vector<std::shared_ptr<Window>> windows{target, neighbour};
-    pins.open(layer, "cua-agent-cursor@55d0", windows, address, stable_id, box);
-    pins.open(unpinned, "cua-agent-cursor", windows, address, stable_id, box);
+    pins.open(layer, "cua-agent-cursor@55d0", windows, address, stable_id, box, keep_open);
+    pins.open(unpinned, "cua-agent-cursor", windows, address, stable_id, box, keep_open);
     check(pins.above(layer, target));
     check(!pins.above(layer, neighbour));
     check(!pins.above(unpinned, target) && !pins.above(unpinned, neighbour));
@@ -84,7 +85,7 @@ int main() {
 
     // Driver opens a new layer when it pins a cursor to the successor.
     expected = std::make_shared<Layer>();
-    pins.open(expected, "cua-agent-cursor@55d0", windows, address, stable_id, box);
+    pins.open(expected, "cua-agent-cursor@55d0", windows, address, stable_id, box, keep_open);
     check(pins.above(expected, successor));
     check(!pins.above(layer, successor));
 
@@ -96,22 +97,27 @@ int main() {
 
     // A shrinking window may no longer hold the spot either.
     expected = std::make_shared<Layer>();
-    pins.open(expected, "cua-agent-cursor@55d0", windows, address, stable_id, box);
+    pins.open(expected, "cua-agent-cursor@55d0", windows, address, stable_id, box, keep_open);
     pins.release_moved(successor, Box{200, 200, 600, 300}, close);
     check(closed == 3);
 
     // A layer Driver named for the closed target opens only after the next
-    // window took the address, and so belongs to no window.
-    const auto stale = std::make_shared<Layer>();
-    pins.open(stale, "cua-agent-cursor@55d0.4", windows, address, stable_id, box);
-    check(!pins.above(stale, successor));
+    // window took the address, so it belongs to no window and is closed at
+    // once. Driver then opens one named for the successor.
+    expected = std::make_shared<Layer>();
+    pins.open(expected, "cua-agent-cursor@55d0.4", windows, address, stable_id, box, close);
+    check(closed == 4 && !pins.above(expected, successor));
     const auto current = std::make_shared<Layer>();
-    pins.open(current, "cua-agent-cursor@55d0.5", windows, address, stable_id, box);
+    pins.open(current, "cua-agent-cursor@55d0.5", windows, address, stable_id, box, keep_open);
     check(pins.above(current, successor));
 
-    // A layer that opens after its window is gone belongs to no window.
-    const auto late = std::make_shared<Layer>();
-    pins.open(late, "cua-agent-cursor@99f0", windows, address, stable_id, box);
+    // A layer that opens after its window is gone belongs to no window either.
+    expected = std::make_shared<Layer>();
+    pins.open(expected, "cua-agent-cursor@99f0", windows, address, stable_id, box, close);
+    check(closed == 5);
     windows.push_back(make_window(0x99f0, placed));
-    check(!pins.above(late, windows.back()));
+    check(!pins.above(expected, windows.back()));
+    pins.release(close);
+    pins.release_moved(windows.back(), Box{1200, 600, 600, 400}, close);
+    check(closed == 5);
 }

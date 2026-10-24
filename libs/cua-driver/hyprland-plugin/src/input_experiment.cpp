@@ -2054,7 +2054,7 @@ struct InputExperiment::CursorStacking {
                 reinterpret_cast<void*>(render_window));
             opened = Event::bus()->m_events.layer.opened.listen([this](PHLLS ls) {
                 if (ls) pins.open(ls, ls->m_namespace, Desktop::windowState()->windows(), [](const PHLWINDOW& w) { return reinterpret_cast<std::uintptr_t>(w.get()); },
-                    [](const PHLWINDOW& w) { return w->m_stableID; }, goal_box);
+                    [](const PHLWINDOW& w) { return w->m_stableID; }, goal_box, close_layer);
             });
             // A window that closed on a hidden workspace never drew its cursor,
             // and releases its layer here all the same.
