@@ -236,26 +236,33 @@ pub(super) fn instance_signature() -> Option<String> {
 /// The one live instance serving `display`. A crashed Hyprland leaves its lock
 /// behind, and the next instance usually takes the same socket name.
 fn signature_for_socket(runtime: &Path, display: &Path) -> Option<String> {
-    let mut found = None;
-    for entry in std::fs::read_dir(runtime.join("hypr")).ok()?.flatten() {
-        let Ok(lock) = std::fs::read_to_string(entry.path().join("hyprland.lock")) else {
-            continue;
-        };
-        let mut lines = lock.lines();
-        let (Some(pid), Some(socket)) = (lines.next(), lines.next()) else {
-            continue;
-        };
-        let live = pid
-            .parse::<u32>()
-            .is_ok_and(|pid| pid > 0 && Path::new(&format!("/proc/{pid}")).exists());
-        if live && runtime.join(socket) == display {
-            if found.is_some() {
-                return None;
-            }
-            found = entry.file_name().into_string().ok();
-        }
+    let mut serving = live_instances(runtime)
+        .into_iter()
+        .filter(|(_, socket)| runtime.join(socket) == display);
+    let (dir, _) = serving.next()?;
+    if serving.next().is_some() {
+        return None;
     }
-    found
+    dir.file_name()?.to_str().map(str::to_owned)
+}
+
+/// Each live Hyprland instance under `runtime`: its `hypr/<signature>`
+/// directory and the Wayland socket its lock names.
+pub(super) fn live_instances(runtime: &Path) -> Vec<(PathBuf, String)> {
+    let Ok(entries) = std::fs::read_dir(runtime.join("hypr")) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let lock = std::fs::read_to_string(entry.path().join("hyprland.lock")).ok()?;
+            let mut lines = lock.lines();
+            let (pid, socket) = (lines.next()?, lines.next()?);
+            pid.parse::<u32>()
+                .is_ok_and(|pid| pid > 0 && Path::new(&format!("/proc/{pid}")).exists())
+                .then(|| (entry.path(), socket.to_owned()))
+        })
+        .collect()
 }
 
 /// `hyprctl -j cua:status` from the attested compositor. `Err` when the plugin

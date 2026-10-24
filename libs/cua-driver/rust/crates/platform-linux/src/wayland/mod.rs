@@ -1502,6 +1502,8 @@ fn open_vptr_session_in(
     activate_window_id: Option<u64>,
     snapshot: Option<&hyprland::DesktopSnapshot>,
 ) -> anyhow::Result<VptrSession> {
+    // The virtual pointer moves the person's own pointer.
+    hyprland_input::ensure_global_input_allowed()?;
     let conn = Connection::connect_to_env()?;
     let mut queue = conn.new_event_queue::<State>();
     let qh = queue.handle();
@@ -2246,6 +2248,8 @@ pub fn type_text(window_id: u64, text: &str) -> anyhow::Result<()> {
     if text.is_empty() {
         return Ok(());
     }
+    // wtype and the virtual keyboard type through the person's own seat.
+    hyprland_input::ensure_global_input_allowed()?;
     activate_window_for_input(window_id)?;
     // Lead with a no-op Shift_L tap: on a freshly-focused window under a headless
     // seat (notably sway), the compositor needs the first virtual-keyboard event
@@ -2280,6 +2284,7 @@ pub fn type_text_focused(text: &str) -> anyhow::Result<()> {
     if text.is_empty() {
         return Ok(());
     }
+    hyprland_input::ensure_global_input_allowed()?;
     let result = std::process::Command::new("wtype")
         .args(["-k", "Shift_L", "--"])
         .arg(text)
@@ -2301,6 +2306,7 @@ pub fn type_text_focused(text: &str) -> anyhow::Result<()> {
 /// headless wlroots seat dropping the first event from a second `wtype`
 /// process after the text has landed.
 pub fn type_text_then_key_focused(text: &str, key: &str) -> anyhow::Result<()> {
+    hyprland_input::ensure_global_input_allowed()?;
     let keysym = key_to_keysym(key);
     let result = std::process::Command::new("wtype")
         .args(["-k", "Shift_L", "-s", "30"])
@@ -2322,6 +2328,7 @@ pub fn type_text_then_key_focused(text: &str, key: &str) -> anyhow::Result<()> {
 
 /// Press a single named key into the focused Wayland surface via `wtype -k`.
 pub fn press_key(window_id: u64, key: &str) -> anyhow::Result<()> {
+    hyprland_input::ensure_global_input_allowed()?;
     activate_window_for_input(window_id)?;
     let keysym = key_to_keysym(key);
     // Keep the sacrificial modifier and requested key in one virtual-keyboard
@@ -2345,6 +2352,7 @@ pub fn press_key(window_id: u64, key: &str) -> anyhow::Result<()> {
 
 /// Press one key while an outer exact-container focus guard is active.
 pub fn press_key_focused(key: &str) -> anyhow::Result<()> {
+    hyprland_input::ensure_global_input_allowed()?;
     if is_inject_mode() {
         let (pid, window_id) = inject_focused_target()?;
         return inject_press_key(pid, window_id, key);
@@ -2371,6 +2379,7 @@ pub fn press_key_focused(key: &str) -> anyhow::Result<()> {
 /// straight to wtype's `-k` so single-character keys and X keysym names work
 /// as-is. This is the Wayland equivalent of the X11 `send_key` modifier mask.
 pub fn hotkey(window_id: u64, keys: &[String]) -> anyhow::Result<()> {
+    hyprland_input::ensure_global_input_allowed()?;
     activate_window_for_input(window_id)?;
     let (mods, final_key) = partition_modifiers(keys)?;
     if let Ok(()) = virtual_keyboard::hotkey(&mods, &final_key) {
@@ -2408,6 +2417,7 @@ pub fn hotkey(window_id: u64, keys: &[String]) -> anyhow::Result<()> {
 
 /// Send a chord while an outer exact-container focus guard is active.
 pub fn hotkey_focused(keys: &[String]) -> anyhow::Result<()> {
+    hyprland_input::ensure_global_input_allowed()?;
     if is_inject_mode() {
         let (pid, window_id) = inject_focused_target()?;
         return inject_hotkey(pid, window_id, keys);

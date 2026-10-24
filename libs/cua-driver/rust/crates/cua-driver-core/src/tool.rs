@@ -1138,7 +1138,11 @@ pub struct ToolRegistry {
     approval_broker: Arc<crate::consent::ApprovalBroker>,
     protected_resource_grants: Arc<crate::consent::ProtectedResourceGrants>,
     protected_resource_ownership: Arc<crate::consent::ProtectedResourceOwnershipStore>,
+    input_gate: Option<InputGate>,
 }
+
+/// A platform rule that refuses an input action before it runs.
+type InputGate = Box<dyn Fn(&str, &Value) -> Option<ToolResult> + Send + Sync>;
 
 impl ToolRegistry {
     pub fn new() -> Self {
@@ -1208,6 +1212,7 @@ impl ToolRegistry {
             approval_broker,
             protected_resource_grants,
             protected_resource_ownership,
+            input_gate: None,
         }
     }
 
@@ -1319,6 +1324,18 @@ impl ToolRegistry {
         registration: crate::session::CursorOutcomeReaderRegistration,
     ) {
         self.cursor_outcome_readers.push(registration);
+    }
+
+    /// Let the platform refuse physical input actions that depend on live
+    /// desktop state, such as Linux keeping agents off the person's own seat
+    /// while the Hyprland input plugin is active. The gate sees each call's
+    /// tool and arguments after its target and delivery mode are normalized,
+    /// before authorization, recording, or the tool itself.
+    pub fn set_input_gate(
+        &mut self,
+        gate: impl Fn(&str, &Value) -> Option<ToolResult> + Send + Sync + 'static,
+    ) {
+        self.input_gate = Some(Box::new(gate));
     }
 
     pub fn retain_runtime_cleanup(&mut self, cleanup: impl FnOnce() + Send + Sync + 'static) {
@@ -1777,6 +1794,14 @@ impl ToolRegistry {
         if let Err(result) = crate::action_target::enforce_delivery_target(resolved_name, &args) {
             return result;
         }
+        if let Some(refusal) = self
+            .input_gate
+            .as_ref()
+            .filter(|_| is_physical_desktop_action(resolved_name))
+            .and_then(|gate| gate(resolved_name, &args))
+        {
+            return refusal;
+        }
 
         // This registry is the canonical native dispatch boundary shared by
         // the same-process SDK and every transport adapter. Authorization must
@@ -1943,9 +1968,13 @@ impl ToolRegistry {
                 "replacement": "action.target",
             }));
         }
-        if let Some(key) = [DISABLE_CONFIG_KEY, LEGACY_CONFIG_KEY]
-            .into_iter()
-            .find(|key| resolved_name == "set_config" && args.get(key).is_some())
+        if let Some(key) = [
+            DISABLE_CONFIG_KEY,
+            LEGACY_CONFIG_KEY,
+            crate::delivery::ALLOW_GLOBAL_INPUT_KEY,
+        ]
+        .into_iter()
+        .find(|key| resolved_name == "set_config" && args.get(key).is_some())
         {
             return ToolResult::error(format!(
                 "config key '{key}' is set by whoever runs cua-driver, in \
@@ -5020,6 +5049,63 @@ resources:
     }
 
     #[tokio::test]
+    async fn the_input_gate_sees_normalized_action_calls_before_the_tool_runs() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mut registry = super::ToolRegistry::new();
+        for name in ["click", "probe"] {
+            registry.register(Box::new(ArgumentProbe {
+                hits: hits.clone(),
+                last_args: Arc::new(Mutex::new(None)),
+                def: super::ToolDef {
+                    name: name.into(),
+                    description: "test".into(),
+                    input_schema: serde_json::json!({"type": "object"}),
+                    read_only: false,
+                    destructive: false,
+                    idempotent: false,
+                    open_world: false,
+                },
+            }));
+        }
+        registry.set_input_gate(|tool, args| {
+            assert_eq!(tool, "click", "only input actions reach the gate");
+            (args["scope"] == "desktop").then(|| {
+                crate::protocol::ToolResult::error("gated")
+                    .with_structured(serde_json::json!({"code": "gated", "effect": "refused"}))
+            })
+        });
+
+        let refused = registry
+            .invoke_with_context(
+                "click",
+                serde_json::json!({
+                    "target": {"kind": "desktop", "display_id": "primary"},
+                    "x": 10,
+                    "y": 20
+                }),
+                standard_context(),
+            )
+            .await;
+        assert_eq!(refused.is_error, Some(true));
+        assert_eq!(refused.structured_content.unwrap()["code"], "gated");
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "the tool never ran");
+
+        for (name, args) in [
+            (
+                "click",
+                serde_json::json!({"target": {"kind": "window", "pid": 10, "window_id": 20}, "x": 1, "y": 2}),
+            ),
+            ("probe", serde_json::json!({"scope": "desktop"})),
+        ] {
+            let result = registry
+                .invoke_with_context(name, args, standard_context())
+                .await;
+            assert_ne!(result.is_error, Some(true), "{name}");
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
     async fn standard_file_transfer_is_promptless_and_still_canonicalizes_paths() {
         let files = tempfile::tempdir().unwrap();
         let first = files.path().join("first.txt");
@@ -5645,7 +5731,11 @@ resources:
             )
             .await;
         assert_eq!(unknown.is_error, Some(true));
-        for key in ["disable_run_script", "experimental_script"] {
+        for key in [
+            "disable_run_script",
+            "experimental_script",
+            "allow_global_input",
+        ] {
             for args in [
                 serde_json::json!({"key": key, "value": true}),
                 serde_json::json!({key: true}),

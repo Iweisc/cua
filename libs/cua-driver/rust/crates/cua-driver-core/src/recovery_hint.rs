@@ -295,6 +295,23 @@ static RULES: &[Rule] = &[
             .call(c.list_windows())
         },
     },
+    // Hyprland with the input plugin: desktop and foreground input are off.
+    Rule {
+        codes: &["global_input_disabled"],
+        build: |c| {
+            RecoveryHint::new(
+                "This would take over the user's keyboard or mouse, so nothing was sent. Target the \
+                 window (pid, window_id) in the background. That works on any window, even on another \
+                 workspace. Desktop or foreground input needs the user to opt in.",
+            )
+            .call(c.read_window().or_else(|| {
+                Some(NextCall {
+                    tool: "list_windows",
+                    arguments: Map::new(),
+                })
+            }))
+        },
+    },
     Rule {
         codes: &["target_occluded"],
         build: |c| {

@@ -29,6 +29,7 @@ before sharing.
 | `screenshot_context_missing` | A window-relative pixel action came before a screenshot read of that window in the same session. Call `get_window_state` (with its screenshot) first, using the same `session` label for one-shot CLI calls. |
 | `invalid_arguments` (`unknown argument element_index`) | Action tools take `element_token` only; read it from the latest `get_window_state` row. |
 | `desktop_scope_disabled` | A legacy window-less call: pass a window target, or `target: {kind: "desktop", display_id: "primary"}`. |
+| `global_input_disabled` | Linux with the Hyprland input plugin: the call would use your own keyboard or pointer (desktop scope, `delivery_mode: "foreground"`, `bring_to_front`). Act on a window target in the background, or set `"allow_global_input": true` in `~/.cua-driver/config.json` to allow it. |
 
 ## Reset stale macOS permissions
 

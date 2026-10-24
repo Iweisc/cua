@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, TryLockError};
 use std::time::{Duration, Instant};
@@ -290,16 +290,73 @@ pub fn enabled() -> bool {
     super::wayland_input_enabled()
         && super::hyprland::is_session()
         && (protocol() == InputProtocol::Experiment
-            || (0..MAX_LANES).any(|lane| {
-                socket_path(lane).ok().is_some_and(|path| {
-                    std::fs::symlink_metadata(path)
-                        .ok()
-                        .is_some_and(|metadata| {
-                            metadata.file_type().is_socket()
-                                && metadata.uid() == unsafe { libc::geteuid() }
-                        })
-                })
-            }))
+            || (0..MAX_LANES).any(|lane| socket_path(lane).is_ok_and(|path| own_socket(&path))))
+}
+
+fn own_socket(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| {
+        metadata.file_type().is_socket() && metadata.uid() == unsafe { libc::geteuid() }
+    })
+}
+
+/// The plugin's sockets in any live Hyprland instance under `runtime`. Unlike
+/// [`enabled`], this needs neither `CUA_DRIVER_RS_ENABLE_WAYLAND` nor an
+/// instance this process can name, so a driver started outside Hyprland's
+/// environment, whose input falls to a global route, is still gated.
+fn plugin_sockets_in(runtime: &Path) -> bool {
+    super::hyprland::live_instances(runtime)
+        .iter()
+        .any(|(dir, _)| {
+            (0..MAX_LANES).any(|lane| {
+                protocol()
+                    .socket_name(lane)
+                    .is_ok_and(|name| own_socket(&dir.join(name)))
+            })
+        })
+}
+
+/// The refusal for input through the person's own seat while the plugin is
+/// active: desktop-scope actions, which drive their keyboard and pointer, and
+/// the foreground route, which activates the target and moves their pointer.
+pub(crate) const GLOBAL_INPUT_DISABLED: &str = "global_input_disabled";
+
+/// The plugin exists so agents can work without interrupting the person, so
+/// input through their seat stays off unless whoever runs the driver set
+/// `"allow_global_input": true` in `~/.cua-driver/config.json`.
+pub fn global_input_disabled() -> bool {
+    let plugin = enabled()
+        || std::env::var_os("XDG_RUNTIME_DIR")
+            .is_some_and(|runtime| plugin_sockets_in(Path::new(&runtime)));
+    global_input_disabled_by(plugin, || {
+        pip_preview::read_config_value(cua_driver_core::delivery::ALLOW_GLOBAL_INPUT_KEY)
+    })
+}
+
+pub(crate) fn global_input_disabled_by(
+    plugin: bool,
+    allow: impl FnOnce() -> Option<Value>,
+) -> bool {
+    plugin && allow() != Some(Value::Bool(true))
+}
+
+pub(crate) fn global_input_detail() -> String {
+    format!(
+        "this would use the person's own keyboard or pointer, or bring a window forward, which \
+         agents may not do while the Hyprland input plugin is active. Act on a window target \
+         (pid, window_id) in the background instead. That reaches any window, even one on \
+         another workspace. The person running the driver can allow desktop and foreground \
+         input with \"{}\": true in ~/.cua-driver/config.json.",
+        cua_driver_core::delivery::ALLOW_GLOBAL_INPUT_KEY
+    )
+}
+
+/// Every route that injects through the person's seat calls this before it
+/// creates a device there, so nothing reaches the seat around the tool gate.
+pub(crate) fn ensure_global_input_allowed() -> Result<()> {
+    if global_input_disabled() {
+        bail!("{GLOBAL_INPUT_DISABLED}: {}", global_input_detail());
+    }
+    Ok(())
 }
 
 /// False while the screen is locked or the display is off, when the plugin
@@ -1398,6 +1455,10 @@ fn execute_actions_routed(
         route == DeliveryRoute::Background || protocol() == InputProtocol::Production,
         "foreground input requires production protocol; no downgrade is permitted"
     );
+    if route == DeliveryRoute::Foreground && global_input_disabled() {
+        return Ok(json!({"ok": false, "code": GLOBAL_INPUT_DISABLED,
+            "detail": global_input_detail()}));
+    }
     let window = super::hyprland::window_for_address(address);
     let Ok(stable_id) =
         super::hyprland::confirm_identity(address, window.as_ref().and_then(|w| w.stable_id))
@@ -1586,6 +1647,25 @@ mod tests {
 
     fn test_attestations() -> usize {
         TEST_ATTESTATIONS.get()
+    }
+
+    #[test]
+    fn plugin_sockets_of_a_live_instance_count_without_its_signature() {
+        use std::os::unix::net::UnixListener;
+        let runtime = tempfile::tempdir().unwrap();
+        let instance = |signature: &str, pid: u32| {
+            let dir = runtime.path().join("hypr").join(signature);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("hyprland.lock"), format!("{pid}\nwayland-1\n")).unwrap();
+            dir
+        };
+        // A crashed Hyprland leaves its sockets behind; no pid gets this high.
+        let crashed = instance("crashed", u32::MAX);
+        let _stale = UnixListener::bind(crashed.join(protocol().socket_name(0).unwrap())).unwrap();
+        let live = instance("live", std::process::id());
+        assert!(!plugin_sockets_in(runtime.path()));
+        let _socket = UnixListener::bind(live.join(protocol().socket_name(1).unwrap())).unwrap();
+        assert!(plugin_sockets_in(runtime.path()));
     }
 
     fn production_test_client() -> (Client, socket2::Socket) {

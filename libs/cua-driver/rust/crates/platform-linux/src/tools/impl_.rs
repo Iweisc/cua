@@ -4641,6 +4641,117 @@ fn hyprland_element_actions_refuse_while_the_session_is_unavailable() {
     }
 }
 
+/// The registry's input gate. With the Hyprland input plugin, agents act on
+/// window targets in the background. Desktop-scope input drives the person's
+/// own keyboard and pointer, and foreground delivery activates the target and
+/// moves their pointer, so both are refused unless the person allowed them.
+/// `disabled` is read only for those calls.
+fn global_input_gate(
+    tool: &str,
+    args: &Value,
+    disabled: impl FnOnce() -> bool,
+) -> Option<ToolResult> {
+    let names_window = ["pid", "window_id"]
+        .iter()
+        .any(|key| args.get(*key).is_some_and(|value| !value.is_null()));
+    let requested = args["scope"] == "desktop"
+        || (args["coordinate_frame"] == "desktop" && !names_window)
+        || crate::input::delivery::DeliveryMode::from_args(args).is_foreground()
+        // On Wayland the held button is always the person's own pointer
+        // (persistent_vptr), whatever the target. mouse_drag and
+        // mouse_button_up only act on a button this held.
+        || tool == "mouse_button_down";
+    if !requested || !disabled() {
+        return None;
+    }
+    use crate::wayland::hyprland_input::{global_input_detail, GLOBAL_INPUT_DISABLED};
+    let detail = global_input_detail();
+    Some(
+        ToolResult::error(format!("{GLOBAL_INPUT_DISABLED}: {detail}")).with_structured(json!({
+            "code": GLOBAL_INPUT_DISABLED, "detail": detail, "effect": "refused"
+        })),
+    )
+}
+
+#[cfg(test)]
+#[test]
+fn hyprland_refuses_input_through_the_persons_seat_unless_allowed() {
+    use crate::wayland::hyprland_input::global_input_disabled_by;
+    let no_opt_in = || global_input_disabled_by(true, || None);
+    // Normalized as the registry hands them over: a desktop target becomes
+    // scope "desktop", the dispatch alias becomes delivery_mode.
+    let window = json!({"pid": 7, "window_id": 9, "x": 5, "y": 5});
+    let refused = [
+        (
+            "hotkey",
+            json!({"scope": "desktop", "keys": ["super", "1"]}),
+        ),
+        (
+            "click",
+            json!({"scope": "desktop", "coordinate_frame": "desktop",
+                "x": 180, "y": 13, "delivery_mode": "foreground"}),
+        ),
+        (
+            "press_key",
+            json!({"coordinate_frame": "desktop", "key": "return"}),
+        ),
+        (
+            "click",
+            json!({"pid": 7, "window_id": 9, "x": 5, "y": 5, "delivery_mode": "foreground"}),
+        ),
+        ("mouse_button_down", window.clone()),
+    ];
+    for (tool, args) in &refused {
+        let refusal = global_input_gate(tool, args, no_opt_in).expect("refused");
+        assert_eq!(refusal.is_error, Some(true));
+        let structured = refusal.structured_content.unwrap();
+        assert_eq!(structured["code"], "global_input_disabled", "{tool} {args}");
+        assert_eq!(structured["effect"], "refused", "{tool} {args}");
+    }
+
+    let background = [
+        window.clone(),
+        json!({"pid": 7, "window_id": 9, "x": 5, "y": 5, "delivery_mode": "background"}),
+        // Desktop pixels addressed to one window still go to that window.
+        json!({"pid": 7, "window_id": 9, "x": 5, "y": 5, "coordinate_frame": "desktop"}),
+    ];
+    for args in &background {
+        assert!(
+            global_input_gate("click", args, || panic!("read for a background call")).is_none(),
+            "{args}"
+        );
+    }
+
+    let opted_in = || global_input_disabled_by(true, || Some(json!(true)));
+    let without_plugin = || global_input_disabled_by(false, || panic!("config read"));
+    for (tool, args) in &refused {
+        assert!(global_input_gate(tool, args, opted_in).is_none(), "{args}");
+        assert!(
+            global_input_gate(tool, args, without_plugin).is_none(),
+            "{args}"
+        );
+    }
+    // Only a JSON true opts in.
+    for value in [json!(false), json!("true"), json!(1)] {
+        assert!(
+            global_input_disabled_by(true, || Some(value.clone())),
+            "{value}"
+        );
+    }
+
+    // The plugin's own foreground refusal keeps the same code.
+    let result = hyprland_input_result(
+        Ok(json!({"ok": false, "code": "global_input_disabled", "detail": "off"})),
+        true,
+    );
+    assert_eq!(
+        result.structured_content.unwrap()["code"],
+        "global_input_disabled"
+    );
+    let public = result.action_record.unwrap().public_result().unwrap();
+    assert_eq!(public.effect, cua_driver_contract::ActionEffect::Refused);
+}
+
 fn isolated_hyprland_result(result: anyhow::Result<Value>) -> ToolResult {
     hyprland_input_result(result, false)
 }
@@ -4713,7 +4824,11 @@ fn hyprland_input_result(result: anyhow::Result<Value>, foreground: bool) -> Too
             value["reason"] = json!(code);
             // An outside point is the caller's mistake, not a route limit, so
             // it keeps the code the tools document for it, as X11 reports it.
-            let message = if code == crate::wayland::hyprland_input::POINT_OUTSIDE_WINDOW {
+            // A foreground route the person has not allowed keeps the same
+            // code the tool gate refuses desktop input with.
+            let message = if code == crate::wayland::hyprland_input::POINT_OUTSIDE_WINDOW
+                || code == crate::wayland::hyprland_input::GLOBAL_INPUT_DISABLED
+            {
                 format!("{code}: {detail}")
             } else {
                 value["code"] = json!(unavailable);
@@ -14819,6 +14934,13 @@ pub fn build_registry_with_provider(
     provider: Option<std::sync::Arc<dyn cua_driver_core::consent::ProtectedConsentProvider>>,
 ) -> ToolRegistry {
     let mut r = ToolRegistry::new_with_protected_consent_provider(provider);
+    r.set_input_gate(|tool, args| {
+        global_input_gate(
+            tool,
+            args,
+            crate::wayland::hyprland_input::global_input_disabled,
+        )
+    });
     let state = ToolState::new_with_capture_service(r.capture_service());
     if crate::wayland::is_wayland() && crate::wayland::hyprland::is_session() {
         let recording_state = Arc::downgrade(&state);

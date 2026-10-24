@@ -54,6 +54,18 @@ for pointer actions, cursor position, without restoration. The canonical native
 harness covers defined GTK3, Electron, and Tauri foreground cases. A background
 refusal never authorizes a hidden foreground fallback.
 
+While the plugin is active, Driver keeps agents off your own keyboard and
+pointer. Agents act on window targets in the background, which reaches any
+window, including windows on other workspaces. Desktop-scope input
+(`scope:"desktop"` or a desktop `target`), `delivery_mode:"foreground"`,
+`bring_to_front`, and `mouse_button_down` refuse with `global_input_disabled`
+and `effect:"refused"` before anything is sent, and any other route that would
+inject through your seat fails with the same code. This holds whenever the
+plugin's sockets exist in your live Hyprland, however Driver was started. To
+let agents use your keyboard and pointer, set
+`"allow_global_input": true` in `~/.cua-driver/config.json`. Driver reads it on
+each call. `set_config` cannot change it, so an agent cannot turn it on.
+
 This branch also contains a separate, opt-in
 [isolated-input compatibility experiment](protocol/input-experiment.md).
 It is not enabled by the normal build or package. Its test-only operator

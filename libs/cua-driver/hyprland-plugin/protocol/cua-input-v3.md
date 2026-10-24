@@ -554,6 +554,14 @@ establish exact-target delivery and is not a fallback. Background refusal never
 escalates to foreground. Both routes use Driver's existing permission and
 lifecycle admission, without a separate approval UI.
 
+Driver sends `FOREGROUND_TARGET` only when the person running it set
+`"allow_global_input": true` in `~/.cua-driver/config.json`. Otherwise every
+`delivery_mode:"foreground"` call and `bring_to_front` refuse in Driver with
+`global_input_disabled` and `effect:"refused"`, before any packet reaches the
+plugin. The same setting gates Driver's desktop-scope input and every other
+route that injects through the person's seat, such as the virtual pointer and
+virtual keyboard, so agents use only window targets in the background.
+
 ## Locked and display-off sessions
 
 Target selection and every operation refuse with `session_unavailable` while

@@ -287,6 +287,34 @@ fn a_next_call_never_asks_for_the_foreground() {
 }
 
 #[test]
+fn refused_global_input_points_at_window_targets() {
+    let desktop = hint_for(
+        "hotkey",
+        &seed(json!({"scope": "desktop", "keys": ["super", "1"]})),
+        true,
+        json!({"code": "global_input_disabled", "effect": "refused"}),
+    );
+    assert!(desktop.hint.contains("even on another workspace"));
+    assert_eq!(
+        call_value(&desktop),
+        json!({"tool": "list_windows", "arguments": {}})
+    );
+    let window = hint_for(
+        "click",
+        &window_seed(),
+        true,
+        json!({"code": "global_input_disabled", "effect": "refused"}),
+    );
+    assert_eq!(
+        call_value(&window),
+        json!({
+            "tool": "get_window_state",
+            "arguments": {"pid": 4242, "window_id": 17, "session": "run-1"},
+        })
+    );
+}
+
+#[test]
 fn a_desktop_point_over_a_background_app_points_at_the_window_target() {
     let hint = hint_for(
         "click",

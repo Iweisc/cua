@@ -29,6 +29,17 @@ that the chosen background route is unavailable or ineffective. Target-specific
 activation and restoration depend on the compositor adapter. If activation
 cannot be proven, accept the refusal instead of sending keys to whatever is focused.
 
+**Hyprland with the input plugin: window targets only.** Act on a window
+target (`pid`, `window_id`) in the background. That reaches any window,
+including X windows and windows on hidden or other workspaces, without touching
+the user's pointer or focus. Never use desktop-scope input there. Desktop-scope
+input, `delivery_mode:"foreground"`, `bring_to_front`, and `mouse_button_down`
+would take over the user's keyboard or mouse, so they refuse with
+`global_input_disabled` and `effect:"refused"`, and nothing is sent. Only the
+user can allow them, with `"allow_global_input": true` in
+`~/.cua-driver/config.json`. See
+[Hyprland input v3](#hyprland-input-v3-source-candidate).
+
 The overlay is separate from the physical pointer; cursor-bearing and
 keyboard actions re-show it automatically. Distinct overlays do not isolate
 desktop input. Keep one controller for a global-input workflow.
@@ -52,6 +63,8 @@ attested window capture.
    Use `get_desktop_state`, then
    `target:{"kind":"desktop","display_id":"primary"}` on input, and verify
    through another desktop snapshot. See [the desktop loop](WORKFLOW.md#desktop-loop).
+   On Hyprland with the input plugin, desktop input refuses with
+   `global_input_disabled`: keep acting on the window target instead.
 4. If desktop scope is not admitted, report the limitation and stop that route.
 
 A capture request may be waiting for an OS/portal permission dialog. Inspect
@@ -309,6 +322,24 @@ Background input reaches any app, as on macOS. There is no app list. Cua's
 recorded native evidence covers Calc from `libreoffice-fresh 26.2.5-3` and
 Inkscape `1.4.4-6`; for every app, verify the effect from fresh state.
 
+The plugin exists so agents never interrupt the user, so while it is active
+Driver refuses every route that would drive the user's own seat. That covers
+desktop-scope input (`scope:"desktop"` or a desktop `target`: click, double
+and right click, scroll, drag, `type_text`, `press_key`, `hotkey`, and
+`move_cursor`), `delivery_mode:"foreground"` on any window, `bring_to_front`,
+and `mouse_button_down`. Each refuses with `global_input_disabled` and
+`effect:"refused"` before anything is sent. Any other path that would use the
+virtual pointer or keyboard on the user's seat fails with the same code before
+it creates the device. This holds whenever a live Hyprland instance of the
+user has the plugin's sockets, even when Driver was started without
+`HYPRLAND_INSTANCE_SIGNATURE` or without its Wayland backend. Work on window
+targets in the background instead: `list_windows` lists windows on every
+workspace, and clicks, scrolls, drags, and keys reach them there. The person
+running Driver can allow those routes with `"allow_global_input": true` in
+`~/.cua-driver/config.json`, which Driver reads on each call. `set_config`
+refuses the key. Without the plugin, and on other compositors, these routes are
+unchanged.
+
 A Hyprland `window_id` is the window's compositor address, and Hyprland gives
 a closed window's address to the next window, usually at once. Driver
 remembers which window each id named when `list_windows`, `get_desktop_state`,
@@ -474,7 +505,8 @@ application effect from fresh state. Do not replay canceled, partial, or unknown
 actions.
 
 The candidate also adds an explicitly requested foreground route, advertised
-by the plugin as `foreground_target:true`. It binds the exact native top-level
+by the plugin as `foreground_target:true`. Driver uses it only with
+`allow_global_input` set, as described above. It binds the exact native top-level
 surface on the compositor thread and intentionally changes primary focus and,
 for pointer actions, cursor position. It does not restore the previous focus or
 cursor. The canonical
