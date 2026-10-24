@@ -70,7 +70,9 @@ The request sequence for every Driver-admitted action is:
 and grants at most five seconds of steady-clock technical lifetime. It first
 retires any unused previous grant. It refuses unavailable desktops and another
 lane targeting the target's Wayland client. Human focus on that client does
-not refuse, because the agent seat has its own pointer and keyboard.
+not refuse pointer actions, because the agent seat has its own pointer. Keys
+refuse while the human's keyboard focus is on that client, as described in
+[Keys in the person's app](#keys-in-the-persons-app).
 Background seats always publish a private canonical `evdev`/`pc105`/`us`
 keymap, so user layout options and remaps do not alter agent key semantics.
 They advertise the user seat's key repeat rate and delay, falling back to
@@ -168,8 +170,32 @@ delivery with no count. Neither case permits replay.
 Refusals use `{"ok":false,"code":"<code>","detail":"<code>"}`. Codes
 include `lane_busy`, `lane_not_claimed`, `stale_target`, `stale_geometry`,
 `session_unavailable`, `unsupported_layout`, `primary_target_busy`,
-`agent_target_busy`, `lease_expired`, `action_not_admitted`, `lease_busy`,
-`client_not_bound`, `replay`, `unsupported`, and `invalid_request`.
+`primary_keyboard_busy`, `agent_target_busy`, `lease_expired`,
+`action_not_admitted`, `lease_busy`, `client_not_bound`, `replay`,
+`unsupported`, and `invalid_request`.
+
+### Keys in the person's app
+
+On a native `TARGET` binding, capability 2 and every `KEY` refuse with
+`primary_keyboard_busy` while the human's keyboard focus is on any surface of
+the target's Wayland client, the target itself included. Click, scroll, and
+drag are unaffected. The check runs on the compositor thread before the agent
+seat's `wl_keyboard.enter`, and a `KEY` enters, types, and leaves within one
+dispatch, so no agent key reaches the client after the human's keyboard focus
+does. Driver sends each key of a text as its own `TARGET` and `KEY`, so a text
+stops at the first key after the human enters the app. Driver reports the
+keys already acknowledged as a partial result with `delivery.delivered_count`.
+
+Each `KEY` sends a keyboard enter on the agent seat. Firefox and Qt keep one
+keyboard focus for the whole process, so that enter takes focus from the
+human's window in the same app. Firefox then routes the human's typing into
+the agent's window until the human clicks their own, and Qt deactivates the
+human's window and drops its shortcuts. In every toolkit, agent keys sent to
+the window the human is typing in mix with the human's own keys. Ghostty, foot,
+GTK3, and GTK4 keep keyboard focus per seat and could take agent keys in one
+window while the human types in another, but they are refused too. This is a
+deliberate limit with no per-app or per-toolkit exception: a client's keyboard
+model is not visible to the compositor.
 
 ## Primary-seat background extension
 
@@ -355,9 +381,11 @@ for the separate cancellation paths and transport limits.
 EOF cancels only the departing connection's work and frees its reservation.
 Lock/unlock, DPMS, session activity, and monitor transitions revoke authority.
 Keymap/layout changes revoke authority, including synchronous layout and
-active-keyboard keymap notifications. For background bindings, changing primary
-focus to a target client cancels that lane synchronously. Dispatch and timer checks supplement
-these listeners. None of these paths wake the display or unlock the session.
+active-keyboard keymap notifications. For `PRIMARY_TARGET` and X bindings,
+changing primary focus to a target client cancels that lane synchronously. A
+native `TARGET` grant stays, and its next `KEY` refuses with
+`primary_keyboard_busy`. Dispatch and timer checks supplement these listeners.
+None of these paths wake the display or unlock the session.
 
 Config disable closes input transports but preserves client-owned seats and
 resources. Re-enable opens fresh transports with new epochs. Each later

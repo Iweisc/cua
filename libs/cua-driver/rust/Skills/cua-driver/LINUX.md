@@ -311,8 +311,17 @@ Inkscape `1.4.4-6`; for every app, verify the effect from fresh state.
 
 The plugin separately binds the exact live native surface and checks geometry,
 desktop availability, and other-lane conflicts. The agent seat has its own
-pointer and keyboard, so an agent can work in a native app you are using,
-including another window of it, without taking your focus or typing. Each
+pointer, so an agent can click, scroll, and drag in a native app you are using,
+including another window of it, without taking your focus. Keys are different:
+while your keyboard focus is in the target's app, `type_text`, `press_key`, and
+`hotkey` refuse with reason `primary_keyboard_busy`, and a running `type_text`
+stops at the next key after you click into that app, reporting the keys it had
+already sent as a partial result. Firefox and Qt keep one keyboard focus per
+app, so an agent key in one of their windows takes your typing away from yours,
+and in any app agent keys in your window mix with your typing. Ghostty, foot,
+and GTK keep keyboard focus per seat and could type into another window
+correctly, but they are refused too: there are no per-app exceptions. Element
+actions such as `set_value` still work there. Each
 background lane publishes a private canonical `evdev`/`pc105`/`us` keymap, so
 user options such as Caps Lock remapped to Ctrl or Super do not alter agent key
 semantics. A physical keymap transition cancels existing authority; use a fresh

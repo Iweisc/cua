@@ -4519,9 +4519,9 @@ fn hyprland_input_result(result: anyhow::Result<Value>, foreground: bool) -> Too
                 .as_u64()
                 .and_then(|count| u32::try_from(count).ok())
                 .filter(|count| *count > 0);
-            let outcome = if value["effect"] == "partial"
-                && delivered.is_some_and(|count| foreground || count == 1)
-            {
+            // Background text and multi-packet scroll count acknowledged keys
+            // and packets, so a background count can exceed one drag phase.
+            let outcome = if value["effect"] == "partial" && delivered.is_some() {
                 record(ActionEffect::Partial)
                     .actual_delivery(actual)
                     .delivered_count(delivered.unwrap())
@@ -5239,6 +5239,19 @@ fn isolated_hyprland_refused_partial_and_unknown_outcomes_stay_distinct() {
     let public = partial.action_record.unwrap().public_result().unwrap();
     assert_eq!(public.effect, cua_driver_contract::ActionEffect::Partial);
     assert_eq!(public.delivery.unwrap().delivered_count, Some(1));
+
+    // A type_text the person interrupts by entering the app keeps its count.
+    let interrupted = isolated_hyprland_result(Ok(
+        json!({"ok":false,"code":"primary_keyboard_busy","detail":"primary_keyboard_busy",
+        "effect":"partial","delivery":{"mode":"background","delivered_count":5}}),
+    ));
+    let content = interrupted.structured_content.as_ref().unwrap();
+    assert_eq!(content["reason"], "primary_keyboard_busy");
+    assert_eq!(content["effect"], "partial");
+    let public = interrupted.action_record.unwrap().public_result().unwrap();
+    public.validate_invariants().unwrap();
+    assert_eq!(public.effect, cua_driver_contract::ActionEffect::Partial);
+    assert_eq!(public.delivery.unwrap().delivered_count, Some(5));
 
     let unknown = isolated_hyprland_result(Err(anyhow::anyhow!("connection lost")));
     let public = unknown.action_record.unwrap().public_result().unwrap();

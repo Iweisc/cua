@@ -72,6 +72,10 @@ fn every_hint_variant_stays_within_the_length_limit() {
             json!({"code": "background_unavailable", "reason": "windowserver_connection_invalid"}),
         ),
         (
+            "type_text",
+            json!({"code": "background_unavailable", "reason": "primary_keyboard_busy"}),
+        ),
+        (
             "click",
             json!({"code": "background_unavailable", "window": {"pid": 1, "window_id": 2}}),
         ),
@@ -196,6 +200,34 @@ fn a_drag_refused_by_macos_drag_and_drop_names_a_non_drag_route_and_the_foregrou
         "No drop landed: macOS drag-and-drop needs the real pointer. Try a route that is not a drag first \
          (Move button, menu item, shortcut). Retry with delivery_mode:\"foreground\" \
          only if the user allows the window to come forward."
+    );
+    assert_eq!(
+        call_value(&hint),
+        json!({
+            "tool": "get_window_state",
+            "arguments": {"pid": 4242, "window_id": 17, "session": "run-1"},
+        })
+    );
+}
+
+#[test]
+fn keys_refused_in_the_users_app_keep_pointer_and_element_routes_open() {
+    let hint = hint_for(
+        "type_text",
+        &window_seed(),
+        true,
+        json!({
+            "code": "background_unavailable",
+            "reason": "primary_keyboard_busy",
+            "effect": "partial",
+            "delivery": {"mode": "background", "delivered_count": 5},
+        }),
+    );
+    assert_eq!(
+        hint.hint,
+        "The user is typing in this app, so keys are refused: they could reach the user's window. \
+         Clicks, scrolls and element actions (set_value) still work. Send any remaining keys after \
+         the user leaves the app."
     );
     assert_eq!(
         call_value(&hint),

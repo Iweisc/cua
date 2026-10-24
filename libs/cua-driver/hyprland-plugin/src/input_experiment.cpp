@@ -574,13 +574,18 @@ struct InputExperiment::Impl {
     bool primary_conflict(const Client& c) const {
         if (c.route == InputRoute::primary_foreground)
             return foreground_started && !foreground_activating && !foreground_guard(c).can_dispatch(foreground_needs_pointer);
-        // The agent seat has its own pointer and keyboard, so it may share a
-        // native app with the human, as on macOS. An X app has one client
-        // pointer for all its windows, and its reactions to the agent would
-        // reach the human's keyboard, so X targets and the routes that borrow
-        // the human's own resources still stay out of the human's app.
+        // The agent seat has its own pointer, so its pointer actions may share
+        // a native app with the human, as on macOS. Its keys may not; see
+        // keyboard_conflict. An X app has one client pointer for all its
+        // windows, and its reactions to the agent would reach the human's
+        // keyboard, so X targets and the routes that borrow the human's own
+        // resources still stay out of the human's app.
         if (c.route == InputRoute::independent && !c.xwayland) return false;
         return primary_conflict(c.surface.lock());
+    }
+    std::string_view keyboard_conflict(const Client& c, std::uint64_t capability) const {
+        return agent_keyboard_refusal(c.route, c.xwayland, capability,
+            g_pSeatManager->m_state.keyboardFocus.lock(), c.surface.lock());
     }
     // XWayland is a single Wayland client for every X app. Each input user has
     // its own X master pair there, so only the same X process conflicts.
@@ -1371,6 +1376,9 @@ struct InputExperiment::Impl {
             if (kProduction) {
                 if (primary_conflict(c)) { invalidate(c); send(c, refusal("primary_target_busy")); return; }
                 if (agent_conflict(c)) { invalidate(c); send(c, refusal("agent_target_busy")); return; }
+                if (const auto failure = keyboard_conflict(c, requested_cap); !failure.empty()) {
+                    invalidate(c, false); send(c, refusal(failure)); return;
+                }
                 if (route == InputRoute::primary_foreground) {
                     const auto failure = foreground_guard(c).activation_failure();
                     if (failure != ForegroundFailureReason::none) {
@@ -1438,6 +1446,13 @@ struct InputExperiment::Impl {
         if (agent_conflict(c)) {
             if (kProduction) revoke("agent_target_busy");
             send(c, refusal("agent_target_busy")); return;
+        }
+        // Driver sends each key of a text as its own TARGET and KEY, so this
+        // runs before every key. The person's focus can reach the client only
+        // between requests: KEY enters, types, and leaves in this one handler.
+        if (const auto failure = keyboard_conflict(c, cap); !failure.empty()) {
+            if (kProduction) revoke(failure, true);
+            send(c, refusal(failure)); return;
         }
         // Hyprland raises an X window in X stacking when it gains keyboard
         // focus, and X stacking decides which window a pointer event reaches.

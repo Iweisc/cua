@@ -136,6 +136,21 @@ inline bool input_layout_qualified(InputRoute route, bool keyboard_action, bool 
     return !uses_primary_seat(route) || !keyboard_action || primary_layout_qualified;
 }
 
+// The agent seat has its own keyboard focus, but Firefox and Qt keep one
+// keyboard focus for the whole process: an agent key in one of their windows
+// takes it from the person's window. Every toolkit mixes agent keys into the
+// person's typing when both are in one window. So the agent seat sends no key
+// to a native client while the person's keyboard focus is on any of its
+// surfaces. X targets and both primary routes already refuse every action in
+// the person's app; pointer actions on this route never need the keyboard.
+template <typename Surface>
+std::string_view agent_keyboard_refusal(InputRoute route, bool xwayland, std::uint64_t capability,
+                                        const Surface& human_keyboard_focus, const Surface& target) {
+    if (route != InputRoute::independent || xwayland || capability != 2) return {};
+    if (!human_keyboard_focus || !target || human_keyboard_focus->client() != target->client()) return {};
+    return "primary_keyboard_busy";
+}
+
 // The background primary route borrows the client's primary-seat resources.
 // It refuses anything that would make the human's own input reach the target
 // or let an agent gesture start compositor-global state.

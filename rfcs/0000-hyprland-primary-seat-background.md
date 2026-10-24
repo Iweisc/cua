@@ -162,12 +162,18 @@ no app list either. The gate was a compatibility check, not authorization, and
 an unlisted app sent agents to foreground input, which takes the person's
 focus.
 
-`TARGET` no longer refuses when the person is on the target client. The agent
-seat has its own pointer and keyboard, so the agent can work in one window of
-a native app while the person types in another, as on macOS. Passive agent
-pointer focus also stays when the person enters that client. `PRIMARY_TARGET`
-and X windows still refuse with `primary_target_busy`, because their input or
-the app's reactions reach the person's own devices.
+`TARGET` no longer refuses pointer actions when the person is on the target
+client. The agent seat has its own pointer, so the agent can click, scroll, and
+drag in one window of a native app while the person types in another. Passive
+agent pointer focus also stays when the person enters that client. Keys refuse
+with `primary_keyboard_busy` while the person's keyboard focus is on any surface
+of the target client, checked before every key. Firefox and Qt keep one
+keyboard focus per process, so an agent key in one window took the person's
+typing in another, and agent keys in the person's own window mix with theirs
+in every toolkit. Ghostty, foot, and GTK keep focus per seat but are refused
+too, with no per-app exception. `PRIMARY_TARGET` and X windows still refuse
+every action with `primary_target_busy`, because their input or the app's
+reactions reach the person's own devices.
 
 ### Doctor
 
@@ -215,7 +221,9 @@ compatibility check, and the plugin trusts same-user code, the same as RFC
 3. Driver: route selection and doctor probes.
 4. Plugin and Driver: no package gate, and native agent-seat targets may share
    an app with the person.
-5. This RFC.
+5. Plugin: refuse agent keys while the person's keyboard focus is in the
+   target's app.
+6. This RFC.
 
 ## Test and acceptance plan
 

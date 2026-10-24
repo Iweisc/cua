@@ -787,6 +787,13 @@ fn background_unavailable(c: &Ctx) -> RecoveryHint {
              (get_window_state, then element_token) or invoke_menu. {foreground}"
         ))
         .call(c.read_window()),
+        // Hyprland: the person's keyboard focus is in the target's app.
+        (_, Some("primary_keyboard_busy")) => RecoveryHint::new(
+            "The user is typing in this app, so keys are refused: they could reach the user's window. \
+             Clicks, scrolls and element actions (set_value) still work. Send any remaining keys after \
+             the user leaves the app.",
+        )
+        .call(c.read_window()),
         (_, Some("windowserver_connection_invalid")) => RecoveryHint::new(
             "The daemon has no valid WindowServer connection. Run the app-bundle daemon (not a bare \
              `cua-driver serve`) and retry.",
