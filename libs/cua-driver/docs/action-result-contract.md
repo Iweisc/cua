@@ -131,6 +131,13 @@ A PID with no eligible windows fails with `code: "window_target_not_found"`.
 Explicit `window_id` targets and `element_token` targets retain their exact
 resolution semantics; the guard does not replace or reinterpret them.
 
+A `window_id` names one window for that window's lifetime. Hyprland reuses
+ids: its window id is a compositor address, which goes to the next window once
+the window closes. There, an explicit `window_id` whose window has closed fails
+before sending input with `code: "window_id_not_found"` and
+`effect: "refused"`, even when another window now holds the same id. Call
+`list_windows` and act on the id it returns.
+
 An action that reached an actuator but lacks a trusted readback is
 `unverifiable`, not `confirmed`. Screenshot change, native API acceptance,
 event receipt, and operator observation may remain useful internal diagnostics,

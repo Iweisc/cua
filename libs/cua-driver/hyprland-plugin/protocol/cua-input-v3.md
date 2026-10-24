@@ -25,7 +25,7 @@ Packets contain printable ASCII fields separated by exactly one space, with
 no newline. The maximum packet size is 2048 bytes. Responses are JSON packets.
 Unknown commands, extra fields, integer overflow, nonfinite coordinates, and
 out-of-range values refuse. Decimal integers are unsigned; the target address,
-epoch, and target token are hexadecimal. Epochs and tokens contain 32 lowercase
+window stable id, epoch, and target token are hexadecimal. Epochs and tokens contain 32 lowercase
 hexadecimal characters.
 
 Each socket accepts at most eight connections. A connection must send `HELLO`
@@ -46,10 +46,10 @@ its original seat names.
 The request sequence for every Driver-admitted action is:
 
 1. Send `HELLO` once per connection. The response is
-   `{"ok":true,"protocol":3,"epoch":"<epoch>","foreground_target":true,"primary_background":true,"xwayland_target":true}`
+   `{"ok":true,"protocol":3,"epoch":"<epoch>","foreground_target":true,"primary_background":true,"xwayland_target":true,"stable_id":true}`
    for a production plugin implementing the foreground, primary-background,
-   and XWayland extensions. Driver must require each explicit capability before
-   using its route.
+   and XWayland extensions and the stable-id target field. Driver must require
+   each explicit capability before using its route or field.
 2. Send `CLAIM`. The response is `{"ok":true,"lane":0}` or lane `1`.
 3. For background input, send `TARGET <pid> <hex-address> <capability>`.
    For foreground input, send
@@ -61,6 +61,10 @@ The request sequence for every Driver-admitted action is:
    target client holds no pointer or keyboard on this lane's agent seat. Such a
    client can only be reached through `PRIMARY_TARGET`, described below.
    `TARGET` refuses X windows with `stale_target`; they need `XWAYLAND_TARGET`.
+   Every target request may end with one more field, the window's hex stable
+   id (`stableId` in `hyprctl -j clients`), for example
+   `TARGET 811 5d12f9b62540 2 18000004`. See
+   [Window identity](#window-identity).
 4. Send the one matching bounded operation using that token and revision.
    A subsequent action requires fresh route-specific target selection, even on
    a cached connection. The binding fixes the route; an operation cannot turn
@@ -82,6 +86,20 @@ agent key is held long enough to repeat. A discovered address is an input to
 attestation, not a surface lifetime token.
 Surface unmap, destruction, or replacement invalidates the binding. Geometry
 changes increment the revision and refuse stale actions.
+
+### Window identity
+
+Hyprland gives a closed window's address to the next window it creates,
+usually at once and across apps, X windows included. An address therefore
+names whichever window holds it now, not the window Driver discovered. The
+optional last field of `TARGET`, `PRIMARY_TARGET`, `FOREGROUND_TARGET`, and
+`XWAYLAND_TARGET` is the stable id Driver read with that address, which
+Hyprland never reuses within a compositor run. When the window at the address
+carries another stable id, the request refuses with `stale_target` and binds
+nothing. A malformed id refuses with `invalid_request`. Without the field,
+target selection binds by address alone. Driver sends the field only when
+`HELLO` reports `stable_id`, and checks the id itself before connecting; the
+plugin check covers a window that takes the address between the two.
 
 The complete operation requests are:
 
@@ -255,8 +273,9 @@ the bound top-level surface, so they do not reach the popup.
 
 Driver draws its agent cursors in full-output `zwlr_layer_shell_v1` overlay
 layers. When the plugin's input sockets exist, cursors pinned to a window go
-in a layer per window and output named `cua-agent-cursor@<hex window address>`.
-While that window is mapped, the plugin leaves the layer out of Hyprland's
+in a layer per window and output named `cua-agent-cursor@<hex window address>`,
+followed by `.<hex stable id>` when Driver knows which window it returned that
+address for. While that window is mapped, the plugin leaves the layer out of Hyprland's
 layer pass and draws it right after the window's main pass, at the window's
 workspace offset. Windows stacked above the target and the target's own
 popups cover the cursor, and a hidden workspace hides it. Single-window
@@ -267,7 +286,10 @@ A pinned layer is never drawn above every window. The plain
 
 Hyprland reuses a freed window's address for the next window it creates, so
 the plugin binds each pinned layer to the window at its address when the
-layer maps, and draws it only after that window. Driver places the cursor
+layer maps, and draws it only after that window. A layer whose name carries a
+stable id binds only to a window with that id, so a layer that maps after its
+target closed and another window took the address stays unbound and is never
+drawn. Driver places the cursor
 relative to the window's top-left corner from the box it read when it acted,
 and does not see the window move, so the plugin also records that box. When
 the window is destroyed, even on a hidden workspace, or its corner moves or

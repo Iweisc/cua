@@ -3480,36 +3480,57 @@ fn apply_pid_filter(mut windows: Vec<WindowInfo>, filter_pid: Option<u32>) -> Ve
     windows
 }
 
+/// [`list_windows_dispatch`] for windows a tool returns to its caller. On
+/// Hyprland, pass the windows it returns to [`hyprland::Identities::hand_out`]
+/// so a later call can tell them from windows that reuse their addresses.
+pub fn list_windows_with_identities(
+    filter_pid: Option<u32>,
+) -> (Vec<WindowInfo>, hyprland::Identities) {
+    if is_wayland() && hyprland::is_session() {
+        hyprland_windows(filter_pid)
+    } else {
+        (list_windows_dispatch(filter_pid), Default::default())
+    }
+}
+
+fn hyprland_windows(filter_pid: Option<u32>) -> (Vec<WindowInfo>, hyprland::Identities) {
+    // Hyprland IPC already attests PID and full native identity. A
+    // foreign-toplevel title join only makes that identity weaker.
+    match hyprland::list_windows() {
+        Ok(windows) => {
+            let identities = hyprland::Identities::of(&windows);
+            let windows = windows
+                .into_iter()
+                .map(|w| WindowInfo {
+                    xid: w.address,
+                    pid: Some(w.pid),
+                    app_name: w.app_id,
+                    title: w.title,
+                    is_on_screen: w.visible,
+                    z_index: None,
+                    x: w.x,
+                    y: w.y,
+                    width: w.width,
+                    height: w.height,
+                })
+                .collect();
+            (
+                listed_windows(apply_pid_filter(windows, filter_pid)),
+                identities,
+            )
+        }
+        Err(error) => {
+            tracing::warn!("Hyprland window enumeration unavailable: {error:#}");
+            Default::default()
+        }
+    }
+}
+
 /// Window-enumeration dispatcher: native Wayland when available, else X11.
 pub fn list_windows_dispatch(filter_pid: Option<u32>) -> Vec<WindowInfo> {
     if wayland_enabled() && std::env::var_os("WAYLAND_DISPLAY").is_some() {
         if hyprland::is_session() {
-            // Hyprland IPC already attests PID and full native identity. A
-            // foreign-toplevel title join only makes that identity weaker.
-            return match hyprland::list_windows() {
-                Ok(windows) => listed_windows(apply_pid_filter(
-                    windows
-                        .into_iter()
-                        .map(|w| WindowInfo {
-                            xid: w.address,
-                            pid: Some(w.pid),
-                            app_name: w.app_id,
-                            title: w.title,
-                            is_on_screen: w.visible,
-                            z_index: None,
-                            x: w.x,
-                            y: w.y,
-                            width: w.width,
-                            height: w.height,
-                        })
-                        .collect(),
-                    filter_pid,
-                )),
-                Err(error) => {
-                    tracing::warn!("Hyprland window enumeration unavailable: {error:#}");
-                    Vec::new()
-                }
-            };
+            return hyprland_windows(filter_pid).0;
         }
         // A verified GNOME helper already supplies exact IDs and ownership.
         // Do not probe unrelated compositor protocols for every preview frame.

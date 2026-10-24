@@ -1,4 +1,5 @@
-//! Fail-closed resolution for actions addressed only by process id.
+//! Fail-closed resolution for actions addressed only by process id, and for
+//! explicit window ids a platform may recycle.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -73,6 +74,13 @@ pub type SnapshotWindowResolver = Arc<dyn Fn(i64, &str) -> Option<u64> + Send + 
 /// `SnapshotStore::pid_for_token`). `None` when the token is unknown.
 pub type TokenPidResolver = Arc<dyn Fn(&Value) -> Option<i32> + Send + Sync + 'static>;
 
+/// `(pid, window_id)` of an explicit target -> a refusal when that id no
+/// longer names the window the caller was given it for. A platform that
+/// recycles window ids (Hyprland hands a closed window's address to the next
+/// window) supplies this; elsewhere an id names one window for its lifetime.
+pub type WindowIdentityCheck =
+    Arc<dyn Fn(Option<i64>, u64) -> Option<ToolResult> + Send + Sync + 'static>;
+
 /// Desktop-frame `x`/`y` of an action, when the call carries them.
 fn desktop_frame_point(args: &Value) -> Option<(f64, f64)> {
     let frame_is_desktop = args.get("coordinate_frame").and_then(Value::as_str) == Some("desktop")
@@ -87,7 +95,8 @@ fn desktop_frame_point(args: &Value) -> Option<(f64, f64)> {
 }
 
 /// Tool decorator that resolves PID-only calls before an action can send input.
-/// Explicit `window_id` and `element_token` targets pass through unchanged.
+/// Explicit `window_id` and `element_token` targets pass through unchanged,
+/// once an explicit `window_id` passes the optional identity check.
 pub struct PidOnlyWindowTargetGuard {
     inner: Box<dyn Tool>,
     candidates: WindowTargetCandidates,
@@ -95,6 +104,7 @@ pub struct PidOnlyWindowTargetGuard {
     fallback_resolver: Option<PidFallbackWindowResolver>,
     snapshot_resolver: Option<SnapshotWindowResolver>,
     token_pid_resolver: Option<TokenPidResolver>,
+    identity_check: Option<WindowIdentityCheck>,
 }
 
 impl PidOnlyWindowTargetGuard {
@@ -106,7 +116,15 @@ impl PidOnlyWindowTargetGuard {
             fallback_resolver: None,
             snapshot_resolver: None,
             token_pid_resolver: None,
+            identity_check: None,
         }
+    }
+
+    /// Refuse an explicit `window_id` that names another window than the one
+    /// the caller was given it for, before the tool runs.
+    pub fn with_identity_check(mut self, check: WindowIdentityCheck) -> Self {
+        self.identity_check = Some(check);
+        self
     }
 
     /// Take a missing `pid` from the call's `element_token`, so a token-only
@@ -180,6 +198,17 @@ impl Tool for PidOnlyWindowTargetGuard {
         if let Some(resolver) = &self.token_pid_resolver {
             if let Err(refusal) =
                 crate::element_token::fill_pid_from_token(&mut args, |args| resolver(args))
+            {
+                return refusal;
+            }
+        }
+        if let (Some(check), Some(window_id)) = (
+            self.identity_check.clone(),
+            args.get("window_id").and_then(Value::as_u64),
+        ) {
+            let pid = args.get("pid").and_then(Value::as_i64);
+            if let Ok(Some(refusal)) =
+                tokio::task::spawn_blocking(move || check(pid, window_id)).await
             {
                 return refusal;
             }
@@ -551,6 +580,39 @@ mod tests {
             assert_eq!(calls.load(Ordering::SeqCst), 1);
             assert_eq!(result.structured_content.unwrap(), expected);
         }
+    }
+
+    #[tokio::test]
+    async fn a_recycled_explicit_window_id_refuses_before_the_action() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let guard = PidOnlyWindowTargetGuard::new(
+            Box::new(EchoTool {
+                calls: calls.clone(),
+            }),
+            Arc::new(|_| panic!("explicit targets must not enumerate windows")),
+        )
+        .with_identity_check(Arc::new(|pid, window_id| {
+            (pid == Some(42) && window_id == 9).then(|| {
+                ToolResult::error("replaced")
+                    .with_structured(serde_json::json!({"code": "window_id_not_found"}))
+            })
+        }));
+
+        let refused = guard
+            .invoke(serde_json::json!({"pid": 42, "window_id": 9}))
+            .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            refused.structured_content.unwrap()["code"],
+            "window_id_not_found"
+        );
+        guard
+            .invoke(serde_json::json!({"pid": 42, "window_id": 10}))
+            .await;
+        guard
+            .invoke(serde_json::json!({"pid": 42, "element_token": "explicit"}))
+            .await;
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]

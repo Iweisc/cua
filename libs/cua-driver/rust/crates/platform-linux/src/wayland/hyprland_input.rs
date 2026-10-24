@@ -374,8 +374,12 @@ struct Client {
     foreground_supported: bool,
     primary_background_supported: bool,
     xwayland_supported: bool,
+    // TARGET takes the window's stable id after the capability.
+    stable_id_supported: bool,
     // The target is an X window; set per call from Hyprland's client list.
     xwayland: bool,
+    // The stable id the window at `address` must carry; set per call.
+    stable_id: Option<u64>,
     delivery_route: Option<DeliveryRoute>,
     // Assigned by the compositor to this connection, never by the local pool.
     lane: Option<usize>,
@@ -533,7 +537,9 @@ impl Client {
             foreground_supported: false,
             primary_background_supported: false,
             xwayland_supported: false,
+            stable_id_supported: false,
             xwayland: false,
+            stable_id: None,
             delivery_route: None,
             lane: None,
             owner,
@@ -576,6 +582,8 @@ impl Client {
             self.protocol == InputProtocol::Production && hello["primary_background"] == true;
         self.xwayland_supported =
             self.protocol == InputProtocol::Production && hello["xwayland_target"] == true;
+        self.stable_id_supported =
+            self.protocol == InputProtocol::Production && hello["stable_id"] == true;
         if self.protocol == InputProtocol::Experiment {
             self.challenge = hex_field(&hello, "challenge")?;
         } else {
@@ -890,10 +898,15 @@ impl Client {
 
     fn target_packet(&self, action: &Action, binding: TargetBinding) -> String {
         let target = format!("{} {} {:x}", binding.command(), self.pid, self.address);
-        if self.protocol == InputProtocol::Production {
-            format!("{target} {}", action.capability())
-        } else {
-            target
+        if self.protocol != InputProtocol::Production {
+            return target;
+        }
+        let target = format!("{target} {}", action.capability());
+        // The plugin then refuses a window that took the address after
+        // Driver's own check.
+        match self.stable_id.filter(|_| self.stable_id_supported) {
+            Some(stable_id) => format!("{target} {stable_id:x}"),
+            None => target,
         }
     }
 }
@@ -1345,10 +1358,16 @@ fn execute_actions_routed(
         route == DeliveryRoute::Background || protocol() == InputProtocol::Production,
         "foreground input requires production protocol; no downgrade is permitted"
     );
+    let window = super::hyprland::window_for_address(address);
+    let Ok(stable_id) =
+        super::hyprland::confirm_identity(address, window.as_ref().and_then(|w| w.stable_id))
+    else {
+        return Ok(json!({"ok":false,"code":"window_id_not_found",
+            "detail":"the window closed and Hyprland gave its address to another window"}));
+    };
     let xwayland = route == DeliveryRoute::Background
         && protocol() == InputProtocol::Production
-        && super::hyprland::window_for_address(address)
-            .is_some_and(|window| window.pid == pid && window.xwayland == Some(true));
+        && window.is_some_and(|window| window.pid == pid && window.xwayland == Some(true));
     let client = session_client(&owner)?;
     let mut slot = client.lock(&cancellation)?;
     if let Some(client) = slot.as_ref() {
@@ -1377,6 +1396,7 @@ fn execute_actions_routed(
     let connected = slot.as_mut().context("missing input connection")?;
     connected.cancellation = cancellation;
     connected.xwayland = xwayland;
+    connected.stable_id = stable_id;
     dispatch_actions_in_slot(&mut slot, actions, started, route, text, Client::attest)
 }
 
@@ -2046,6 +2066,49 @@ mod tests {
     }
 
     #[test]
+    fn targets_carry_the_stable_id_only_to_a_plugin_that_checks_it() {
+        let (mut client, peer) = production_test_client();
+        client.primary_background_supported = true;
+        client.stable_id = Some(0x1800_0004);
+        let server = std::thread::spawn(move || {
+            // An older plugin refuses a fifth field as invalid_request.
+            assert_eq!(read_packet(&peer), "TARGET 1 1 2");
+            peer.send(br#"{"ok":false,"code":"stale_target","detail":"stale_target"}"#)
+                .unwrap();
+            assert_eq!(read_packet(&peer), "TARGET 1 1 2 18000004");
+            peer.send(
+                json!({"ok":true,"target":TOKEN,"revision":1,"width":100,"height":100,
+                    "agent_bound":false})
+                .to_string()
+                .as_bytes(),
+            )
+            .unwrap();
+            assert_eq!(read_packet(&peer), "PRIMARY_TARGET 1 1 2 18000004");
+            peer.send(br#"{"ok":false,"code":"stale_target","detail":"stale_target"}"#)
+                .unwrap();
+            assert_peer_receives_nothing_more(&peer);
+        });
+        let key = || Action::Key {
+            key: "a".into(),
+            modifiers: vec![],
+        };
+        for stable_id_supported in [false, true] {
+            client.stable_id_supported = stable_id_supported;
+            let reply = client
+                .execute_routed_with_attest(
+                    key(),
+                    None,
+                    DeliveryRoute::Background,
+                    record_test_attestation,
+                )
+                .unwrap();
+            assert_eq!(reply["code"], "stale_target");
+        }
+        drop(client);
+        server.join().unwrap();
+    }
+
+    #[test]
     fn unadvertised_primary_background_keeps_the_agent_seat_refusal() {
         let (mut client, peer) = production_test_client();
         let server = std::thread::spawn(move || {
@@ -2416,7 +2479,7 @@ mod tests {
             assert_eq!(read_packet(&peer), "HELLO");
             peer.send(
                 json!({"ok":true,"protocol":3,"epoch":TOKEN,"foreground_target":true,
-                    "primary_background":true,"xwayland_target":true})
+                    "primary_background":true,"xwayland_target":true,"stable_id":true})
                 .to_string()
                 .as_bytes(),
             )
@@ -2428,6 +2491,7 @@ mod tests {
         assert!(client.foreground_supported);
         assert!(client.primary_background_supported);
         assert!(client.xwayland_supported);
+        assert!(client.stable_id_supported);
         server.join().unwrap();
     }
 
@@ -3167,7 +3231,9 @@ mod tests {
                 foreground_supported: false,
                 primary_background_supported: false,
                 xwayland_supported: false,
+                stable_id_supported: false,
                 xwayland: false,
+                stable_id: None,
                 delivery_route: None,
                 lane: None,
                 owner: "input-unregistered-test-client".into(),

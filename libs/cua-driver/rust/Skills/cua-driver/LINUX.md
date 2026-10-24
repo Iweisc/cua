@@ -309,6 +309,16 @@ Background input reaches any app, as on macOS. There is no app list. Cua's
 recorded native evidence covers Calc from `libreoffice-fresh 26.2.5-3` and
 Inkscape `1.4.4-6`; for every app, verify the effect from fresh state.
 
+A Hyprland `window_id` is the window's compositor address, and Hyprland gives
+a closed window's address to the next window, usually at once. Driver
+remembers which window each id named when `list_windows`, `get_desktop_state`,
+`launch_app`, `list_apps`, or `get_window_state` returned it. Once that window
+closes, actions and `get_window_state` with its id refuse with
+`window_id_not_found`, even when a new window, native or X, holds the address.
+Call `list_windows` to get the new window's id. An id Driver never returned,
+for example after Driver restarts, names whichever window holds the address
+when it is first used.
+
 The plugin separately binds the exact live native surface and checks geometry,
 desktop availability, and other-lane conflicts. A click, scroll, or drag at a
 point outside that window, including the end of a drag, is refused with

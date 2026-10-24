@@ -134,8 +134,32 @@ fn pid_window_guarded<T: Tool + 'static>(
             .with_point_resolver(point_resolver.clone())
             .with_fallback_resolver(fallback_resolver.clone())
             .with_snapshot_resolver(snapshot_resolver.clone())
-            .with_token_pid_resolver(token_pid_resolver.clone()),
+            .with_token_pid_resolver(token_pid_resolver.clone())
+            .with_identity_check(Arc::new(hyprland_window_identity)),
     )
+}
+
+/// A Hyprland window_id is the window's address, which Hyprland gives to the
+/// next window once it closes. Refuse an id whose address now holds another
+/// window than the one Driver returned it for.
+fn hyprland_window_identity(pid: Option<i64>, window_id: u64) -> Option<ToolResult> {
+    (crate::wayland::is_wayland()
+        && crate::wayland::hyprland::is_session()
+        && crate::wayland::hyprland::window_identity(window_id).is_err())
+    .then(|| window_replaced_refusal(pid, window_id))
+}
+
+fn window_replaced_refusal(pid: Option<i64>, window_id: u64) -> ToolResult {
+    ToolResult::error(format!(
+        "window_id {window_id} named a window that has closed; Hyprland gave its address to \
+         another window. Call list_windows for the current window ids."
+    ))
+    .with_structured(json!({
+        "code": "window_id_not_found",
+        "effect": "refused",
+        "pid": pid,
+        "window_id": window_id,
+    }))
 }
 
 /// The pid an `element_token` was minted for, so a token-only action (no
@@ -311,7 +335,7 @@ impl Tool for ListAppsTool {
         let apps = tokio::task::spawn_blocking(|| -> Vec<serde_json::Value> {
             let procs = crate::proc_fs::list_processes();
             let installed = crate::installed_apps::list_installed_apps();
-            let windows = crate::wayland::list_windows_dispatch(None);
+            let (windows, identities) = crate::wayland::list_windows_with_identities(None);
 
             // An app whose launcher is not its process (`libreoffice --calc`
             // runs `soffice.bin`, `google-chrome` runs `chrome`, `gnome-terminal`
@@ -393,14 +417,15 @@ impl Tool for ListAppsTool {
                         None,
                     ),
                 };
-                let owned: Vec<Value> = windows
+                let owned: Vec<_> = windows
                     .iter()
                     .filter(|w| w.pid == Some(p.pid))
                     .filter(|w| {
                         merged.is_none_or(|idx| installed[idx].owns_window_class(&w.app_name))
                     })
-                    .map(window_record_json)
                     .collect();
+                identities.hand_out(owned.iter().copied());
+                let owned: Vec<Value> = owned.into_iter().map(window_record_json).collect();
                 out.push(json!({
                     "pid":         p.pid,
                     "bundle_id":   bundle_id,
@@ -421,12 +446,13 @@ impl Tool for ListAppsTool {
                 // `soffice.bin` showing Calc and Writer): each entry with a
                 // window is running under its own id.
                 let window_pid = by_window.get(&i).copied();
-                let owned: Vec<Value> = windows
+                let owned: Vec<_> = windows
                     .iter()
                     .filter(|w| w.pid.is_some() && w.pid == window_pid)
                     .filter(|w| app.owns_window_class(&w.app_name))
-                    .map(window_record_json)
                     .collect();
+                identities.hand_out(owned.iter().copied());
+                let owned: Vec<Value> = owned.into_iter().map(window_record_json).collect();
                 out.push(json!({
                     "pid":         window_pid.unwrap_or(0),
                     "bundle_id":   app.bundle_id.clone(),
@@ -570,10 +596,11 @@ impl Tool for ListWindowsTool {
         use cua_driver_core::tool_args::ArgsExt;
         let filter_pid = args.opt_u64("pid").map(|v| v as u32);
         let on_screen_only = args.bool_or("on_screen_only", false);
-        let mut windows =
-            tokio::task::spawn_blocking(move || crate::wayland::list_windows_dispatch(filter_pid))
-                .await
-                .unwrap_or_default();
+        let (mut windows, identities) = tokio::task::spawn_blocking(move || {
+            crate::wayland::list_windows_with_identities(filter_pid)
+        })
+        .await
+        .unwrap_or_default();
         // Exited applications can remain visible in AT-SPI/X11 as zombies;
         // never return those stale targets to callers.
         windows.retain(|window| window.pid.is_none_or(crate::proc_fs::is_process_live));
@@ -588,6 +615,7 @@ impl Tool for ListWindowsTool {
         if crate::wayland::is_wayland() {
             crate::wayland::remember_observed_window_origins(&windows);
         }
+        identities.hand_out(&windows);
         let mut lines = vec![format!("Found {} windows:", windows.len())];
         for w in &windows {
             lines.push(format!(
@@ -1273,23 +1301,21 @@ impl Tool for GetWindowStateTool {
         let popup_meta = (!crate::wayland::is_wayland())
             .then(|| crate::input::popup_window_info(xid))
             .flatten();
-        let window_meta = crate::wayland::list_windows_dispatch(Some(pid))
-            .into_iter()
-            .find(|w| w.xid == xid)
-            .or_else(|| {
-                popup_meta.as_ref().map(|popup| crate::x11::WindowInfo {
-                    xid: popup.window,
-                    pid: popup.pid,
-                    app_name: String::new(),
-                    title: popup.title.clone(),
-                    is_on_screen: true,
-                    z_index: None,
-                    x: popup.x,
-                    y: popup.y,
-                    width: popup.width,
-                    height: popup.height,
-                })
-            });
+        let (listed, identities) = crate::wayland::list_windows_with_identities(Some(pid));
+        let window_meta = listed.into_iter().find(|w| w.xid == xid).or_else(|| {
+            popup_meta.as_ref().map(|popup| crate::x11::WindowInfo {
+                xid: popup.window,
+                pid: popup.pid,
+                app_name: String::new(),
+                title: popup.title.clone(),
+                is_on_screen: true,
+                z_index: None,
+                x: popup.x,
+                y: popup.y,
+                width: popup.width,
+                height: popup.height,
+            })
+        });
         let window_matches = if crate::wayland::is_wayland() {
             window_meta.as_ref().is_some_and(|w| w.pid == Some(pid))
                 || crate::wayland::window_was_listed_for_pid(pid, xid)
@@ -1311,6 +1337,9 @@ impl Tool for GetWindowStateTool {
             return ToolResult::error(format!(
                 "Window target pid {pid}, window_id {xid} is stale or no longer running; refresh list_windows."
             ));
+        }
+        if args.opt_u64("window_id").is_some() && identities.confirm(xid).is_err() {
+            return window_replaced_refusal(Some(pid.into()), xid);
         }
 
         // Always walk the AT-SPI tree; capture the screenshot by default. The
@@ -2325,10 +2354,11 @@ fn resolve_launched_windows(
 ) -> LaunchedWindows {
     let started = std::time::Instant::now();
     loop {
-        let all = crate::wayland::list_windows_dispatch(None);
+        let (all, identities) = crate::wayland::list_windows_with_identities(None);
         if let Some(launched) = settle_launch(&all, launcher_pid, query, before, |w| {
             crate::x11::window_is_splash(w.xid)
         }) {
+            identities.hand_out(&launched.windows);
             return launched;
         }
         let launcher_exited = process_exited(launcher_pid);
@@ -12810,7 +12840,7 @@ impl Tool for GetDesktopStateTool {
             };
             // Which pid owns which window is what the agent needs before its
             // first click; without it the first action guesses `pid: 1`.
-            let mut windows = crate::wayland::list_windows_dispatch(None);
+            let (mut windows, identities) = crate::wayland::list_windows_with_identities(None);
             windows
                 .retain(|w| w.is_on_screen && w.pid.is_some_and(crate::proc_fs::is_process_live));
             if let Some(frame) = &hyprland_frame {
@@ -12830,6 +12860,7 @@ impl Tool for GetDesktopStateTool {
                 (shot_w, shot_h),
                 (screen_w, screen_h),
             )?;
+            identities.hand_out(&windows);
             Ok((
                 b64,
                 shot_w,

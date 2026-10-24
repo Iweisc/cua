@@ -604,10 +604,13 @@ fn release_pinned_window(
 }
 
 /// The plugin parses this name in `hyprland-plugin/src/cursor_layer.hpp`.
-fn layer_namespace(group: Group) -> String {
-    match group {
-        None => "cua-agent-cursor".to_owned(),
-        Some(wid) => format!("cua-agent-cursor@{wid:x}"),
+/// `stable_id` names the window Driver returned that address for, so a window
+/// that takes the address later never gets the cursor.
+fn layer_namespace(group: Group, stable_id: Option<u64>) -> String {
+    match (group, stable_id) {
+        (None, _) => "cua-agent-cursor".to_owned(),
+        (Some(wid), None) => format!("cua-agent-cursor@{wid:x}"),
+        (Some(wid), Some(stable_id)) => format!("cua-agent-cursor@{wid:x}.{stable_id:x}"),
     }
 }
 
@@ -646,7 +649,10 @@ fn create_layer(
         &surface,
         Some(output),
         Layer::Overlay,
-        layer_namespace(data.group),
+        layer_namespace(
+            data.group,
+            data.group.and_then(super::hyprland::handed_out_identity),
+        ),
         qh,
         data,
     );
@@ -1300,7 +1306,7 @@ fn redraw_output(
     dbg(&format!(
         "redraw output={} group={} origin=({}, {}) w={w} h={h} stride={stride} buf_id={buffer_id} cursors={} pending={}",
         output_label(state, target.id),
-        layer_namespace(group),
+        layer_namespace(group, None),
         layout.origin_x,
         layout.origin_y,
         painted_positions.len(),
@@ -1794,10 +1800,14 @@ mod tests {
         assert_eq!(cursor_group(&core, true), Some(0x55d0_c1a2_b3f0));
         // hyprland-plugin/tests/cursor_layer_test.cpp parses this exact name.
         assert_eq!(
-            layer_namespace(Some(0x55d0_c1a2_b3f0)),
+            layer_namespace(Some(0x55d0_c1a2_b3f0), None),
             "cua-agent-cursor@55d0c1a2b3f0"
         );
-        assert_eq!(layer_namespace(None), "cua-agent-cursor");
+        assert_eq!(
+            layer_namespace(Some(0x55d0_c1a2_b3f0), Some(0x1800_0004)),
+            "cua-agent-cursor@55d0c1a2b3f0.18000004"
+        );
+        assert_eq!(layer_namespace(None, Some(0x1800_0004)), "cua-agent-cursor");
     }
 
     #[test]

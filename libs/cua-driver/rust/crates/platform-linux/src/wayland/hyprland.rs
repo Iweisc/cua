@@ -5,11 +5,12 @@
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 const QUERY_TIMEOUT: Duration = Duration::from_secs(1);
@@ -41,6 +42,9 @@ struct Client {
     /// 0 is the focused client; larger is longer ago. Absent on old builds.
     #[serde(rename = "focusHistoryID", default)]
     focus_history: i64,
+    /// Hex. Never reused within a compositor run, unlike the address.
+    #[serde(rename = "stableId", default)]
+    stable_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -204,6 +208,8 @@ pub struct Window {
     /// Focus recency (0 = focused); the closest thing to z-order Hyprland
     /// exposes.
     pub focus_order: i64,
+    /// `None` when the compositor does not report one.
+    pub stable_id: Option<u64>,
 }
 
 pub fn is_session() -> bool {
@@ -462,6 +468,7 @@ fn windows_from_clients(clients: Vec<Client>, active: &HashSet<i64>) -> Result<V
             xwayland: c.xwayland,
             hidden: c.hidden,
             focus_order: c.focus_history,
+            stable_id: c.stable_id.and_then(|id| u64::from_str_radix(&id, 16).ok()),
         });
     }
     Ok(windows)
@@ -853,6 +860,94 @@ pub fn window_for_address(address: u64) -> Option<Window> {
         .find(|w| w.address == address)
 }
 
+/// The stable id of the window each address named when Driver returned that
+/// address to a caller as a window_id. Hyprland gives a closed window's
+/// address to the next window, usually at once, so the address alone can name
+/// a window the caller never saw. Entries outlive their windows on purpose;
+/// addresses are recycled, so the map stays small.
+fn handed_out() -> &'static Mutex<HashMap<u64, u64>> {
+    static HANDED_OUT: OnceLock<Mutex<HashMap<u64, u64>>> = OnceLock::new();
+    HANDED_OUT.get_or_init(Default::default)
+}
+
+fn lock_handed_out() -> MutexGuard<'static, HashMap<u64, u64>> {
+    handed_out().lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The stable id of each window from one enumeration, by address.
+#[derive(Default)]
+pub struct Identities(HashMap<u64, u64>);
+
+impl Identities {
+    pub fn of(windows: &[Window]) -> Self {
+        Self(
+            windows
+                .iter()
+                .filter_map(|w| Some((w.address, w.stable_id?)))
+                .collect(),
+        )
+    }
+
+    /// Record that these windows from the same enumeration were returned to a
+    /// caller, replacing whatever their addresses named before.
+    pub fn hand_out<'a>(&self, windows: impl IntoIterator<Item = &'a crate::x11::WindowInfo>) {
+        let mut handed = lock_handed_out();
+        for window in windows {
+            if let Some(id) = self.0.get(&window.xid) {
+                handed.insert(window.xid, *id);
+            }
+        }
+    }
+
+    pub fn confirm(&self, address: u64) -> Result<Option<u64>, WindowReplaced> {
+        confirm_identity(address, self.0.get(&address).copied())
+    }
+}
+
+/// The window at an address is not the one Driver returned for it.
+#[derive(Debug, PartialEq, Eq)]
+pub struct WindowReplaced;
+
+/// The stable id an action or read on `address` must find, given the stable id
+/// of the window there now (`None` when there is none). Refuses when that is
+/// not the window Driver returned for the address. An address Driver never
+/// returned (the caller found it elsewhere, or Driver restarted since) is
+/// pinned to the window there now.
+pub fn confirm_identity(address: u64, current: Option<u64>) -> Result<Option<u64>, WindowReplaced> {
+    confirm_in(&mut lock_handed_out(), address, current)
+}
+
+fn confirm_in(
+    handed: &mut HashMap<u64, u64>,
+    address: u64,
+    current: Option<u64>,
+) -> Result<Option<u64>, WindowReplaced> {
+    let Some(current) = current else {
+        // Nothing to compare: the missing-window checks refuse on their own.
+        // Keep expecting the old window, so one that maps here before the
+        // plugin binds the target still refuses there.
+        return Ok(handed.get(&address).copied());
+    };
+    if *handed.entry(address).or_insert(current) == current {
+        Ok(Some(current))
+    } else {
+        Err(WindowReplaced)
+    }
+}
+
+/// The stable id of the window Driver returned or pinned `address` for.
+pub fn handed_out_identity(address: u64) -> Option<u64> {
+    lock_handed_out().get(&address).copied()
+}
+
+/// [`confirm_identity`] against the window at `address` now.
+pub fn window_identity(address: u64) -> Result<Option<u64>, WindowReplaced> {
+    confirm_identity(
+        address,
+        window_for_address(address).and_then(|w| w.stable_id),
+    )
+}
+
 /// AT-SPI has no native Hyprland handle. Correlate only when the title is
 /// unique among this PID's mapped compositor clients, as well as AX roots.
 pub fn accessibility_window(address: u64, pid: u32) -> Option<Window> {
@@ -971,7 +1066,64 @@ mod tests {
             xwayland: Some(false),
             hidden: false,
             focus_order: 0,
+            stable_id: None,
         }
+    }
+
+    fn listed(address: u64) -> crate::x11::WindowInfo {
+        crate::x11::WindowInfo {
+            xid: address,
+            pid: Some(42),
+            app_name: "fixture".into(),
+            title: "Fixture".into(),
+            is_on_screen: true,
+            z_index: None,
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        }
+    }
+
+    #[test]
+    fn a_window_id_names_only_the_window_it_was_returned_for() {
+        // Unique to this test: the record is process-wide.
+        const ADDRESS: u64 = 0x7e57_0000_1d00;
+        let (a, b) = (0x1800_0002, 0x1800_0003);
+        let enumerated = |stable_id| {
+            let mut w = window(ADDRESS, 42);
+            w.stable_id = Some(stable_id);
+            Identities::of(&[w])
+        };
+        enumerated(a).hand_out([&listed(ADDRESS)]);
+        assert_eq!(confirm_identity(ADDRESS, Some(a)), Ok(Some(a)));
+        // A closed, and B mapped at its address.
+        assert_eq!(confirm_identity(ADDRESS, None), Ok(Some(a)));
+        assert_eq!(confirm_identity(ADDRESS, Some(b)), Err(WindowReplaced));
+        assert_eq!(enumerated(b).confirm(ADDRESS), Err(WindowReplaced));
+        // Listing B hands its id out again.
+        enumerated(b).hand_out([&listed(ADDRESS)]);
+        assert_eq!(confirm_identity(ADDRESS, Some(b)), Ok(Some(b)));
+        assert_eq!(confirm_identity(ADDRESS, Some(a)), Err(WindowReplaced));
+    }
+
+    #[test]
+    fn an_address_never_returned_is_pinned_at_first_use() {
+        let mut handed = HashMap::new();
+        assert_eq!(confirm_in(&mut handed, 0x10, None), Ok(None));
+        assert!(handed.is_empty());
+        assert_eq!(confirm_in(&mut handed, 0x10, Some(7)), Ok(Some(7)));
+        assert_eq!(confirm_in(&mut handed, 0x10, Some(8)), Err(WindowReplaced));
+    }
+
+    #[test]
+    fn client_stable_id_is_hex_and_optional() {
+        let active = HashSet::from([1]);
+        let mut c = client("0x10", 42, [800, 600]);
+        c.stable_id = Some("1800074b".into());
+        let windows = windows_from_clients(vec![c, client("0x20", 42, [800, 600])], &active);
+        let ids: Vec<_> = windows.unwrap().iter().map(|w| w.stable_id).collect();
+        assert_eq!(ids, [Some(0x1800_074b), None]);
     }
 
     #[test]

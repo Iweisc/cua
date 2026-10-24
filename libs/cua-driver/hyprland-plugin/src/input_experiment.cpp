@@ -11,6 +11,7 @@
 #include "foreground_route.hpp"
 #include "keymap_equivalence.hpp"
 #include "cursor_layer.hpp"
+#include "target_identity.hpp"
 
 #include <src/Compositor.hpp>
 #include <src/devices/IKeyboard.hpp>
@@ -1282,7 +1283,7 @@ struct InputExperiment::Impl {
             if (f.size() != 1 || c.hello) { send(c, refusal("invalid_request")); return; }
             c.hello = true;
             if (kProduction)
-                send(c, std::format(R"({{"ok":true,"protocol":3,"epoch":"{}","foreground_target":true,"primary_background":true,"xwayland_target":true}})", epoch));
+                send(c, std::format(R"({{"ok":true,"protocol":3,"epoch":"{}","foreground_target":true,"primary_background":true,"xwayland_target":true,"stable_id":true}})", epoch));
             else
                 send(c, std::format(R"({{"ok":true,"protocol":0,"epoch":"{}","challenge":"{}"}})", epoch, c.challenge));
             return;
@@ -1324,7 +1325,7 @@ struct InputExperiment::Impl {
             const auto route = command == "FOREGROUND_TARGET" ? InputRoute::primary_foreground :
                 command == "PRIMARY_TARGET" ? InputRoute::primary_background : InputRoute::independent;
             if (!bind_input_route(c.route, route)) { invalidate(c); send(c, refusal("route_mismatch")); return; }
-            if (f.size() != (kProduction ? 4u : 3u)) {
+            if (kProduction ? !production_target_fields(f.size()) : f.size() != 3u) {
                 if (kProduction) invalidate(c);
                 send(c, refusal("invalid_request")); return;
             }
@@ -1337,12 +1338,13 @@ struct InputExperiment::Impl {
             if (kProduction && !available()) { invalidate(c, false); send(c, refusal("session_unavailable")); return; }
             if (!input_layout_qualified(route, requested_cap == 2, layout_qualified())) { invalidate(c, false); send(c, refusal("unsupported_layout")); return; }
             const auto pid = number(f[1]); const auto address = number(f[2], 16);
+            const auto stable_id = f.size() == 5 ? std::optional{number(f[4], 16)} : std::nullopt;
             PHLWINDOW window;
             for (const auto& w : Desktop::windowState()->windows())
                 if (reinterpret_cast<std::uintptr_t>(w.get()) == address && static_cast<std::uint64_t>(w->getPID()) == pid) window = w;
             const bool xwayland = command == "XWAYLAND_TARGET";
-            if (!window || window->m_isX11 != xwayland || !window->m_isMapped || window->isHidden() || !window->resource() ||
-                (xwayland && !window->m_xwaylandSurface)) {
+            if (!window || !target_identity_matches(stable_id, window->m_stableID) || window->m_isX11 != xwayland ||
+                !window->m_isMapped || window->isHidden() || !window->resource() || (xwayland && !window->m_xwaylandSurface)) {
                 invalidate(c); send(c, refusal("stale_target")); return;
             }
             // Retire the old target before rebinding: even if the new target's
@@ -1924,7 +1926,8 @@ struct InputExperiment::CursorStacking {
             window = install_hook(plugin, "_ZN6Render13IHyprRenderer12renderWindowEN9Hyprutils6Memory14CSharedPointerIN7Desktop4View7CWindowEEENS3_IN7Monitor8CMonitorEEERKNSt6chrono10time_pointINSB_3_V212steady_clockENSB_8durationIlSt5ratioILl1ELl1000000000EEEEEEbNS_15eRenderPassModeEbb",
                 reinterpret_cast<void*>(render_window));
             opened = Event::bus()->m_events.layer.opened.listen([this](PHLLS ls) {
-                if (ls) pins.open(ls, ls->m_namespace, Desktop::windowState()->windows(), [](const PHLWINDOW& w) { return reinterpret_cast<std::uintptr_t>(w.get()); }, goal_box);
+                if (ls) pins.open(ls, ls->m_namespace, Desktop::windowState()->windows(), [](const PHLWINDOW& w) { return reinterpret_cast<std::uintptr_t>(w.get()); },
+                    [](const PHLWINDOW& w) { return w->m_stableID; }, goal_box);
             });
             // A window that closed on a hidden workspace never drew its cursor,
             // and releases its layer here all the same.
