@@ -37,6 +37,8 @@
 #include <src/protocols/XDGShell.hpp>
 #include <src/protocols/LayerShell.hpp>
 #include <src/render/Renderer.hpp>
+#include <src/config/ConfigValue.hpp>
+#include <src/managers/eventLoop/EventLoopManager.hpp>
 #include <src/render/pass/SurfacePassElement.hpp>
 #include <src/xwayland/XSurface.hpp>
 #include <linux/input-event-codes.h>
@@ -292,6 +294,8 @@ struct InputExperiment::Impl {
         MONITORID monitor = MONITOR_INVALID;
     } recent_app;
     Clock::time_point recent_dispatch{};
+    // Windows this lane delivered to while its session holds it. See HiddenFrames.
+    std::vector<PHLWINDOWREF> driven_windows;
 
     explicit Impl(const std::string& directory, unsigned index) : lane(index) {
 #ifdef CUA_HYPRLAND_TEST_INPUT
@@ -744,8 +748,10 @@ struct InputExperiment::Impl {
     void note_dispatch(const Client& c) {
         recent_target = c.surface;
         recent_dispatch = Clock::now();
-        if (const auto w = c.window.lock(); w && w->m_workspace)
+        if (const auto w = c.window.lock(); w && w->m_workspace) {
             recent_app = {w->getPID(), w->m_isX11, w->m_workspace->m_id, w->m_workspace->m_name, w->monitorID()};
+            if (std::ranges::find(driven_windows, w) == driven_windows.end()) driven_windows.emplace_back(w);
+        }
     }
     bool owns_reaction(wl_client* client) const {
         if (!client) return false;
@@ -2421,6 +2427,53 @@ struct InputExperiment::CursorStacking {
     }
 };
 
+// Hyprland sends frame callbacks only to the windows it draws, and apps run
+// their animations and present their changes on those callbacks. On a hidden
+// workspace a window the agent drives would stop mid-animation: a Discord
+// dialog stays transparent and ignores the click that follows it. As
+// Hyprland's own render_unfocused window rule does, each window a lane
+// delivered to gets them at misc:render_unfocused_fps until its session ends.
+struct InputExperiment::HiddenFrames {
+    // How often to look for a session's first window while no lane has one.
+    static constexpr auto kIdle = std::chrono::seconds(1);
+    InputExperiment& owner;
+    SP<CEventLoopTimer> timer;
+
+    explicit HiddenFrames(InputExperiment& input) : owner(input) {
+        timer = makeShared<CEventLoopTimer>(kIdle, [this](SP<CEventLoopTimer> self, void*) { self->updateTimeout(tick()); }, nullptr);
+        g_pEventLoopManager->addTimer(timer);
+    }
+    ~HiddenFrames() { g_pEventLoopManager->removeTimer(timer); }
+    // Returns when to run again.
+    Time::steady_dur tick() {
+        static auto fps = CConfigValue<Config::INTEGER>("misc:render_unfocused_fps");
+        bool any = false;
+        for (auto& lane : owner.lanes_) {
+            if (!lane->reservation) lane->driven_windows.clear();
+            std::erase_if(lane->driven_windows, [](const auto& w) { return !w; });
+            any = any || !lane->driven_windows.empty();
+        }
+        const auto monitor = Desktop::focusState()->monitor();
+        if (!any || !monitor || *fps <= 0) return kIdle;
+        const auto now = Time::steadyNow();
+        const auto present = [&](SP<CWLSurfaceResource> surface, const Vector2D&, void*) {
+            surface->m_stateQueue.unlockFirst(LOCK_REASON_FENCE | LOCK_REASON_FIFO | LOCK_REASON_TIMER);
+            surface->presentFeedback(now, monitor, true);
+        };
+        for (auto& lane : owner.lanes_)
+            for (const auto& ref : lane->driven_windows) {
+                const auto w = ref.lock();
+                if (!w->m_isMapped || g_pHyprRenderer->shouldRenderWindow(w)) continue;
+                if (const auto s = w->wlSurface(); s && s->resource()) s->resource()->breadthfirst(present, nullptr);
+                if (!w->m_isX11 && w->m_popupHead)
+                    w->m_popupHead->breadthfirst([&](SP<Desktop::View::CPopup> popup, void*) {
+                        if (const auto s = popup->wlSurface(); s && s->resource()) s->resource()->breadthfirst(present, nullptr);
+                    }, nullptr);
+            }
+        return std::chrono::milliseconds(1000 / *fps);
+    }
+};
+
 InputExperiment::InputExperiment(const std::string& directory, void* plugin) {
     SeatLifetime lifetime(directory);
     for (unsigned i = 0; i < lanes_.size(); ++i) lanes_[i] = std::make_unique<Impl>(directory, i);
@@ -2442,6 +2495,7 @@ InputExperiment::InputExperiment(const std::string& directory, void* plugin) {
     reaction_guards_ = std::make_unique<ReactionGuards>(*this, plugin);
     cursor_stacking_ = std::make_unique<CursorStacking>(plugin);
     state_requests_ = std::make_unique<StateRequests>(*this);
+    hidden_frames_ = std::make_unique<HiddenFrames>(*this);
 #endif
     // Seat globals come last. Clients bind a new global as soon as it is
     // announced, and destroying it after a failed hook would disconnect them.
@@ -2449,6 +2503,7 @@ InputExperiment::InputExperiment(const std::string& directory, void* plugin) {
     lifetime.publish();
 }
 InputExperiment::~InputExperiment() {
+    hidden_frames_.reset();
     state_requests_.reset();
     cursor_stacking_.reset();
     reaction_guards_.reset();

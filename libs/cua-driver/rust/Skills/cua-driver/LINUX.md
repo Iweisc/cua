@@ -405,6 +405,8 @@ not using, a window with no parent that opens up to 30 seconds after the
 agent's last input there is the agent's, so a slow app's next window stays off
 your workspace. A window of that app you open yourself from outside it, such
 as from a launcher, in those 30 seconds opens on the agent's workspace too.
+A window you act on keeps drawing on a hidden workspace until your session
+ends, so its animations finish and its screenshots are current.
 Such a window
 never ends your fullscreen or maximized window, and on a
 workspace you can see it floats, so it never splits or resizes your tile.

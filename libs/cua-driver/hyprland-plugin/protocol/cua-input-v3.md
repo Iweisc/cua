@@ -360,6 +360,16 @@ focuses it. On the human's workspace it stacks directly under the human's
 window, also when that window is fullscreen. `input.withheld_initial_focus`
 counts these windows.
 
+Hyprland sends frame callbacks only to the windows it draws, and clients run
+their animations and present their changes on them. A window on a hidden
+workspace stops mid-animation, so a Chromium dialog that fades in never takes
+the click that follows it. While a lane is claimed, every window it delivered
+to gets what Hyprland's `render_unfocused` window rule would give it whenever
+Hyprland does not draw it: frame callbacks and discarded presentation feedback
+for its surfaces and popups, at `misc:render_unfocused_fps`, and none when that
+is 0. The list ends with the claim. Chromium keeps drawing on its own after
+that once it has had these callbacks.
+
 A client can also ask to change its own state. Hyprland applies
 `xdg_toplevel.set_fullscreen`, `unset_fullscreen`, `set_maximized`, and
 `unset_maximized`, and an X window's `_NET_WM_STATE` fullscreen and maximize

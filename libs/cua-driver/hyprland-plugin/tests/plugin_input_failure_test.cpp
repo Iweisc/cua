@@ -30,6 +30,7 @@ struct InputExperiment::DesktopListeners {};
 struct InputExperiment::ReactionGuards {};
 struct InputExperiment::StateRequests {};
 struct InputExperiment::CursorStacking {};
+struct InputExperiment::HiddenFrames {};
 class PrimaryTrace {};
 InputExperiment::InputExperiment(const std::string&, void*) {
     ++created;
