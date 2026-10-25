@@ -1338,6 +1338,25 @@ impl ToolRegistry {
         self.input_gate = Some(Box::new(gate));
     }
 
+    /// Whether the input gate would refuse this call with foreground delivery,
+    /// so its hint never suggests a retry that is bound to be refused.
+    fn foreground_refused(&self, name: &str, args: &Value) -> bool {
+        let name = renamed_tool(name).unwrap_or(name);
+        let Some(gate) = self
+            .input_gate
+            .as_ref()
+            .filter(|_| is_physical_desktop_action(name))
+        else {
+            return false;
+        };
+        let mut foreground = args.clone();
+        let Some(fields) = foreground.as_object_mut() else {
+            return false;
+        };
+        fields.insert("delivery_mode".into(), serde_json::json!("foreground"));
+        gate(name, &foreground).is_some()
+    }
+
     pub fn retain_runtime_cleanup(&mut self, cleanup: impl FnOnce() + Send + Sync + 'static) {
         self.runtime_cleanups
             .push(RuntimeCleanup(Some(Box::new(cleanup))));
@@ -1704,7 +1723,8 @@ impl ToolRegistry {
         context: &crate::session_authorization::EffectiveAuthorizationContext,
         evidence: &TrustedInvocationEvidence,
     ) -> ToolResult {
-        let seed = crate::recovery_hint::Seed::from_args(&args);
+        let seed = crate::recovery_hint::Seed::from_args(&args)
+            .with_foreground_off(self.foreground_refused(name, &args));
         let mut result = self
             .invoke_authorized_unannotated(name, args, context, evidence)
             .await;
@@ -5103,6 +5123,63 @@ resources:
             assert_ne!(result.is_error, Some(true), "{name}");
         }
         assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    struct CoveredProbe(super::ToolDef);
+
+    #[async_trait::async_trait]
+    impl super::Tool for CoveredProbe {
+        fn def(&self) -> &super::ToolDef {
+            &self.0
+        }
+
+        async fn invoke(&self, _args: serde_json::Value) -> crate::protocol::ToolResult {
+            crate::protocol::ToolResult::error("background_unavailable (xwayland_target_covered)")
+                .with_structured(serde_json::json!({
+                    "code": "background_unavailable",
+                    "reason": "xwayland_target_covered",
+                    "effect": "refused"
+                }))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refusal_never_suggests_the_foreground_retry_the_input_gate_refuses() {
+        for foreground_off in [false, true] {
+            let mut registry = super::ToolRegistry::new();
+            registry.register(Box::new(CoveredProbe(super::ToolDef {
+                name: "click".into(),
+                description: "test".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+                read_only: false,
+                destructive: false,
+                idempotent: false,
+                open_world: false,
+            })));
+            registry.set_input_gate(move |_, args| {
+                (foreground_off && args["delivery_mode"] == "foreground").then(|| {
+                    crate::protocol::ToolResult::error("gated").with_structured(
+                        serde_json::json!({"code": "global_input_disabled", "effect": "refused"}),
+                    )
+                })
+            });
+            let result = registry
+                .invoke_with_context(
+                    "click",
+                    serde_json::json!({"pid": 10, "window_id": 20, "x": 1, "y": 2}),
+                    standard_context(),
+                )
+                .await;
+            let structured = result.structured_content.expect("structured refusal");
+            assert_eq!(structured["reason"], "xwayland_target_covered");
+            let hint = structured["hint"].as_str().expect("hint");
+            assert_eq!(
+                hint.contains("delivery_mode:\"foreground\""),
+                !foreground_off,
+                "{hint}"
+            );
+            assert!(hint.chars().count() <= crate::recovery_hint::MAX_HINT_CHARS, "{hint}");
+        }
     }
 
     #[tokio::test]

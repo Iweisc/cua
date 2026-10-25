@@ -79,6 +79,8 @@ pub struct Seed {
     target_id: Option<String>,
     tab_id: Option<String>,
     desktop_target: bool,
+    /// The platform would refuse this call with foreground delivery.
+    foreground_off: bool,
 }
 
 impl Seed {
@@ -105,7 +107,13 @@ impl Seed {
             desktop_target: target
                 .is_some_and(|t| t.get("kind").and_then(Value::as_str) == Some("desktop"))
                 || args.get("scope").and_then(Value::as_str) == Some("desktop"),
+            foreground_off: false,
         }
+    }
+
+    pub fn with_foreground_off(mut self, off: bool) -> Self {
+        self.foreground_off = off;
+        self
     }
 }
 
@@ -273,6 +281,8 @@ struct Rule {
 }
 
 const FOREGROUND_CONDITION: &str = "only if the user allows the window to come forward";
+const FOREGROUND_OFF: &str =
+    "Foreground delivery is off here, and the user must not be asked to move windows.";
 
 /// Every refusal code that carries a hint, with the hint. Add a row here to
 /// cover a new code; the coverage test checks each row.
@@ -301,8 +311,8 @@ static RULES: &[Rule] = &[
         build: |c| {
             RecoveryHint::new(
                 "This would take over the user's keyboard or mouse, so nothing was sent. Target the \
-                 window (pid, window_id) in the background. That works on any window, even on another \
-                 workspace. Desktop or foreground input needs the user to opt in.",
+                 window (pid, window_id) in the background, even on another workspace. If that is \
+                 refused, report the step as blocked. Never ask the user to move windows.",
             )
             .call(c.read_window().or_else(|| {
                 Some(NextCall {
@@ -780,8 +790,12 @@ pub fn covered_codes() -> impl Iterator<Item = &'static str> {
 
 fn background_unavailable(c: &Ctx) -> RecoveryHint {
     // A refusal with a working background route leads with it, then names the
-    // foreground retry with its condition.
-    let foreground = format!("Retry with delivery_mode:\"foreground\" {FOREGROUND_CONDITION}.");
+    // foreground retry with its condition, unless that retry would be refused.
+    let foreground = if c.seed.foreground_off {
+        FOREGROUND_OFF.to_owned()
+    } else {
+        format!("Retry with delivery_mode:\"foreground\" {FOREGROUND_CONDITION}.")
+    };
     match (c.tool, c.reason()) {
         _ if c.structured.get("window").is_some() => RecoveryHint::new(
             "That desktop point is over a background app, so the action would use the user's pointer. \
@@ -811,6 +825,12 @@ fn background_unavailable(c: &Ctx) -> RecoveryHint {
         ))
         .call(c.read_window()),
         (_, Some("session_unavailable")) => session_unavailable(),
+        // Hyprland: X routes the agent's pointer by X stacking.
+        (_, Some("xwayland_target_covered")) => RecoveryHint::new(format!(
+            "An X window above this point would take the click. Keys still reach this window: use \
+             Tab, Return or shortcuts. {foreground} Otherwise report the step as blocked."
+        ))
+        .call(c.read_window()),
         // Hyprland: the person's keyboard focus is in the target's app.
         (_, Some("primary_keyboard_busy")) => RecoveryHint::new(
             "The user is typing in this app, so keys are refused: they could reach the user's window. \
