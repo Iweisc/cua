@@ -112,13 +112,15 @@ pub const ENABLE_WAYLAND_ENV: &str = "CUA_DRIVER_RS_ENABLE_WAYLAND";
 /// `CUA_DRIVER_RS_ENABLE_WAYLAND=1`. Any value other than empty / `0` /
 /// `false` enables it.
 pub fn wayland_enabled() -> bool {
-    match std::env::var(ENABLE_WAYLAND_ENV) {
-        Ok(v) => {
-            let v = v.trim();
-            !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
-        }
-        Err(_) => false,
-    }
+    wayland_flag(std::env::var(ENABLE_WAYLAND_ENV).ok().as_deref())
+}
+
+/// Whether a value of [`ENABLE_WAYLAND_ENV`] enables the backend.
+pub fn wayland_flag(value: Option<&str>) -> bool {
+    value.is_some_and(|v| {
+        let v = v.trim();
+        !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
+    })
 }
 
 /// True when this is an opted-in Wayland desktop session.

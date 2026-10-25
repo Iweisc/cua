@@ -587,6 +587,25 @@ fn append_platform_probes(report: &mut Report) {
     append_hyprland_probes(report);
 }
 
+/// The running daemon's own setting. Agents run `doctor` from shells that
+/// lack the variable the daemon was started with.
+#[cfg(target_os = "linux")]
+fn daemon_wayland_enabled() -> Option<bool> {
+    use platform_linux::wayland;
+    if !cua_driver_core::daemon::is_daemon_listening(&crate::serve::default_socket_path()) {
+        return None;
+    }
+    let pid = crate::serve::read_pid_file(&crate::serve::default_pid_file_path())?;
+    let environ = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+    let prefix = format!("{}=", wayland::ENABLE_WAYLAND_ENV);
+    let value = environ
+        .split(|byte| *byte == 0)
+        .find_map(|var| var.strip_prefix(prefix.as_bytes()));
+    Some(wayland::wayland_flag(
+        value.and_then(|v| std::str::from_utf8(v).ok()),
+    ))
+}
+
 #[cfg(target_os = "linux")]
 fn append_hyprland_probes(report: &mut Report) {
     use platform_linux::wayland;
@@ -594,9 +613,13 @@ fn append_hyprland_probes(report: &mut Report) {
     if !wayland::hyprland::is_session() {
         return;
     }
-    if !wayland::wayland_enabled() {
+    let (enabled, whose) = match daemon_wayland_enabled() {
+        Some(enabled) => (enabled, "the running daemon"),
+        None => (wayland::wayland_enabled(), "a daemon started from this shell"),
+    };
+    if !enabled {
         report.push(
-            Probe::warn("Hyprland input", "Wayland backend disabled")
+            Probe::warn("Hyprland input", format!("Wayland backend disabled for {whose}"))
                 .with_detail(format!(
                     "start the daemon with {}=1; without it input falls back to X11 and cannot reach native Wayland windows.",
                     wayland::ENABLE_WAYLAND_ENV
