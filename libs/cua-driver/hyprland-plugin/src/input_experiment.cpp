@@ -1411,7 +1411,7 @@ struct InputExperiment::Impl {
             if (f.size() != 1 || c.hello) { send(c, refusal("invalid_request")); return; }
             c.hello = true;
             if (kProduction)
-                send(c, std::format(R"({{"ok":true,"protocol":3,"epoch":"{}","foreground_target":true,"primary_background":true,"xwayland_target":true,"stable_id":true,"popup_input":true}})", epoch));
+                send(c, std::format(R"({{"ok":true,"protocol":3,"epoch":"{}","foreground_target":true,"primary_background":true,"xwayland_target":true,"stable_id":true,"popup_input":true,"xsend_key":true}})", epoch));
             else
                 send(c, std::format(R"({{"ok":true,"protocol":0,"epoch":"{}","challenge":"{}"}})", epoch, c.challenge));
             return;
@@ -1546,10 +1546,15 @@ struct InputExperiment::Impl {
             send(c, std::format(R"({{"ok":true,"target":"{}","revision":{},"width":{},"height":{},"agent_bound":{}}})",
                 c.token, c.revision, c.geometry[2], c.geometry[3], agent_bound)); return;
         }
-        const std::uint64_t cap = command == "CLICK" ? 1 : command == "KEY" ? 2 : command == "SCROLL" ? 4 : command == "DRAG" ? 8 :
+        // Driver sends this key to the X window itself, as an event that
+        // carries its own modifiers. Stock Qt 5 builds text with the modifier
+        // state of the keyboard it found at startup, the human's, which the
+        // agent's X keyboard never changes. The plugin admits and records it.
+        const bool xsend = kProduction && command == "XSEND_KEY";
+        const std::uint64_t cap = command == "CLICK" ? 1 : command == "KEY" || xsend ? 2 : command == "SCROLL" ? 4 : command == "DRAG" ? 8 :
             command == "ACTIVATE" && kProduction && c.route == InputRoute::primary_foreground ? 16 : 0;
-        const std::size_t count = command == "CLICK" ? 8 : command == "KEY" ? 6 : command == "SCROLL" ? 8 : command == "ACTIVATE" ? 4 : 9;
-        if (!cap) { send(c, refusal("unsupported")); return; }
+        const std::size_t count = command == "CLICK" ? 8 : command == "KEY" || xsend ? 6 : command == "SCROLL" ? 8 : command == "ACTIVATE" ? 4 : 9;
+        if (!cap || (xsend && (!c.xwayland || c.route != InputRoute::independent))) { send(c, refusal("unsupported")); return; }
         if (f.size() != count) { send(c, refusal("invalid_request")); return; }
         const auto sequence = number(f[1]);
         if (sequence <= c.sequence) { send(c, refusal("replay")); return; }
@@ -1605,16 +1610,18 @@ struct InputExperiment::Impl {
             primary_background_request(c, f, cap);
             return;
         }
-        if (command == "KEY") {
+        if (command == "KEY" || xsend) {
             const auto code = number(f[4]); const auto mods = number(f[5]);
             if (code == 0 || code > 247 || mods > 15 || code == 58 || code == 69 || code == 70) { send(c, refusal("unsupported")); return; }
             if (!consume_grant(c, cap)) return;
-            if (!keyboard_enter(c)) { send(c, refusal("client_not_bound")); return; }
-            // Every key is released in this handler; sync_key_repeat relies on it.
-            const std::array<std::uint32_t, 4> keys{42, 29, 56, 125};
-            for (unsigned i = 0; i < 4; ++i) if ((mods & (1u << i)) && keys[i] != code) key(keys[i], true);
-            key(code, true); key(code, false);
-            for (int i = 3; i >= 0; --i) if ((mods & (1u << i)) && keys[i] != code) key(keys[i], false);
+            if (!xsend) {
+                if (!keyboard_enter(c)) { send(c, refusal("client_not_bound")); return; }
+                // Every key is released in this handler; sync_key_repeat relies on it.
+                const std::array<std::uint32_t, 4> keys{42, 29, 56, 125};
+                for (unsigned i = 0; i < 4; ++i) if ((mods & (1u << i)) && keys[i] != code) key(keys[i], true);
+                key(code, true); key(code, false);
+                for (int i = 3; i >= 0; --i) if ((mods & (1u << i)) && keys[i] != code) key(keys[i], false);
+            }
         } else {
             const auto x = real(f[4]), y = real(f[5]);
             const auto target = pointer_target_at(c, x, y, command == "DRAG");

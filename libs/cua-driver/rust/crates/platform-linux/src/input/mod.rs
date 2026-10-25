@@ -4152,6 +4152,11 @@ fn send_key_to_target(
     Ok(())
 }
 
+/// The X keycode that types `ch`, and whether it needs Shift.
+pub(crate) fn x_key_for_char(mapping: &GetKeyboardMappingReply, ch: char) -> Option<(u8, bool)> {
+    char_to_keycode_shift(mapping, mpx_keyboard::keysym_for_char(ch))
+}
+
 /// Find the keycode that emits `keysym`, plus whether Shift must be held (the
 /// keysym sits in the shifted column of the keyboard map). Prefers the
 /// unshifted column when a keysym appears in both. Keysym for ASCII / Latin-1

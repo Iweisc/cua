@@ -29,6 +29,7 @@ pub(super) const UNAVAILABLE: &str = "xwayland_unavailable";
 pub(super) const SEAT_UNAVAILABLE: &str = "xwayland_seat_unavailable";
 pub(super) const COVERED: &str = "xwayland_target_covered";
 pub(super) const ISOLATION_FAILED: &str = "xwayland_isolation_failed";
+pub(super) const TEXT_KEY_UNMAPPED: &str = "xwayland_text_key_unmapped";
 /// Set by `libs/cua-driver/xwayland/build.sh` as the server vendor string.
 const AGENT_FOCUS_VENDOR: &[u8] = b"The X.Org Foundation (cua-xwayland-agent-focus)";
 
@@ -40,6 +41,9 @@ pub(super) fn detail(code: &str) -> &'static str {
             "another app's X window covers this point, and X routes pointer input by \
              X stacking (Hyprland keeps windows on hidden workspaces mapped); keyboard \
              actions still reach this window"
+        }
+        TEXT_KEY_UNMAPPED => {
+            "the X keyboard map has no key for this character without AltGr, so it was not typed"
         }
         _ => "the agent seat could not be moved onto its own X master pair",
     }
@@ -68,6 +72,13 @@ pub(super) enum Need {
 
 pub(super) struct Prepared {
     pointer: u16,
+}
+
+/// An X keycode for a character of typed text, and whether it needs Shift.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct TextKey {
+    keycode: u8,
+    shift: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -574,6 +585,59 @@ impl State {
             fail.code
         })
     }
+}
+
+/// The key that types `ch` in the X server's keyboard map, which is the one
+/// Qt translates keys with.
+pub(super) fn text_key(ch: char) -> Result<TextKey, &'static str> {
+    let mut state = STATE.lock().unwrap_or_else(|poison| poison.into_inner());
+    let x = state.connection()?;
+    let result = (|| {
+        let mapping = x.conn.get_keyboard_mapping(8, 248)?.reply()?;
+        let (keycode, shift) =
+            crate::input::x_key_for_char(&mapping, ch).ok_or(refuse(TEXT_KEY_UNMAPPED))?;
+        Ok(TextKey { keycode, shift })
+    })();
+    state.settle(result)
+}
+
+/// Sends `key` to `window` as a press and release that carry their own
+/// modifiers. Stock Qt 5 builds text with the modifier state of the keyboard it
+/// found at startup, the human's, which the agent's X keyboard never changes,
+/// but uses the state in a key event another client sent.
+pub(super) fn send_text_key(window: u32, key: TextKey) -> Result<(), &'static str> {
+    let mut state = STATE.lock().unwrap_or_else(|poison| poison.into_inner());
+    let x = state.connection()?;
+    let result = (|| {
+        let modifiers = if key.shift {
+            xproto::KeyButMask::SHIFT
+        } else {
+            xproto::KeyButMask::from(0u16)
+        };
+        for (response_type, mask) in [
+            (xproto::KEY_PRESS_EVENT, xproto::EventMask::KEY_PRESS),
+            (xproto::KEY_RELEASE_EVENT, xproto::EventMask::KEY_RELEASE),
+        ] {
+            let event = xproto::KeyPressEvent {
+                response_type,
+                detail: key.keycode,
+                sequence: 0,
+                time: x11rb::CURRENT_TIME,
+                root: x.root,
+                event: window,
+                child: x11rb::NONE,
+                root_x: 0,
+                root_y: 0,
+                event_x: 0,
+                event_y: 0,
+                state: modifiers,
+                same_screen: true,
+            };
+            x.conn.send_event(false, window, mask, event)?.check()?;
+        }
+        Ok(())
+    })();
+    state.settle(result)
 }
 
 /// Isolate `seat`, then focus or check the target as `need` requires. Keep the

@@ -160,7 +160,11 @@ pub(crate) fn text_actions(text: &str) -> Result<Vec<Action>> {
                 b')' => (11, true),
                 _ => bail!("unsupported Hyprland text control character"),
             };
-            Ok(Action::TextKey { keycode, shift })
+            Ok(Action::TextKey {
+                keycode,
+                shift,
+                byte,
+            })
         })
         .collect()
 }
@@ -413,6 +417,8 @@ pub enum Action {
     TextKey {
         keycode: u32,
         shift: bool,
+        // The ASCII character, for an X target that takes it as an X event.
+        byte: u8,
     },
     Click {
         x: f64,
@@ -448,6 +454,10 @@ struct Client {
     // Background clicks and scrolls reach the target's popups, which may
     // extend past the window, so the plugin judges points outside it.
     popup_input_supported: bool,
+    // The plugin admits a text key that Driver sends to the X window itself.
+    xsend_key_supported: bool,
+    // The target runs Qt 5's X backend; read once per target.
+    qt5_xcb: Option<bool>,
     // The target is an X window; set per call from Hyprland's client list.
     xwayland: bool,
     // The stable id the window at `address` must carry; set per call.
@@ -610,6 +620,8 @@ impl Client {
             xwayland_supported: false,
             stable_id_supported: false,
             popup_input_supported: false,
+            xsend_key_supported: false,
+            qt5_xcb: None,
             xwayland: false,
             stable_id: None,
             delivery_route: None,
@@ -658,6 +670,8 @@ impl Client {
             self.protocol == InputProtocol::Production && hello["stable_id"] == true;
         self.popup_input_supported =
             self.protocol == InputProtocol::Production && hello["popup_input"] == true;
+        self.xsend_key_supported =
+            self.protocol == InputProtocol::Production && hello["xsend_key"] == true;
         if self.protocol == InputProtocol::Experiment {
             self.challenge = hex_field(&hello, "challenge")?;
         } else {
@@ -825,6 +839,24 @@ impl Client {
                 );
                 return Ok(json!({"ok":false,"code":POINT_OUTSIDE_WINDOW,"detail":detail}));
             }
+            // Stock Qt 5 loses the agent keyboard's Shift, so its text keys go
+            // as X events that carry their own modifiers. See send_text_key.
+            let xsend = match &action {
+                Action::TextKey { byte, .. }
+                    if binding == TargetBinding::Xwayland
+                        && self.xsend_key_supported
+                        && self.qt5_xcb() =>
+                {
+                    match super::xwayland_seat::text_key(char::from(*byte)) {
+                        Ok(key) => Some(key),
+                        Err(code) => {
+                            let detail = super::xwayland_seat::detail(code);
+                            return Ok(json!({"ok":false,"code":code,"detail":detail}));
+                        }
+                    }
+                }
+                _ => None,
+            };
             // Held until this attempt ends, so the X side is released on every path.
             let _isolation = if binding == TargetBinding::Xwayland {
                 let field = |name| {
@@ -851,8 +883,26 @@ impl Client {
             };
             self.sequence = self.sequence.checked_add(1).context("sequence exhausted")?;
             let packet = action.packet(self.sequence, &token, revision, width, height)?;
+            // A text key's packet is KEY. The plugin admits and records it as
+            // XSEND_KEY without sending it, and Driver sends it after that.
+            let packet = match xsend {
+                Some(_) => format!("XSEND_{packet}"),
+                None => packet,
+            };
             let mut reply =
                 self.dispatch_routed_with_started(&packet, is_drag, &mut started, route, binding)?;
+            if let Some(key) = xsend.filter(|_| reply["ok"] == true) {
+                let xid = target["xid"]
+                    .as_u64()
+                    .and_then(|xid| u32::try_from(xid).ok())
+                    .context("missing XWayland xid")?;
+                if let Err(code) = super::xwayland_seat::send_text_key(xid, key) {
+                    return Err(unknown_dispatch(
+                        anyhow::anyhow!("{}", super::xwayland_seat::detail(code)),
+                        0,
+                    ));
+                }
+            }
             // Both refusals precede any input. xwayland_focus_changed means
             // Hyprland may have restacked X windows since the coverage check.
             let retry = ["stale_geometry", "xwayland_focus_changed"]
@@ -943,6 +993,13 @@ impl Client {
             reply["delivery"] = json!({"mode":route.mode(),"delivered_count":1});
         }
         Ok(reply)
+    }
+
+    fn qt5_xcb(&mut self) -> bool {
+        let pid = self.pid;
+        *self
+            .qt5_xcb
+            .get_or_insert_with(|| crate::input::targeted::uses_qt5_xcb(pid))
     }
 
     fn check_route(&self, route: DeliveryRoute) -> Result<()> {
@@ -1061,7 +1118,7 @@ impl Action {
         let prefix = format!("{sequence} {token} {revision}");
         Ok(match self {
             Self::Activate => format!("ACTIVATE {prefix}"),
-            Self::TextKey { keycode, shift } => {
+            Self::TextKey { keycode, shift, .. } => {
                 ensure!((1..=57).contains(keycode), "unsupported text key");
                 format!("KEY {prefix} {keycode} {}", u8::from(*shift))
             }
@@ -2423,7 +2480,8 @@ mod tests {
         assert_eq!(
             need(Action::TextKey {
                 keycode: 30,
-                shift: false
+                shift: false,
+                byte: b'a',
             }),
             Need::Keyboard
         );
@@ -3466,6 +3524,8 @@ mod tests {
                 xwayland_supported: false,
                 stable_id_supported: false,
                 popup_input_supported: false,
+                xsend_key_supported: false,
+                qt5_xcb: None,
                 xwayland: false,
                 stable_id: None,
                 delivery_route: None,

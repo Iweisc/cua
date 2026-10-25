@@ -46,10 +46,11 @@ its original seat names.
 The request sequence for every Driver-admitted action is:
 
 1. Send `HELLO` once per connection. The response is
-   `{"ok":true,"protocol":3,"epoch":"<epoch>","foreground_target":true,"primary_background":true,"xwayland_target":true,"stable_id":true,"popup_input":true}`
+   `{"ok":true,"protocol":3,"epoch":"<epoch>","foreground_target":true,"primary_background":true,"xwayland_target":true,"stable_id":true,"popup_input":true,"xsend_key":true}`
    for a production plugin implementing the foreground, primary-background,
-   and XWayland extensions, the stable-id target field, and
-   [pointer targets](#pointer-targets) on the window's popups. Driver must
+   and XWayland extensions, the stable-id target field,
+   [pointer targets](#pointer-targets) on the window's popups, and `XSEND_KEY`
+   on X windows. Driver must
    require each explicit capability before using its route or field.
 2. Send `CLAIM`. The response is `{"ok":true,"lane":0}` or lane `1`.
 3. For background input, send `TARGET <pid> <hex-address> <capability>`.
@@ -509,6 +510,16 @@ These rules differ from native targets:
 - X apps show menus and dialogs as new windows. A menu or dialog that reacts
   to agent input opens as [Reactions to background input](#reactions-to-background-input)
   describes, without initial focus.
+- `XSEND_KEY` takes the fields of `KEY` and is admitted, refused, and recorded
+  exactly as `KEY` is, but sends nothing: after its acknowledgement Driver sends
+  the key to the X window as an X event whose state carries its modifiers.
+  Stock Qt 5, which apps such as DaVinci Resolve bundle, builds text with the
+  modifier state of the keyboard it found at startup, the human's, which the
+  agent seat's X keyboard never changes, so it would type every shifted
+  character unshifted. It uses the state of a key event another client sent.
+  Driver sends the keys of a text this way to an X window whose process loads
+  Qt 5's X backend, and looks each character up in the X server's keyboard map,
+  which is the one Qt translates with. Other keys and other apps use `KEY`.
 
 ## Exact-target foreground extension
 
