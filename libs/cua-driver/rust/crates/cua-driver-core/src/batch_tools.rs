@@ -1275,6 +1275,16 @@ impl Recovery {
             });
         }
         let code = report.get("code").and_then(Value::as_str);
+        if code == Some(crate::snapshot_store::PERSON_USED_WINDOW) {
+            return Some(Self {
+                window: last.clone(),
+                screenshot: true,
+                why: format!(
+                    "the person used window {} after your last read; its state now follows, act on that",
+                    last.window_id
+                ),
+            });
+        }
         if code == Some("screenshot_context_missing") || message.starts_with("No screenshot") {
             return Some(Self {
                 window: last.clone(),

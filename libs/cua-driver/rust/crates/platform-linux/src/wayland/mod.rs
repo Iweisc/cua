@@ -17,6 +17,7 @@ pub mod hyprland_input;
 pub mod kwin_helper;
 pub mod overlay;
 pub mod persistent_vptr;
+pub(crate) mod person_focus;
 pub(crate) mod portal;
 pub mod portal_screenshot;
 mod primary_seat;

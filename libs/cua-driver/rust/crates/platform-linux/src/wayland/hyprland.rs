@@ -288,6 +288,11 @@ fn ipc_path() -> Result<PathBuf> {
     Ok(runtime.join("hypr").join(signature).join(".socket.sock"))
 }
 
+/// The socket Hyprland announces events on, focus changes among them.
+pub(super) fn event_socket_path() -> Result<PathBuf> {
+    Ok(ipc_path()?.with_file_name(".socket2.sock"))
+}
+
 pub(super) fn peer_pid(fd: RawFd) -> Result<libc::pid_t> {
     let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
     let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;

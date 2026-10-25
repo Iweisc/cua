@@ -4919,8 +4919,13 @@ fn isolated_hyprland_task_error(error: tokio::task::JoinError, acknowledged: boo
     )))
 }
 
+/// Starts plugin input to `target`, a (pid, window address), on a blocking
+/// worker. Refused before anything is sent when the person used the window
+/// after the agent's last read of it.
 fn spawn_isolated_hyprland(
     args: &Value,
+    target: (u32, u64),
+    foreground: bool,
     work: impl FnOnce(crate::wayland::hyprland_input::ActionCancellation) -> anyhow::Result<Value>
         + Send
         + 'static,
@@ -4932,14 +4937,29 @@ fn spawn_isolated_hyprland(
     ToolResult,
 > {
     use cua_driver_core::session;
+    let (pid, xid) = target;
+    if let Some(refusal) = cua_driver_core::snapshot_store::current_runtime_store::<
+        crate::atspi::snapshot::AtspiSnapshot,
+    >()
+    .and_then(|store| store.person_used_window(pid as i32, xid))
+    {
+        return Err(refusal);
+    }
+    let unadmitted = |detail: &str| {
+        if foreground {
+            foreground_hyprland_refusal("authenticated admitted lifecycle required")
+        } else {
+            isolated_hyprland_refusal(detail.to_owned())
+        }
+    };
     let owner = named_session_cursor_key(args)
-        .ok_or_else(|| isolated_hyprland_refusal("authenticated lifecycle required"))?;
+        .ok_or_else(|| unadmitted("authenticated lifecycle required"))?;
     let transport_owner = args
         .get("_transport_session_id")
         .and_then(Value::as_str)
         .unwrap_or(&owner);
     let snapshot = session::session_snapshot(&owner, transport_owner, std::time::Duration::ZERO)
-        .ok_or_else(|| isolated_hyprland_refusal("admitted lifecycle required"))?;
+        .ok_or_else(|| unadmitted("admitted lifecycle required"))?;
     // Retain admission before spawning: aborting the async caller must not
     // complete session teardown while its native worker still owns input.
     let lifecycle = session::begin_session_dispatch(
@@ -4950,7 +4970,7 @@ fn spawn_isolated_hyprland(
         snapshot.transport,
         snapshot.client_kind,
     )
-    .map_err(isolated_hyprland_refusal)?;
+    .map_err(unadmitted)?;
     let (guard, cancellation) = crate::wayland::hyprland_input::ActionCancellation::invocation();
     let dispatch = tokio::task::spawn_blocking(move || {
         let _lifecycle = lifecycle;
@@ -4966,12 +4986,13 @@ async fn isolated_hyprland_action(
     action: crate::wayland::hyprland_input::Action,
 ) -> ToolResult {
     let owner = named_session_cursor_key(args);
-    let (_cancellation, dispatch) = match spawn_isolated_hyprland(args, move |cancellation| {
-        crate::wayland::hyprland_input::execute(owner, pid, xid, action, cancellation)
-    }) {
-        Ok(dispatch) => dispatch,
-        Err(refusal) => return refusal,
-    };
+    let (_cancellation, dispatch) =
+        match spawn_isolated_hyprland(args, (pid, xid), false, move |cancellation| {
+            crate::wayland::hyprland_input::execute(owner, pid, xid, action, cancellation)
+        }) {
+            Ok(dispatch) => dispatch,
+            Err(refusal) => return refusal,
+        };
     match dispatch.await {
         Ok(result) => isolated_hyprland_result(result),
         Err(error) => isolated_hyprland_task_error(error, false),
@@ -4997,12 +5018,19 @@ async fn foreground_hyprland_action(
         return foreground_hyprland_refusal("production Hyprland input plugin is unavailable");
     }
     let owner = named_session_cursor_key(args);
-    let (_cancellation, dispatch) = match spawn_isolated_hyprland(args, move |cancellation| {
-        crate::wayland::hyprland_input::execute_foreground(owner, pid, xid, action, cancellation)
-    }) {
-        Ok(dispatch) => dispatch,
-        Err(_) => return foreground_hyprland_refusal("authenticated admitted lifecycle required"),
-    };
+    let (_cancellation, dispatch) =
+        match spawn_isolated_hyprland(args, (pid, xid), true, move |cancellation| {
+            crate::wayland::hyprland_input::execute_foreground(
+                owner,
+                pid,
+                xid,
+                action,
+                cancellation,
+            )
+        }) {
+            Ok(dispatch) => dispatch,
+            Err(refusal) => return refusal,
+        };
     hyprland_input_result(
         match dispatch.await {
             Ok(result) => result,
@@ -5025,18 +5053,19 @@ async fn foreground_hyprland_scroll(
         return foreground_hyprland_refusal("production Hyprland input plugin is unavailable");
     }
     let owner = named_session_cursor_key(args);
-    let (_cancellation, dispatch) = match spawn_isolated_hyprland(args, move |cancellation| {
-        crate::wayland::hyprland_input::execute_foreground_scroll(
-            owner,
-            pid,
-            xid,
-            actions,
-            cancellation,
-        )
-    }) {
-        Ok(dispatch) => dispatch,
-        Err(_) => return foreground_hyprland_refusal("authenticated admitted lifecycle required"),
-    };
+    let (_cancellation, dispatch) =
+        match spawn_isolated_hyprland(args, (pid, xid), true, move |cancellation| {
+            crate::wayland::hyprland_input::execute_foreground_scroll(
+                owner,
+                pid,
+                xid,
+                actions,
+                cancellation,
+            )
+        }) {
+            Ok(dispatch) => dispatch,
+            Err(refusal) => return refusal,
+        };
     hyprland_input_result(
         match dispatch.await {
             Ok(result) => result,
@@ -5119,6 +5148,29 @@ async fn focus_hyprland_foreground(
 }
 
 #[cfg(test)]
+#[test]
+fn input_to_a_window_the_person_used_is_refused_before_admission() {
+    cua_driver_core::tool::with_runtime_scope("person-used-input".into(), || {
+        let state = ToolState::new();
+        state
+            .snapshots
+            .publish(7, 9, crate::atspi::snapshot::AtspiSnapshot::from_nodes(&[]));
+        assert_eq!(state.snapshots.retire_person_window(9), 1);
+        for foreground in [false, true] {
+            let Err(refusal) =
+                spawn_isolated_hyprland(&json!({}), (7, 9), foreground, |_| Ok(json!({})))
+            else {
+                panic!("input to a window the person used was started");
+            };
+            assert_eq!(
+                refusal.structured_content.unwrap()["code"],
+                "person_used_window"
+            );
+        }
+    });
+}
+
+#[cfg(test)]
 #[tokio::test]
 async fn isolated_worker_retains_lifecycle_until_native_work_exits() {
     use cua_driver_core::session::{self, SessionClientKind, SessionTransport};
@@ -5137,6 +5189,8 @@ async fn isolated_worker_retains_lifecycle_until_native_work_exits() {
     let (release, released) = std::sync::mpsc::channel();
     let (cancellation, dispatch) = spawn_isolated_hyprland(
         &json!({"_session_id":sid,"_transport_session_id":owner}),
+        (1, 1),
+        false,
         move |_| {
             started.send(()).unwrap();
             released.recv().unwrap();
@@ -7303,8 +7357,11 @@ impl Tool for ClickTool {
                     );
                 };
                 let owner = named_session_cursor_key(&args);
-                let (_cancellation, dispatch) =
-                    match spawn_isolated_hyprland(&args, move |cancellation| {
+                let (_cancellation, dispatch) = match spawn_isolated_hyprland(
+                    &args,
+                    (pid, exact_xid),
+                    false,
+                    move |cancellation| {
                         let (_, x, y) = resolve_element_local_coords(pid, idx, Some(exact_xid))?;
                         crate::wayland::hyprland_input::execute(
                             owner,
@@ -7318,10 +7375,11 @@ impl Tool for ClickTool {
                             },
                             cancellation,
                         )
-                    }) {
-                        Ok(dispatch) => dispatch,
-                        Err(refusal) => return refusal,
-                    };
+                    },
+                ) {
+                    Ok(dispatch) => dispatch,
+                    Err(refusal) => return refusal,
+                };
                 return match dispatch.await {
                     Ok(result) => isolated_hyprland_result(result),
                     Err(error) => isolated_hyprland_task_error(error, false),
@@ -8037,7 +8095,7 @@ impl Tool for TypeTextTool {
                 .await;
             let owner = named_session_cursor_key(&args);
             let (_cancellation, dispatch) =
-                match spawn_isolated_hyprland(&args, move |cancellation| {
+                match spawn_isolated_hyprland(&args, (pid, xid), false, move |cancellation| {
                     crate::wayland::hyprland_input::execute_background_text(
                         owner,
                         pid,
@@ -8145,7 +8203,7 @@ impl Tool for TypeTextTool {
             }
             let owner = named_session_cursor_key(&args);
             let (_cancellation, dispatch) =
-                match spawn_isolated_hyprland(&args, move |cancellation| {
+                match spawn_isolated_hyprland(&args, (pid, xid), true, move |cancellation| {
                     crate::wayland::hyprland_input::execute_foreground_text(
                         owner,
                         pid,
@@ -8155,11 +8213,7 @@ impl Tool for TypeTextTool {
                     )
                 }) {
                     Ok(dispatch) => dispatch,
-                    Err(_) => {
-                        return foreground_hyprland_refusal(
-                            "authenticated admitted lifecycle required",
-                        )
-                    }
+                    Err(refusal) => return refusal,
                 };
             return hyprland_input_result(
                 match dispatch.await {
@@ -10473,7 +10527,7 @@ impl Tool for ScrollTool {
             }
             let owner = named_session_cursor_key(&args);
             let (_cancellation, dispatch) =
-                match spawn_isolated_hyprland(&args, move |cancellation| {
+                match spawn_isolated_hyprland(&args, (pid, xid), false, move |cancellation| {
                     let point = if let Some(idx) = resolved_element_index {
                         let (_, x, y) = resolve_element_local_coords(pid, idx, Some(xid))?;
                         Some((x, y))
@@ -11579,7 +11633,7 @@ impl Tool for DragTool {
             );
             let (started, acknowledged) = tokio::sync::oneshot::channel();
             let (_cancellation, mut dispatch) =
-                match spawn_isolated_hyprland(&args, move |cancellation| {
+                match spawn_isolated_hyprland(&args, (pid, xid), true, move |cancellation| {
                     crate::wayland::hyprland_input::execute_foreground_with_started(
                         owner,
                         pid,
@@ -11594,11 +11648,7 @@ impl Tool for DragTool {
                     )
                 }) {
                     Ok(dispatch) => dispatch,
-                    Err(_) => {
-                        return foreground_hyprland_refusal(
-                            "authenticated admitted lifecycle required",
-                        )
-                    }
+                    Err(refusal) => return refusal,
                 };
             let acknowledged = acknowledged.await.is_ok();
             let result = if acknowledged {
@@ -11642,7 +11692,7 @@ impl Tool for DragTool {
             );
             let (started, acknowledged) = tokio::sync::oneshot::channel();
             let (_cancellation, mut dispatch) =
-                match spawn_isolated_hyprland(&args, move |cancellation| {
+                match spawn_isolated_hyprland(&args, (pid, xid), false, move |cancellation| {
                     crate::wayland::hyprland_input::execute_with_started(
                         owner,
                         pid,
@@ -14943,6 +14993,7 @@ pub fn build_registry_with_provider(
     });
     let state = ToolState::new_with_capture_service(r.capture_service());
     if crate::wayland::is_wayland() && crate::wayland::hyprland::is_session() {
+        crate::wayland::person_focus::start();
         let recording_state = Arc::downgrade(&state);
         r.recording
             .set_pixel_point_fn(move |args, window_id, pid, mut x, mut y| {

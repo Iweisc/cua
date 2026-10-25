@@ -387,7 +387,17 @@ the agent seats. When the plugin reports that, Driver delivers through the
 target's own primary-seat resources instead, still without moving your focus or
 cursor. The result route remains `synthetic_events`. It refuses while your pointer or
 keyboard focus is on that app, and during a grab, drag-and-drop, or pointer
-constraint. The plugin also withholds popup grabs and cancels drag starts that
+constraint.
+
+You can check on a window an agent is driving. When your focus lands on it, or
+leaves it, Driver retires what the agent last read of that window, because you
+may have clicked, typed, or scrolled there. The agent's next pixel, element, or
+key action on the window refuses with `person_used_window` before anything is
+sent, and `run_steps` attaches a fresh screenshot. Reading the window again lets
+the agent carry on from what it shows. Driver learns this from Hyprland's focus
+events, so a scroll over a window that never takes focus goes unnoticed.
+
+The plugin also withholds popup grabs and cancels drag starts that
 an app makes in reaction to agent input, even in the app you are using, so a
 dropdown or drag cannot take your keyboard or pointer. GTK menus and combo
 boxes still open without the grab, and agent keys such as Down and Return

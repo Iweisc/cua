@@ -1516,6 +1516,8 @@ fn execute_actions_routed(
         return Ok(json!({"ok": false, "code": GLOBAL_INPUT_DISABLED,
             "detail": global_input_detail()}));
     }
+    let _driver_focus =
+        (route == DeliveryRoute::Foreground).then(super::person_focus::DriverFocus::hold);
     let window = super::hyprland::window_for_address(address);
     let Ok(stable_id) =
         super::hyprland::confirm_identity(address, window.as_ref().and_then(|w| w.stable_id))

@@ -77,6 +77,10 @@ fn every_hint_variant_stays_within_the_length_limit() {
         ),
         (
             "click",
+            json!({"code": "background_unavailable", "reason": "primary_target_busy"}),
+        ),
+        (
+            "click",
             json!({"code": "background_unavailable", "window": {"pid": 1, "window_id": 2}}),
         ),
         ("invoke_menu", json!({"code": "background_unavailable"})),
@@ -172,6 +176,7 @@ fn the_table_covers_every_code_agents_hit_most() {
         "popup_keyboard_grab",
         "lane_busy",
         "primary_target_busy",
+        "person_used_window",
         "invalid_arguments",
     ] {
         assert!(covered.contains(&code), "no hint for {code}");
@@ -200,6 +205,28 @@ fn a_drag_refused_by_macos_drag_and_drop_names_a_non_drag_route_and_the_foregrou
         "No drop landed: macOS drag-and-drop needs the real pointer. Try a route that is not a drag first \
          (Move button, menu item, shortcut). Retry with delivery_mode:\"foreground\" \
          only if the user allows the window to come forward."
+    );
+    assert_eq!(
+        call_value(&hint),
+        json!({
+            "tool": "get_window_state",
+            "arguments": {"pid": 4242, "window_id": 17, "session": "run-1"},
+        })
+    );
+}
+
+#[test]
+fn input_refused_while_the_user_is_on_the_app_waits_for_them() {
+    let hint = hint_for(
+        "click",
+        &window_seed(),
+        true,
+        json!({"code": "background_unavailable", "reason": "primary_target_busy"}),
+    );
+    assert_eq!(
+        hint.hint,
+        "The user is on this app right now, so nothing was sent. Wait a few seconds, then read the \
+         window again before retrying, since they may have changed it. Do not switch to foreground."
     );
     assert_eq!(
         call_value(&hint),

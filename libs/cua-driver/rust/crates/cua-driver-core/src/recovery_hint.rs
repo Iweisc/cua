@@ -620,12 +620,27 @@ static RULES: &[Rule] = &[
         },
     },
     Rule {
-        codes: &["lane_busy", "primary_target_busy"],
+        codes: &["lane_busy"],
         build: |_| {
             RecoveryHint::new(
                 "Another action is using this window's input. Wait a moment and retry once; do not fire \
                  parallel actions at one window.",
             )
+        },
+    },
+    Rule {
+        codes: &["primary_target_busy"],
+        build: person_on_app,
+    },
+    Rule {
+        codes: &[crate::snapshot_store::PERSON_USED_WINDOW],
+        build: |c| {
+            RecoveryHint::new(
+                "The user used this window after your last read, so nothing was sent. Read it again and \
+                 continue from what it shows now: your earlier pixels, element tokens and focus no \
+                 longer apply.",
+            )
+            .call(c.read_window())
         },
     },
     Rule {
@@ -831,6 +846,7 @@ fn background_unavailable(c: &Ctx) -> RecoveryHint {
              Tab, Return or shortcuts. {foreground} Otherwise report the step as blocked."
         ))
         .call(c.read_window()),
+        (_, Some("primary_target_busy")) => person_on_app(c),
         // Hyprland: the person's keyboard focus is in the target's app.
         (_, Some("primary_keyboard_busy")) => RecoveryHint::new(
             "The user is typing in this app, so keys are refused: they could reach the user's window. \
@@ -873,6 +889,16 @@ fn background_unavailable(c: &Ctx) -> RecoveryHint {
         ))
         .call(c.read_window()),
     }
+}
+
+/// Hyprland: the person's pointer or keyboard is on the target's app, so input
+/// routed through their own seat waits for them to leave.
+fn person_on_app(c: &Ctx) -> RecoveryHint {
+    RecoveryHint::new(
+        "The user is on this app right now, so nothing was sent. Wait a few seconds, then read the \
+         window again before retrying, since they may have changed it. Do not switch to foreground.",
+    )
+    .call(c.read_window())
 }
 
 /// Hyprland: the screen is locked or the display is off. There is no next call
