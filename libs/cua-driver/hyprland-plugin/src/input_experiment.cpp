@@ -80,10 +80,6 @@ using Clock = std::chrono::steady_clock;
 constexpr std::size_t kMaxPacket = 2048;
 constexpr std::size_t kMaxClients = 8;
 constexpr std::size_t kMaxResources = 512;
-// Clients react to a click within a few frames. Two seconds also covers a
-// renderer process that is briefly descheduled, without leaving a refusal
-// window long enough to block the human's own later use of that app.
-constexpr auto kReactionWindow = std::chrono::seconds(2);
 // A click or modifier chord the human gave the app of `surface`.
 struct HumanCommand {
     WP<CWLSurfaceResource> surface;
@@ -776,14 +772,15 @@ struct InputExperiment::Impl {
         const auto same = [&](const SP<CWLSurfaceResource>& other) {
             return x ? same_app(other, surface) : pid_of(surface) > 0 && pid_of(other) == pid_of(surface);
         };
+        const bool human_in_app = same(g_pSeatManager->m_state.pointerFocus.lock()) || same(g_pSeatManager->m_state.keyboardFocus.lock());
         SP<CWLSurfaceResource> target;
         Clock::time_point agent;
         if (const auto s = lease && lease->route != InputRoute::primary_foreground ? lease->surface.lock() : nullptr; same(s)) {
             target = s; agent = Clock::now();
-        } else if (const auto s = recent_target.lock(); Clock::now() - recent_dispatch < kReactionWindow && same(s)) {
+        } else if (const auto s = recent_target.lock(); app_reaction_recent(Clock::now() - recent_dispatch, human_in_app) && same(s)) {
             target = s; agent = recent_dispatch;
         }
-        if (!target || (!same(g_pSeatManager->m_state.pointerFocus.lock()) && !same(g_pSeatManager->m_state.keyboardFocus.lock()))) return target;
+        if (!target || !human_in_app) return target;
         std::optional<Clock::time_point> human;
         for (const auto& c : commands)
             if (same(c.surface.lock()) && (!human || c.at > *human)) human = c.at;
@@ -799,11 +796,14 @@ struct InputExperiment::Impl {
         std::optional<Clock::time_point> human;
         for (const auto& c : commands)
             if (same(window_of(c.surface.lock())) && (!human || c.at > *human)) human = c.at;
+        const bool human_in_app = same(Desktop::focusState()->window());
+        // Qt on Wayland keeps the surface of a window it hides.
+        const auto driven = window_of(recent_target.lock());
         const Replacement replacement{
             .same_app = !window->parent() && same(window),
-            .driven_gone = !recent_target.lock(),
-            .recent = Clock::now() - recent_dispatch < kReactionWindow,
-            .human_in_app = same(Desktop::focusState()->window()),
+            .driven_gone = !driven || !driven->m_isMapped,
+            .recent = app_reaction_recent(Clock::now() - recent_dispatch, human_in_app),
+            .human_in_app = human_in_app,
             .agent_last = agent_commanded_last(recent_dispatch, human),
         };
         return agent_replacement(replacement) ? &recent_app : nullptr;

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -9,6 +10,21 @@
 #include <vector>
 
 namespace cua::hyprland {
+// Clients react to a click within a few frames. Two seconds also covers a
+// renderer process that is briefly descheduled, without leaving a refusal
+// window long enough to block the human's own later use of that app.
+inline constexpr std::chrono::steady_clock::duration kReactionWindow = std::chrono::seconds(2);
+// Slow apps open the window a click asked for seconds later. DaVinci Resolve
+// opens its main window only once the project it was told to create has loaded.
+inline constexpr std::chrono::steady_clock::duration kSlowReactionWindow = std::chrono::seconds(30);
+
+// Whether a new window with no parent, opened `since` the agent's latest input
+// to its app, can still react to that input. While the human is in the app, a
+// later window is as likely to be their own, so only a quick one counts.
+[[nodiscard]] constexpr bool app_reaction_recent(std::chrono::steady_clock::duration since, bool human_in_app) {
+    return since < (human_in_app ? kReactionWindow : kSlowReactionWindow);
+}
+
 // Returns the window a new top-level window reacts to, or an empty Window
 // when it is not a reaction to agent input. `parents` is its parent chain,
 // nearest first. The nearest parent that is the human's focused window or a

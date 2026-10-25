@@ -1,5 +1,6 @@
 #include "reaction_window.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
@@ -11,6 +12,7 @@ namespace {
 using cua::hyprland::agent_commanded_last;
 using cua::hyprland::agent_grab;
 using cua::hyprland::agent_replacement;
+using cua::hyprland::app_reaction_recent;
 using cua::hyprland::AgentSerials;
 using cua::hyprland::GrabSignals;
 using cua::hyprland::reaction_anchor;
@@ -47,6 +49,12 @@ int main() {
     check(agent_commanded_last(5, std::optional<int>{}), "with no human command the new window is the agent's");
     check(agent_commanded_last(5, std::optional<int>{4}), "a human command before the agent's leaves the new window the agent's");
     check(!agent_commanded_last(5, std::optional<int>{6}), "a human command after the agent's makes the new window theirs");
+
+    using std::chrono::seconds;
+    check(app_reaction_recent(seconds(1), true), "a window right after the agent's input reacts to it, even in an app the human is in");
+    check(!app_reaction_recent(seconds(3), true), "in an app the human is in, a later window does not");
+    check(app_reaction_recent(seconds(9), false), "in an app the human is not in, a window that takes seconds to open still reacts to the agent");
+    check(!app_reaction_recent(seconds(31), false), "a window long after the agent's input is not a reaction");
 
     check(agent_replacement({.same_app = true, .driven_gone = true, .recent = true}),
         "a window an app opens right after closing the window the agent drove is the agent's");
