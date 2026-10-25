@@ -415,13 +415,7 @@ not using, a window with no parent that opens up to 30 seconds after the
 agent's last input there is the agent's, so a slow app's next window stays off
 your workspace. A window of that app you open yourself from outside it, such
 as from a launcher, in those 30 seconds opens on the agent's workspace too.
-A window you act on keeps drawing on a hidden workspace until your session
-ends, so its animations finish and its screenshots are current.
-In X apps built on stock Qt 5, such as DaVinci Resolve, type capitals and
-symbols with `type_text`: `press_key` with Shift types the unshifted character
-there.
-Such a window
-never ends your fullscreen or maximized window, and on a
+Such a window never ends your fullscreen or maximized window, and on a
 workspace you can see it floats, so it never splits or resizes your tile.
 Moving your pointer over it does not focus it, because Hyprland draws floating
 windows over tiled ones and it may open under your pointer. Click it to type
@@ -455,7 +449,11 @@ text view, spin button, slider, combo box, or table cell. Their action does not
 focus them, so, as on X11, Driver clicks them with the pointer at their center
 when the toolkit's own hit test finds them there. That works in a covered window
 and on a hidden workspace. An element scrolled out of view, or one whose toolkit
-does not answer the hit test, keeps its AT-SPI action.
+does not answer the hit test, keeps its AT-SPI action. A window you act on keeps
+drawing on a hidden workspace until your session ends, so its animations finish
+and its screenshots are current. In X apps built on stock Qt 5, such as DaVinci
+Resolve, type capitals and symbols with `type_text`: `press_key` with Shift
+types the unshifted character there.
 
 While the screen is locked or the display is off, every agent action on the
 window refuses with reason `session_unavailable` and `effect:"refused"`, and
