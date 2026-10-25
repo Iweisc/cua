@@ -278,6 +278,14 @@ struct InputExperiment::Impl {
     std::vector<WP<CWLKeyboardResource>> borrowed_keyboards;
     WP<CWLSurfaceResource> borrowed_surface;
     WP<CWLSeatResource> borrowed_seat;
+    // Chromium and Electron take keyboard focus as window activation, and an
+    // app may move focus when it is activated: Discord's dialogs pull it back
+    // to the dialog. A person activates a window once, then clicks and types.
+    // The agent holds the target's primary keyboard the same way, from its
+    // first click or key until a revoke or the end of its lane's session, so
+    // its keys never activate the window again.
+    std::vector<WP<CWLKeyboardResource>> held_keyboards;
+    WP<CWLSurfaceResource> held_surface;
     // The last client this lane delivered to. A popup grab or drag start that
     // client sends shortly afterwards is a reaction to agent input.
     WP<CWLSurfaceResource> recent_target;
@@ -836,6 +844,7 @@ struct InputExperiment::Impl {
         drag.reset();
         finish_foreground();
         return_primary();
+        release_primary_keyboard();
         if (retain_pointer) release_pointer_button(); else leave_pointer();
         leave_keyboard(); retire_grant();
     }
@@ -1119,7 +1128,7 @@ struct InputExperiment::Impl {
                     if (const auto k = weak.lock(); k && k->good()) {
                         for (auto code : held_keys) k->sendKey(event_ms(), code, WL_KEYBOARD_KEY_STATE_RELEASED);
                         k->sendMods(0, 0, 0, 0);
-                        k->sendLeave();
+                        if (held_surface.lock() != root) k->sendLeave();
                     }
         }
         borrowed_pointers.clear(); borrowed_keyboards.clear(); borrowed_surface.reset(); borrowed_seat.reset();
@@ -1128,6 +1137,31 @@ struct InputExperiment::Impl {
         if (borrowed) { held_button = 0; held_keys.clear(); }
         if (physical_keyboard_state) xkb_state_unref(physical_keyboard_state);
         physical_keyboard_state = physical_keymap ? xkb_state_new(physical_keymap) : nullptr;
+    }
+    // Enters the target's primary keyboards unless this lane holds them
+    // already. False when the client bound no keyboard.
+    bool hold_primary_keyboard(const SP<CWLSurfaceResource>& root) {
+        const auto live = [](const WP<CWLKeyboardResource>& weak) { const auto k = weak.lock(); return k && k->good(); };
+        if (held_surface.lock() == root && std::ranges::any_of(held_keyboards, live)) return true;
+        release_primary_keyboard();
+        const auto seat = g_pSeatManager->seatResourceForClient(root->client());
+        if (!seat || !seat->good()) return false;
+        wl_array keys{};
+        for (const auto& k : seat->m_keyboards)
+            if (k && k->good()) { k->sendEnter(root, &keys); k->sendMods(0, 0, 0, 0); held_keyboards.push_back(k); }
+        if (!held_keyboards.empty()) held_surface = root;
+        return !held_keyboards.empty();
+    }
+    // Leaves what hold_primary_keyboard entered. Once the person's keyboard
+    // focus reaches that app, the compositor entered it itself and leaves it
+    // when they go, so nothing is ours to leave.
+    void release_primary_keyboard() {
+        const auto root = held_surface.lock();
+        const auto human = g_pSeatManager->m_state.keyboardFocus.lock();
+        if (root && root->good() && (!human || human->client() != root->client()))
+            for (const auto& weak : held_keyboards)
+                if (const auto k = weak.lock(); k && k->good()) { k->sendMods(0, 0, 0, 0); k->sendLeave(); }
+        held_keyboards.clear(); held_surface.reset();
     }
     ForegroundGuard foreground_guard(const Client& c) const {
         const auto root = c.surface.lock();
@@ -1484,6 +1518,7 @@ struct InputExperiment::Impl {
                 // unchanged passive hover. Compare the actual target below.
                 invalidate(c, false); c.unmap.reset(); c.destroy.reset();
                 c.window = window; c.surface = window->resource(); c.xwayland = xwayland; c.token = nonce(); c.revision = 1;
+                if (held_surface.lock() != c.surface.lock()) release_primary_keyboard();
                 c.unmap = window->m_events.unmap.listen([this, &c] { invalidate(c); });
                 c.destroy = window->m_events.destroy.listen([this, &c] { invalidate(c); });
             }
@@ -1761,11 +1796,10 @@ struct InputExperiment::Impl {
             }
             if (!consume_grant(c, cap)) return;
             borrow_primary(c, false, true);
-            if (borrowed_keyboards.empty() || !physical_keyboard_state) { return_primary(); send(c, refusal("client_not_bound")); return; }
+            if (borrowed_keyboards.empty() || !physical_keyboard_state || !hold_primary_keyboard(root)) {
+                return_primary(); send(c, refusal("client_not_bound")); return;
+            }
             xkb_state_update_mask(physical_keyboard_state, 0, 0, 0, 0, 0, 0);
-            wl_array keys{};
-            for (const auto& weak : borrowed_keyboards)
-                if (const auto k = weak.lock(); k && k->good()) { k->sendEnter(root, &keys); k->sendMods(0, 0, 0, 0); }
             const std::array<std::uint32_t, 4> chord{42, 29, 56, 125};
             for (unsigned i = 0; i < 4; ++i) if ((mods & (1u << i)) && chord[i] != code) borrowed_key(chord[i], true);
             borrowed_key(static_cast<std::uint32_t>(code), true); borrowed_key(static_cast<std::uint32_t>(code), false);
@@ -1776,6 +1810,9 @@ struct InputExperiment::Impl {
             if (!consume_grant(c, cap)) return;
             borrow_primary(c, true, false);
             if (borrowed_pointers.empty()) { return_primary(); send(c, refusal("client_not_bound")); return; }
+            // Activate first, as a person's focus does, so an app that moves
+            // focus on activation does it before the click rather than after.
+            hold_primary_keyboard(root);
             borrowed_pointer_enter(target->surface, target->local);
             for (unsigned i = 0; i < clicks; ++i) { borrowed_button(static_cast<std::uint32_t>(btn), true); borrowed_button(static_cast<std::uint32_t>(btn), false); }
         } else if (command == "SCROLL") {
@@ -1859,6 +1896,12 @@ struct InputExperiment::Impl {
         if (!retired) sync_keymap();
         for (auto& c : clients) if (c->deadline.expired(c->hello, Clock::now())) c->dead = true;
         guard_targets();
+        if (!held_keyboards.empty()) {
+            const auto held = held_surface.lock();
+            const auto human = g_pSeatManager->m_state.keyboardFocus.lock();
+            if (!reservation || !held || !held->good() || (human && human->client() == held->client()))
+                release_primary_keyboard();
+        }
         if (drag) {
             const auto d = *drag;
             const auto elapsed = std::chrono::duration<double, std::milli>(Clock::now() - d.start).count();

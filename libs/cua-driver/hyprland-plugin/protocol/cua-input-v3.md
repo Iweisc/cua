@@ -284,9 +284,18 @@ Admission and every dispatch refuse with these codes:
   keymap than on a neutral US keyboard. Keys are sent with neutral modifiers, so
   the human's Num Lock does not refuse.
 
-The borrowed resources are left and released after each action, except when
-human focus has since reached that client: Hyprland has already moved them to
-the human's surface. Human focus reaching the target cancels the lease
+The borrowed pointer is left and released after each action. The borrowed
+keyboard is entered at the first `CLICK` or `KEY` and held across later actions,
+because Chromium takes keyboard focus as window activation and some apps move
+focus when activated: Discord's dialogs pull it back to the dialog, so a key
+that entered again would land there instead of in the field the click focused.
+A `CLICK` enters it before the press, as a person's activation precedes their
+click. The plugin leaves it on any revoke, when the connection binds another
+window, and when the lane's reservation ends, including the connection's idle
+timeout. Human keyboard focus reaching that client ends the hold without a
+leave, and neither resource is left once human focus has reached the client:
+Hyprland has already moved them to the human's surface. Human focus reaching
+the target cancels the lease
 synchronously, as on the agent-seat route. An agent button press clears the
 seat's pointer-button serial at once, so the client cannot use it to start an
 interactive move or resize that would follow the human's pointer. See

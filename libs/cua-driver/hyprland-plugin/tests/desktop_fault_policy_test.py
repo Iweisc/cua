@@ -26,8 +26,8 @@ def method(source, name):
 
 def fixture(source):
     methods = '\n'.join(method(source, name) for name in (
-        'invalidate', 'retire_grant', 'revoke', 'return_primary', 'suspend',
-        'desktop_transition', 'guard_targets', 'cancel_authority'))
+        'invalidate', 'retire_grant', 'revoke', 'return_primary', 'release_primary_keyboard',
+        'suspend', 'desktop_transition', 'guard_targets', 'cancel_authority'))
     # Exercise the real refusal branches from both TARGET and action dispatch.
     for label, start, end in (
         ('target_refusal', 'const auto requested_cap =', 'const auto pid ='),

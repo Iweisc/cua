@@ -387,7 +387,11 @@ the agent seats. When the plugin reports that, Driver delivers through the
 target's own primary-seat resources instead, still without moving your focus or
 cursor. The result route remains `synthetic_events`. It refuses while your pointer or
 keyboard focus is on that app, and during a grab, drag-and-drop, or pointer
-constraint.
+constraint, which includes a game that holds your pointer. These apps take
+keyboard focus as being the active window, so from the agent's first click or
+key until its session ends or goes idle for a minute, the app behaves as the
+active window: Discord, for example, treats the open channel as read. That is
+what lets a field in a Discord dialog keep the focus a click gives it.
 
 You can check on a window an agent is driving. When your focus lands on it, or
 leaves it, Driver retires what the agent last read of that window, because you

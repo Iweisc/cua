@@ -89,8 +89,8 @@ struct Lane {
     Clock::time_point expires;
     std::vector<unsigned> held_keys{42};
     std::vector<std::string> responses;
-    std::vector<std::weak_ptr<Borrowed>> borrowed_pointers, borrowed_keyboards;
-    std::weak_ptr<Surface> borrowed_surface, borrowed_seat;
+    std::vector<std::weak_ptr<Borrowed>> borrowed_pointers, borrowed_keyboards, held_keyboards;
+    std::weak_ptr<Surface> borrowed_surface, borrowed_seat, held_surface;
     xkb_state* physical_keyboard_state = nullptr;
     xkb_keymap* physical_keymap = nullptr;
 
@@ -141,6 +141,13 @@ struct Lane {
         borrowed_surface = borrowed_seat = surface;
         return borrowed;
     }
+    // The primary keyboard an earlier agent click or key left entered.
+    std::shared_ptr<Borrowed> hold_primary_route_keyboard() {
+        auto held = std::make_shared<Borrowed>();
+        held_keyboards.push_back(held);
+        held_surface = surface;
+        return held;
+    }
     // PRODUCTION_METHODS
     void check_inert(bool retained = true) const {
         check(!lease && !drag && !held_button && held_keys.empty() && !keyboard_focus &&
@@ -167,9 +174,11 @@ int main() {
     { Lane l; l.lease->dead = true; l.guard_targets(); l.check_inert(); }
     { Lane l; l.cancel_authority("stopped"); l.guard_targets(); l.check_inert(); }
     // The primary route releases on the borrowed pointer, never on the agent seat.
+    // A primary keyboard held between actions is left exactly once too.
     for (int path = 0; path < 4; ++path) {
         Lane l;
         const auto borrowed = l.use_primary_route();
+        const auto held = l.hold_primary_route_keyboard();
         if (path == 0) l.lease->dead = true;
         if (path == 1) l.cancel_authority("stopped");
         if (path == 2) l.desktop_transition();
@@ -177,6 +186,19 @@ int main() {
         l.guard_targets();
         check(borrowed->releases == 1 && borrowed->leaves == 1 && !l.releases && !l.held_button &&
               l.borrowed_pointers.empty(), "borrowed press was not released exactly once on its own route");
+        check(held->leaves == 1 && l.held_keyboards.empty() && !l.held_surface.lock(),
+              "held primary keyboard was not left exactly once");
+    }
+    // Once the person's own keyboard focus is in that app, the compositor
+    // leaves it, not the agent.
+    {
+        Lane l;
+        l.use_primary_route();
+        const auto held = l.hold_primary_route_keyboard();
+        seat_manager.m_state.keyboardFocus = l.surface;
+        l.cancel_authority("stopped");
+        seat_manager.m_state.keyboardFocus.reset();
+        check(!held->leaves && l.held_keyboards.empty(), "agent left a keyboard the person's focus owns");
     }
     for (bool session_fault : {true, false}) {
         for (int path = 0; path < 3; ++path) {
