@@ -159,7 +159,9 @@ pub struct RenderStateCore {
     /// The pinned target window is on another workspace (macOS Space), so the
     /// cursor must not paint over the user's current workspace at that
     /// window's coordinates. Platform adapters set it when handling
-    /// `PinAbove`; `false` when membership is unknown.
+    /// `PinAbove`; `false` when membership is unknown. The Hyprland adapter
+    /// also sets it once the target closes, moves, or shrinks, until the
+    /// next positioned command places the cursor again.
     pub pinned_target_off_workspace: bool,
     /// Idle-hide: elapsed seconds since last activity.
     pub idle_secs: f64,

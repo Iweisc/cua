@@ -7,7 +7,14 @@
 #include <string_view>
 
 namespace cua::hyprland {
-enum class InputRoute { unbound, independent, primary_foreground };
+// primary_background sends to the target's own primary-seat resources without
+// moving global focus or the cursor. It exists for clients that bind only one
+// wl_seat (Chromium/Ozone and Electron), which never see the agent seats.
+enum class InputRoute { unbound, independent, primary_foreground, primary_background };
+
+inline constexpr bool uses_primary_seat(InputRoute route) {
+    return route == InputRoute::primary_foreground || route == InputRoute::primary_background;
+}
 
 struct AgentKeymapConfig {
     std::string_view rules;
@@ -114,15 +121,57 @@ bool foreground_resources_match(const Resources& current, const Resources& captu
     return live == captured.size();
 }
 
+// Foreground never shares a connection with either background route. The two
+// background routes may alternate, because each TARGET re-binds from scratch.
 inline bool bind_input_route(InputRoute& bound, InputRoute requested) {
-    if (bound != InputRoute::unbound && bound != requested) return false;
+    const bool background_pair = bound != InputRoute::primary_foreground && requested != InputRoute::primary_foreground;
+    if (bound != InputRoute::unbound && bound != requested && !background_pair) return false;
     bound = requested;
     return true;
 }
 
+// Both primary routes type through the human's keymap, so both need it to be
+// US-equivalent. The independent seats carry their own canonical keymap.
 inline bool input_layout_qualified(InputRoute route, bool keyboard_action, bool primary_layout_qualified) {
-    return route != InputRoute::primary_foreground || !keyboard_action || primary_layout_qualified;
+    return !uses_primary_seat(route) || !keyboard_action || primary_layout_qualified;
 }
+
+// The agent seat has its own keyboard focus, but Firefox and Qt keep one
+// keyboard focus for the whole process: an agent key in one of their windows
+// takes it from the person's window. Every toolkit mixes agent keys into the
+// person's typing when both are in one window. So the agent seat sends no key
+// to a native client while the person's keyboard focus is on any of its
+// surfaces. X targets and both primary routes already refuse every action in
+// the person's app; pointer actions on this route never need the keyboard.
+template <typename Surface>
+std::string_view agent_keyboard_refusal(InputRoute route, bool xwayland, std::uint64_t capability,
+                                        const Surface& human_keyboard_focus, const Surface& target) {
+    if (route != InputRoute::independent || xwayland || capability != 2) return {};
+    if (!human_keyboard_focus || !target || human_keyboard_focus->client() != target->client()) return {};
+    return "primary_keyboard_busy";
+}
+
+// The background primary route borrows the client's primary-seat resources.
+// It refuses anything that would make the human's own input reach the target
+// or let an agent gesture start compositor-global state.
+struct PrimaryBackgroundGuard {
+    bool primary_binding = true;
+    bool human_on_client = false;
+    bool peer_conflict = false;
+    bool grab = false;
+    bool dnd = false;
+    bool constraint = false;
+
+    std::string_view failure() const {
+        if (!primary_binding) return "primary_binding";
+        if (human_on_client) return "primary_target_busy";
+        if (peer_conflict) return "agent_target_busy";
+        if (grab) return "primary_grab";
+        if (dnd) return "primary_dnd";
+        if (constraint) return "primary_constraint";
+        return {};
+    }
+};
 
 struct ForegroundGuard {
     bool exact_root = false;

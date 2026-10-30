@@ -330,6 +330,30 @@ async fn a_window_never_captured_gets_a_screenshot_after_a_pixel_failure() {
     );
 }
 
+#[tokio::test]
+async fn a_window_the_person_used_is_shown_again_after_the_refusal() {
+    let harness = Harness::new();
+    let refused = "The person used window 4096 after your last read of it, so what you saw may \
+                   have changed.";
+    let result = harness
+        .run(json!({"steps": [
+            {"tool": "type_text", "args": {"pid": 77, "window_id": 4096, "text": "Dude fun",
+                "fail_message": refused, "fail_code": "person_used_window"}},
+            {"tool": "click", "args": {"pid": 77, "window_id": 4096, "x": 10, "y": 10}}
+        ]}))
+        .await;
+    assert_eq!(result.is_error, Some(true));
+    assert!(harness.calls["click"].lock().unwrap().is_empty());
+    let observed = harness.last("get_window_state");
+    assert_eq!(observed["window_id"], 4096);
+    assert_eq!(observed["include_screenshot"], true);
+    assert!(
+        text(&result).contains("the person used window 4096"),
+        "{}",
+        text(&result)
+    );
+}
+
 #[test]
 fn focus_holder_and_row_parsing() {
     assert_eq!(

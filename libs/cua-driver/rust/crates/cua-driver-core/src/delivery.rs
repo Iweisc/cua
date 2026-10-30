@@ -74,6 +74,12 @@ pub fn brief_foreground_flag(value: Option<&str>) -> bool {
     )
 }
 
+/// `~/.cua-driver/config.json` key that lets agents use the person's own
+/// keyboard and pointer (desktop-scope input and `delivery_mode:"foreground"`)
+/// on Linux while the Hyprland input plugin is active. Off unless it is `true`.
+/// Only the person running the driver sets it; `set_config` refuses it.
+pub const ALLOW_GLOBAL_INPUT_KEY: &str = "allow_global_input";
+
 /// Whether the call itself asked for background delivery by name, which opts
 /// it out of the brief foreground step.
 pub fn background_requested_explicitly(args: &Value) -> bool {

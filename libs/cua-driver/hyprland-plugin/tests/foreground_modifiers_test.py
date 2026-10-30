@@ -23,6 +23,7 @@ REQUIRED = bool(os.environ.get('CUA_HYPRLAND_REQUIRE_XKBCOMMON'))
 
 FIXTURE = r'''
 #include "keymap_equivalence.hpp"
+#include "pointer_hit.hpp"
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
@@ -120,6 +121,9 @@ struct Lane {
     bool available() const { return true; }
     bool layout_qualified() const { return layout_ready; }
     bool point(Client&, double, double) { return true; }
+    PointerSurface<std::shared_ptr<Root>, Vector2D> pointer_hit_at(const Client& c, double, double) const {
+        return {PointerHit::root, c.surface.lock(), {}};
+    }
     std::uint32_t event_ms() { return 0; }
     void foreground_motion(Client&, double, double) { ++motions; }
     ForegroundGuard foreground_guard(const Client&) const {

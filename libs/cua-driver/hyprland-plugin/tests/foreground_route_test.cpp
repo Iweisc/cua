@@ -133,16 +133,43 @@ int main() {
     check(route == InputRoute::primary_foreground);
     route = InputRoute::independent;
     check(!bind_input_route(route, InputRoute::primary_foreground));
+    check(bind_input_route(route, InputRoute::primary_background));
+    check(route == InputRoute::primary_background);
+    check(bind_input_route(route, InputRoute::independent));
+    check(route == InputRoute::independent);
+    route = InputRoute::primary_background;
+    check(!bind_input_route(route, InputRoute::primary_foreground));
+    route = InputRoute::primary_foreground;
+    check(!bind_input_route(route, InputRoute::primary_background));
+    check(route == InputRoute::primary_foreground);
 
-    // Background input uses the agent seat's private keymap. The primary
-    // layout matters only for foreground keyboard delivery.
+    // The agent seats carry their own keymap. Both primary routes type through
+    // the human's keymap, so only they need it to be US-equivalent.
     for (const bool primary_layout : {false, true}) {
         check(input_layout_qualified(InputRoute::independent, false, primary_layout));
         check(input_layout_qualified(InputRoute::independent, true, primary_layout));
         check(input_layout_qualified(InputRoute::primary_foreground, false, primary_layout));
+        check(input_layout_qualified(InputRoute::primary_background, false, primary_layout));
     }
     check(!input_layout_qualified(InputRoute::primary_foreground, true, false));
     check(input_layout_qualified(InputRoute::primary_foreground, true, true));
+    check(!input_layout_qualified(InputRoute::primary_background, true, false));
+    check(input_layout_qualified(InputRoute::primary_background, true, true));
+
+    PrimaryBackgroundGuard background;
+    check(background.failure().empty());
+    background.constraint = true;
+    check(background.failure() == "primary_constraint");
+    background.dnd = true;
+    check(background.failure() == "primary_dnd");
+    background.grab = true;
+    check(background.failure() == "primary_grab");
+    background.peer_conflict = true;
+    check(background.failure() == "agent_target_busy");
+    background.human_on_client = true;
+    check(background.failure() == "primary_target_busy");
+    background.primary_binding = false;
+    check(background.failure() == "primary_binding");
     check(kAgentKeymap.rules == "evdev");
     check(kAgentKeymap.model == "pc105");
     check(kAgentKeymap.layout == "us");
@@ -175,4 +202,28 @@ int main() {
     guard.exact_keyboard_focus = false;
     check(!guard.can_dispatch());
     check(!guard.can_dispatch(false));
+
+    // Agent keys refuse while the person's keyboard focus is on any surface
+    // of the target's client, the target itself included.
+    struct Surface {
+        int owner;
+        int client() const { return owner; }
+    };
+    const auto target = std::make_shared<Surface>(Surface{7});
+    const auto sibling = std::make_shared<Surface>(Surface{7});
+    const auto other_app = std::make_shared<Surface>(Surface{8});
+    const std::shared_ptr<Surface> no_focus;
+    for (const auto& focus : {target, sibling})
+        check(agent_keyboard_refusal(InputRoute::independent, false, 2, focus, target) == "primary_keyboard_busy");
+    check(agent_keyboard_refusal(InputRoute::independent, false, 2, other_app, target).empty());
+    check(agent_keyboard_refusal(InputRoute::independent, false, 2, no_focus, target).empty());
+    // Pointer actions still share the person's app.
+    for (const std::uint64_t pointer : {1u, 4u, 8u})
+        check(agent_keyboard_refusal(InputRoute::independent, false, pointer, sibling, target).empty());
+    // XWayland is one client for every X app; X targets compare X processes
+    // in primary_conflict instead. PRIMARY_TARGET refuses every action in the
+    // person's app, and FOREGROUND_TARGET takes the person's focus on purpose.
+    check(agent_keyboard_refusal(InputRoute::independent, true, 2, sibling, target).empty());
+    for (const auto route : {InputRoute::primary_background, InputRoute::primary_foreground})
+        check(agent_keyboard_refusal(route, false, 2, sibling, target).empty());
 }

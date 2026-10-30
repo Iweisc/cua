@@ -1,4 +1,4 @@
-use super::{element_needs_real_click, split_key_combo, wm_chord_kind, WmChord};
+use super::{split_key_combo, wm_chord_kind, WmChord};
 
 #[test]
 fn key_combos_split_into_modifiers_and_key() {
@@ -57,14 +57,4 @@ fn wm_chords_are_recognised() {
     assert_eq!(wm_chord_kind("f", &m(&["alt"])), None);
     assert_eq!(wm_chord_kind("F4", &m(&[])), None);
     assert_eq!(wm_chord_kind("s", &m(&["ctrl", "shift"])), None);
-}
-
-#[test]
-fn focus_taking_roles_need_a_real_click() {
-    for role in ["spin button", "Text", "entry", "slider", "combo box"] {
-        assert!(element_needs_real_click(role), "{role}");
-    }
-    for role in ["menu item", "push button", "menu", "check box", "page tab"] {
-        assert!(!element_needs_real_click(role), "{role}");
-    }
 }

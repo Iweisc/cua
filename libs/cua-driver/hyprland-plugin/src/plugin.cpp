@@ -51,6 +51,9 @@ std::string g_reconcile_error;
 #if defined(CUA_HYPRLAND_TEST_INPUT) || defined(CUA_HYPRLAND_INPUT)
 std::unique_ptr<cua::hyprland::InputExperiment> g_experiment;
 HANDLE g_experiment_handle = nullptr;
+// Input could not start in this compositor, for example because a hook target
+// is missing. A config reload cannot change that, so it is not retried.
+std::string g_input_failure;
 #endif
 
 bool safe_instance_signature(const std::string& signature) {
@@ -167,6 +170,10 @@ void reconcile_server() {
     }
     if (g_server && g_server->snapshot().running)
         return;
+#if defined(CUA_HYPRLAND_TEST_INPUT) || defined(CUA_HYPRLAND_INPUT)
+    if (!g_input_failure.empty())
+        throw std::runtime_error(g_input_failure);
+#endif
 
     static_cast<void>(stop_server());
     g_epoch = 0;
@@ -185,9 +192,15 @@ void reconcile_server() {
     if (server->start()) {
         g_epoch = epoch;
 #if defined(CUA_HYPRLAND_TEST_INPUT) || defined(CUA_HYPRLAND_INPUT)
-        if (!g_experiment)
-            g_experiment = std::make_unique<cua::hyprland::InputExperiment>(
-                std::filesystem::path{g_socket_path}.parent_path().string(), g_experiment_handle);
+        if (!g_experiment) {
+            try {
+                g_experiment = std::make_unique<cua::hyprland::InputExperiment>(
+                    std::filesystem::path{g_socket_path}.parent_path().string(), g_experiment_handle);
+            } catch (const std::exception& error) {
+                g_input_failure = std::format("{}; input stays off until Hyprland restarts", error.what());
+                throw std::runtime_error(g_input_failure);
+            }
+        }
         g_experiment->resume();
 #endif
     }
@@ -355,6 +368,7 @@ APICALL EXPORT void PLUGIN_EXIT() {
     // Retire input directly so an in-flight action receives plugin_shutdown,
     // not the config-disable reason from stop_server()'s suspend path.
     g_experiment.reset();
+    g_input_failure.clear();
 #endif
     static_cast<void>(stop_server());
     g_status_command.reset();

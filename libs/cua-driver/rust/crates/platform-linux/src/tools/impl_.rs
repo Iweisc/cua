@@ -134,8 +134,32 @@ fn pid_window_guarded<T: Tool + 'static>(
             .with_point_resolver(point_resolver.clone())
             .with_fallback_resolver(fallback_resolver.clone())
             .with_snapshot_resolver(snapshot_resolver.clone())
-            .with_token_pid_resolver(token_pid_resolver.clone()),
+            .with_token_pid_resolver(token_pid_resolver.clone())
+            .with_identity_check(Arc::new(hyprland_window_identity)),
     )
+}
+
+/// A Hyprland window_id is the window's address, which Hyprland gives to the
+/// next window once it closes. Refuse an id whose address now holds another
+/// window than the one Driver returned it for.
+fn hyprland_window_identity(pid: Option<i64>, window_id: u64) -> Option<ToolResult> {
+    (crate::wayland::is_wayland()
+        && crate::wayland::hyprland::is_session()
+        && crate::wayland::hyprland::window_identity(window_id).is_err())
+    .then(|| window_replaced_refusal(pid, window_id))
+}
+
+fn window_replaced_refusal(pid: Option<i64>, window_id: u64) -> ToolResult {
+    ToolResult::error(format!(
+        "window_id {window_id} named a window that has closed; Hyprland gave its address to \
+         another window. Call list_windows for the current window ids."
+    ))
+    .with_structured(json!({
+        "code": "window_id_not_found",
+        "effect": "refused",
+        "pid": pid,
+        "window_id": window_id,
+    }))
 }
 
 /// The pid an `element_token` was minted for, so a token-only action (no
@@ -311,7 +335,7 @@ impl Tool for ListAppsTool {
         let apps = tokio::task::spawn_blocking(|| -> Vec<serde_json::Value> {
             let procs = crate::proc_fs::list_processes();
             let installed = crate::installed_apps::list_installed_apps();
-            let windows = crate::wayland::list_windows_dispatch(None);
+            let (windows, identities) = crate::wayland::list_windows_with_identities(None);
 
             // An app whose launcher is not its process (`libreoffice --calc`
             // runs `soffice.bin`, `google-chrome` runs `chrome`, `gnome-terminal`
@@ -393,14 +417,15 @@ impl Tool for ListAppsTool {
                         None,
                     ),
                 };
-                let owned: Vec<Value> = windows
+                let owned: Vec<_> = windows
                     .iter()
                     .filter(|w| w.pid == Some(p.pid))
                     .filter(|w| {
                         merged.is_none_or(|idx| installed[idx].owns_window_class(&w.app_name))
                     })
-                    .map(window_record_json)
                     .collect();
+                identities.hand_out(owned.iter().copied());
+                let owned: Vec<Value> = owned.into_iter().map(window_record_json).collect();
                 out.push(json!({
                     "pid":         p.pid,
                     "bundle_id":   bundle_id,
@@ -421,12 +446,13 @@ impl Tool for ListAppsTool {
                 // `soffice.bin` showing Calc and Writer): each entry with a
                 // window is running under its own id.
                 let window_pid = by_window.get(&i).copied();
-                let owned: Vec<Value> = windows
+                let owned: Vec<_> = windows
                     .iter()
                     .filter(|w| w.pid.is_some() && w.pid == window_pid)
                     .filter(|w| app.owns_window_class(&w.app_name))
-                    .map(window_record_json)
                     .collect();
+                identities.hand_out(owned.iter().copied());
+                let owned: Vec<Value> = owned.into_iter().map(window_record_json).collect();
                 out.push(json!({
                     "pid":         window_pid.unwrap_or(0),
                     "bundle_id":   app.bundle_id.clone(),
@@ -570,10 +596,11 @@ impl Tool for ListWindowsTool {
         use cua_driver_core::tool_args::ArgsExt;
         let filter_pid = args.opt_u64("pid").map(|v| v as u32);
         let on_screen_only = args.bool_or("on_screen_only", false);
-        let mut windows =
-            tokio::task::spawn_blocking(move || crate::wayland::list_windows_dispatch(filter_pid))
-                .await
-                .unwrap_or_default();
+        let (mut windows, identities) = tokio::task::spawn_blocking(move || {
+            crate::wayland::list_windows_with_identities(filter_pid)
+        })
+        .await
+        .unwrap_or_default();
         // Exited applications can remain visible in AT-SPI/X11 as zombies;
         // never return those stale targets to callers.
         windows.retain(|window| window.pid.is_none_or(crate::proc_fs::is_process_live));
@@ -588,6 +615,7 @@ impl Tool for ListWindowsTool {
         if crate::wayland::is_wayland() {
             crate::wayland::remember_observed_window_origins(&windows);
         }
+        identities.hand_out(&windows);
         let mut lines = vec![format!("Found {} windows:", windows.len())];
         for w in &windows {
             lines.push(format!(
@@ -1273,23 +1301,21 @@ impl Tool for GetWindowStateTool {
         let popup_meta = (!crate::wayland::is_wayland())
             .then(|| crate::input::popup_window_info(xid))
             .flatten();
-        let window_meta = crate::wayland::list_windows_dispatch(Some(pid))
-            .into_iter()
-            .find(|w| w.xid == xid)
-            .or_else(|| {
-                popup_meta.as_ref().map(|popup| crate::x11::WindowInfo {
-                    xid: popup.window,
-                    pid: popup.pid,
-                    app_name: String::new(),
-                    title: popup.title.clone(),
-                    is_on_screen: true,
-                    z_index: None,
-                    x: popup.x,
-                    y: popup.y,
-                    width: popup.width,
-                    height: popup.height,
-                })
-            });
+        let (listed, identities) = crate::wayland::list_windows_with_identities(Some(pid));
+        let window_meta = listed.into_iter().find(|w| w.xid == xid).or_else(|| {
+            popup_meta.as_ref().map(|popup| crate::x11::WindowInfo {
+                xid: popup.window,
+                pid: popup.pid,
+                app_name: String::new(),
+                title: popup.title.clone(),
+                is_on_screen: true,
+                z_index: None,
+                x: popup.x,
+                y: popup.y,
+                width: popup.width,
+                height: popup.height,
+            })
+        });
         let window_matches = if crate::wayland::is_wayland() {
             window_meta.as_ref().is_some_and(|w| w.pid == Some(pid))
                 || crate::wayland::window_was_listed_for_pid(pid, xid)
@@ -1311,6 +1337,9 @@ impl Tool for GetWindowStateTool {
             return ToolResult::error(format!(
                 "Window target pid {pid}, window_id {xid} is stale or no longer running; refresh list_windows."
             ));
+        }
+        if args.opt_u64("window_id").is_some() && identities.confirm(xid).is_err() {
+            return window_replaced_refusal(Some(pid.into()), xid);
         }
 
         // Always walk the AT-SPI tree; capture the screenshot by default. The
@@ -2325,10 +2354,11 @@ fn resolve_launched_windows(
 ) -> LaunchedWindows {
     let started = std::time::Instant::now();
     loop {
-        let all = crate::wayland::list_windows_dispatch(None);
+        let (all, identities) = crate::wayland::list_windows_with_identities(None);
         if let Some(launched) = settle_launch(&all, launcher_pid, query, before, |w| {
             crate::x11::window_is_splash(w.xid)
         }) {
+            identities.hand_out(&launched.windows);
             return launched;
         }
         let launcher_exited = process_exited(launcher_pid);
@@ -2768,6 +2798,21 @@ fn require_point_args(tool: &str, args: &Value) -> Option<ToolResult> {
 #[cfg(test)]
 mod pointer_argument_tests;
 
+#[cfg(test)]
+#[test]
+fn non_ax_escalation_stays_in_the_background_where_hyprland_can_address_the_window() {
+    assert_eq!(non_ax_escalation_for(true, true)["recommended"], "px");
+    assert_eq!(
+        non_ax_escalation_for(true, false)["recommended"],
+        "foreground"
+    );
+    assert_eq!(non_ax_escalation_for(false, false)["recommended"], "px");
+    assert!(non_ax_escalation_for(true, true)["reason"]
+        .as_str()
+        .unwrap()
+        .contains("delivery_mode:\"background\""));
+}
+
 fn parse_mouse_button(name: &str) -> u8 {
     match name {
         "right" => 3,
@@ -2784,9 +2829,25 @@ fn parse_mouse_button(name: &str) -> u8 {
 /// background-target an unfocused window (libei injects to the compositor's input
 /// focus — see `input::delivery`), and the pixel path itself routes through the
 /// same coordinate-free AT-SPI actuation that just no-op'd, so the move there is
-/// to bring the window to the foreground first (`foreground`).
+/// to bring the window to the foreground first (`foreground`). Hyprland's
+/// plugin is the exception: it addresses one window, native or XWayland.
 fn non_ax_escalation() -> Value {
-    if crate::wayland::is_wayland() {
+    non_ax_escalation_for(
+        crate::wayland::is_wayland(),
+        crate::wayland::hyprland_input::enabled(),
+    )
+}
+
+fn non_ax_escalation_for(wayland: bool, hyprland_input: bool) -> Value {
+    if wayland && hyprland_input {
+        json!({
+            "recommended": "px",
+            "reason": "non-AX surface — act by pixel (x,y) off the screenshot in this \
+                       response, keeping delivery_mode:\"background\". Hyprland's plugin \
+                       addresses this window directly. A refusal is not a reason to bring \
+                       it forward."
+        })
+    } else if wayland {
         json!({
             "recommended": "foreground",
             "reason": "non-AX surface on Wayland: a specific unfocused window can't be \
@@ -4109,6 +4170,81 @@ fn element_is_menu_role(role: &str) -> bool {
     )
 }
 
+/// The real pointer a background element click can press with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ElementPointer {
+    /// The session's MPX pointer on X11.
+    Mpx,
+    /// The Hyprland input plugin's agent seat.
+    HyprlandPlugin,
+}
+
+/// How a background element click reaches the element.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ElementPress {
+    /// Fire its AT-SPI action.
+    Action,
+    /// Press the pointer at its centre.
+    Pointer,
+    /// Press the pointer while it is SHOWING, else fire its AT-SPI action.
+    PointerIfShowing,
+    /// Press the pointer when the toolkit's hit test at its centre finds it,
+    /// else fire its AT-SPI action.
+    PointerIfHit,
+}
+
+/// An AT-SPI action can open a menu or press a button, but it cannot give an
+/// entry / spin button / slider the widget focus a following type_text needs
+/// (GIMP spin scales, VS Code settings inputs, GTK entries on Hyprland), so
+/// with a real pointer those are clicked like a user would.
+///
+/// A menu / menu item's `doAction` is declined or silently ignored by
+/// LibreOffice VCL (and opens GTK menus without the pointer grab a following
+/// item click expects), so the MPX pointer presses an entry that is on screen
+/// (a menubar entry, an item of an open GTK3 / VCL popup) too. A menu item
+/// that is not showing has no point to press: gail (GTK2, GIMP) never marks
+/// menu items SHOWING, open or closed, and an item of a closed menu is still
+/// reached through its AT-SPI `click` action (the same rule the foreground
+/// route applies).
+///
+/// The plugin pointer reaches a covered window and one on a hidden workspace,
+/// but it presses whatever is at the point, so an entry scrolled out of its
+/// pane keeps its action. Menus keep their action there too: a menu needs no
+/// focus, and an item of a closed menu has no point to press.
+fn element_press(pointer: Option<ElementPointer>, role: &str) -> ElementPress {
+    let focus_taking = element_needs_real_click(role);
+    match pointer {
+        Some(ElementPointer::Mpx) if focus_taking => ElementPress::Pointer,
+        Some(ElementPointer::Mpx) if element_is_menu_role(role) => ElementPress::PointerIfShowing,
+        Some(ElementPointer::HyprlandPlugin) if focus_taking => ElementPress::PointerIfHit,
+        _ => ElementPress::Action,
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn element_clicks_press_the_pointer_only_where_an_action_falls_short() {
+    use ElementPointer::{HyprlandPlugin, Mpx};
+    use ElementPress::{Action, Pointer, PointerIfHit, PointerIfShowing};
+    let cases = [
+        ("entry", [Action, Pointer, PointerIfHit]),
+        ("Text", [Action, Pointer, PointerIfHit]),
+        ("text box", [Action, Pointer, PointerIfHit]),
+        ("spin button", [Action, Pointer, PointerIfHit]),
+        ("slider", [Action, Pointer, PointerIfHit]),
+        ("combo box", [Action, Pointer, PointerIfHit]),
+        ("menu item", [Action, PointerIfShowing, Action]),
+        ("menu", [Action, PointerIfShowing, Action]),
+        ("push button", [Action, Action, Action]),
+        ("check box", [Action, Action, Action]),
+        ("page tab", [Action, Action, Action]),
+    ];
+    for (role, expected) in cases {
+        let got = [None, Some(Mpx), Some(HyprlandPlugin)].map(|p| element_press(p, role));
+        assert_eq!(got, expected, "{role}");
+    }
+}
+
 /// A chord the window manager, not the application, acts on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WmChord {
@@ -4407,6 +4543,215 @@ fn isolated_hyprland_refusal(detail: impl Into<String>) -> ToolResult {
     }))
 }
 
+/// The Hyprland plugin refuses its input while the screen is locked or the
+/// display is off. AT-SPI reaches the app without the plugin, so element
+/// actions, `set_value` and `invoke_menu` read the same state first and refuse
+/// the same way. Pixel actions skip this: the plugin itself refuses them.
+async fn hyprland_session_refusal(
+    delivery: crate::input::delivery::DeliveryMode,
+) -> Option<ToolResult> {
+    let foreground = delivery.is_foreground();
+    tokio::task::spawn_blocking(move || {
+        hyprland_session_gate(
+            crate::wayland::hyprland_input::enabled(),
+            foreground,
+            crate::wayland::hyprland::plugin_status,
+        )
+    })
+    .await
+    .unwrap_or_else(|error| {
+        Some(hyprland_session_unavailable(
+            foreground,
+            format!("could not read the session state: {error}"),
+        ))
+    })
+}
+
+fn hyprland_session_gate(
+    plugin: bool,
+    foreground: bool,
+    status: impl FnOnce() -> anyhow::Result<Value>,
+) -> Option<ToolResult> {
+    if !plugin {
+        return None;
+    }
+    // With the plugin there, a status we cannot read may hide a lock.
+    match status().and_then(|status| crate::wayland::hyprland_input::session_available(&status)) {
+        Ok(true) => None,
+        Ok(false) => Some(hyprland_session_unavailable(
+            foreground,
+            "the screen is locked or the display is off".into(),
+        )),
+        Err(error) => Some(hyprland_session_unavailable(
+            foreground,
+            format!("could not read the session state: {error:#}"),
+        )),
+    }
+}
+
+/// Shaped like the plugin's own `session_unavailable` refusal in
+/// `hyprland_input_result`, minus the route: nothing was sent anywhere.
+fn hyprland_session_unavailable(foreground: bool, detail: String) -> ToolResult {
+    let code = if foreground {
+        "foreground_unavailable"
+    } else {
+        "background_unavailable"
+    };
+    ToolResult::error(format!("{code} (session_unavailable): {detail}")).with_structured(json!({
+        "ok": false, "code": code, "reason": "session_unavailable", "detail": detail,
+        "verified": false, "effect": "refused"
+    }))
+}
+
+#[cfg(test)]
+#[test]
+fn hyprland_element_actions_refuse_while_the_session_is_unavailable() {
+    let status = |input: Value| move || Ok(json!({ "input": input }));
+    assert!(
+        hyprland_session_gate(false, false, || panic!("read without the plugin")).is_none(),
+        "without the plugin nothing is read or refused"
+    );
+    assert!(
+        hyprland_session_gate(true, false, status(json!({"session_available": true}))).is_none()
+    );
+    for (foreground, code) in [
+        (false, "background_unavailable"),
+        (true, "foreground_unavailable"),
+    ] {
+        let refusals = [
+            hyprland_session_gate(
+                true,
+                foreground,
+                status(json!({"session_available": false})),
+            ),
+            // An older plugin without the field, and a failed read, refuse too.
+            hyprland_session_gate(true, foreground, status(json!({}))),
+            hyprland_session_gate(true, foreground, || {
+                anyhow::bail!("Hyprland IPC query timed out")
+            }),
+        ];
+        for refusal in refusals {
+            let refusal = refusal.expect("an unavailable session refuses");
+            assert_eq!(refusal.is_error, Some(true));
+            let structured = refusal.structured_content.unwrap();
+            assert_eq!(structured["code"], code);
+            assert_eq!(structured["reason"], "session_unavailable");
+            assert_eq!(structured["effect"], "refused");
+        }
+    }
+}
+
+/// The registry's input gate. With the Hyprland input plugin, agents act on
+/// window targets in the background. Desktop-scope input drives the person's
+/// own keyboard and pointer, and foreground delivery activates the target and
+/// moves their pointer, so both are refused unless the person allowed them.
+/// `disabled` is read only for those calls.
+fn global_input_gate(
+    tool: &str,
+    args: &Value,
+    disabled: impl FnOnce() -> bool,
+) -> Option<ToolResult> {
+    let names_window = ["pid", "window_id"]
+        .iter()
+        .any(|key| args.get(*key).is_some_and(|value| !value.is_null()));
+    let requested = args["scope"] == "desktop"
+        || (args["coordinate_frame"] == "desktop" && !names_window)
+        || crate::input::delivery::DeliveryMode::from_args(args).is_foreground()
+        // On Wayland the held button is always the person's own pointer
+        // (persistent_vptr), whatever the target. mouse_drag and
+        // mouse_button_up only act on a button this held.
+        || tool == "mouse_button_down";
+    if !requested || !disabled() {
+        return None;
+    }
+    use crate::wayland::hyprland_input::{global_input_detail, GLOBAL_INPUT_DISABLED};
+    let detail = global_input_detail();
+    Some(
+        ToolResult::error(format!("{GLOBAL_INPUT_DISABLED}: {detail}")).with_structured(json!({
+            "code": GLOBAL_INPUT_DISABLED, "detail": detail, "effect": "refused"
+        })),
+    )
+}
+
+#[cfg(test)]
+#[test]
+fn hyprland_refuses_input_through_the_persons_seat_unless_allowed() {
+    use crate::wayland::hyprland_input::global_input_disabled_by;
+    let no_opt_in = || global_input_disabled_by(true, || None);
+    // Normalized as the registry hands them over: a desktop target becomes
+    // scope "desktop", the dispatch alias becomes delivery_mode.
+    let window = json!({"pid": 7, "window_id": 9, "x": 5, "y": 5});
+    let refused = [
+        (
+            "hotkey",
+            json!({"scope": "desktop", "keys": ["super", "1"]}),
+        ),
+        (
+            "click",
+            json!({"scope": "desktop", "coordinate_frame": "desktop",
+                "x": 180, "y": 13, "delivery_mode": "foreground"}),
+        ),
+        (
+            "press_key",
+            json!({"coordinate_frame": "desktop", "key": "return"}),
+        ),
+        (
+            "click",
+            json!({"pid": 7, "window_id": 9, "x": 5, "y": 5, "delivery_mode": "foreground"}),
+        ),
+        ("mouse_button_down", window.clone()),
+    ];
+    for (tool, args) in &refused {
+        let refusal = global_input_gate(tool, args, no_opt_in).expect("refused");
+        assert_eq!(refusal.is_error, Some(true));
+        let structured = refusal.structured_content.unwrap();
+        assert_eq!(structured["code"], "global_input_disabled", "{tool} {args}");
+        assert_eq!(structured["effect"], "refused", "{tool} {args}");
+    }
+
+    let background = [
+        window.clone(),
+        json!({"pid": 7, "window_id": 9, "x": 5, "y": 5, "delivery_mode": "background"}),
+        // Desktop pixels addressed to one window still go to that window.
+        json!({"pid": 7, "window_id": 9, "x": 5, "y": 5, "coordinate_frame": "desktop"}),
+    ];
+    for args in &background {
+        assert!(
+            global_input_gate("click", args, || panic!("read for a background call")).is_none(),
+            "{args}"
+        );
+    }
+
+    let opted_in = || global_input_disabled_by(true, || Some(json!(true)));
+    let without_plugin = || global_input_disabled_by(false, || panic!("config read"));
+    for (tool, args) in &refused {
+        assert!(global_input_gate(tool, args, opted_in).is_none(), "{args}");
+        assert!(
+            global_input_gate(tool, args, without_plugin).is_none(),
+            "{args}"
+        );
+    }
+    // Only a JSON true opts in.
+    for value in [json!(false), json!("true"), json!(1)] {
+        assert!(
+            global_input_disabled_by(true, || Some(value.clone())),
+            "{value}"
+        );
+    }
+
+    // The plugin's own foreground refusal keeps the same code.
+    let result = hyprland_input_result(
+        Ok(json!({"ok": false, "code": "global_input_disabled", "detail": "off"})),
+        true,
+    );
+    assert_eq!(
+        result.structured_content.unwrap()["code"],
+        "global_input_disabled"
+    );
+    let public = result.action_record.unwrap().public_result().unwrap();
+    assert_eq!(public.effect, cua_driver_contract::ActionEffect::Refused);
+}
+
 fn isolated_hyprland_result(result: anyhow::Result<Value>) -> ToolResult {
     hyprland_input_result(result, false)
 }
@@ -4477,7 +4822,18 @@ fn hyprland_input_result(result: anyhow::Result<Value>, foreground: bool) -> Too
                 .unwrap_or("input refused")
                 .to_owned();
             value["reason"] = json!(code);
-            value["code"] = json!(unavailable);
+            // An outside point is the caller's mistake, not a route limit, so
+            // it keeps the code the tools document for it, as X11 reports it.
+            // A foreground route the person has not allowed keeps the same
+            // code the tool gate refuses desktop input with.
+            let message = if code == crate::wayland::hyprland_input::POINT_OUTSIDE_WINDOW
+                || code == crate::wayland::hyprland_input::GLOBAL_INPUT_DISABLED
+            {
+                format!("{code}: {detail}")
+            } else {
+                value["code"] = json!(unavailable);
+                format!("{unavailable} ({code}): {detail}")
+            };
             value["route"] = json!(if foreground {
                 "global_input"
             } else {
@@ -4488,9 +4844,9 @@ fn hyprland_input_result(result: anyhow::Result<Value>, foreground: bool) -> Too
                 .as_u64()
                 .and_then(|count| u32::try_from(count).ok())
                 .filter(|count| *count > 0);
-            let outcome = if value["effect"] == "partial"
-                && delivered.is_some_and(|count| foreground || count == 1)
-            {
+            // Background text and multi-packet scroll count acknowledged keys
+            // and packets, so a background count can exceed one drag phase.
+            let outcome = if value["effect"] == "partial" && delivered.is_some() {
                 record(ActionEffect::Partial)
                     .actual_delivery(actual)
                     .delivered_count(delivered.unwrap())
@@ -4505,7 +4861,7 @@ fn hyprland_input_result(result: anyhow::Result<Value>, foreground: bool) -> Too
             .detail(&detail)
             .build()
             .expect("isolated input outcome is valid");
-            ToolResult::error(format!("{unavailable} ({code}): {detail}"))
+            ToolResult::error(message)
                 .with_structured(value)
                 .with_action_record(outcome)
         }
@@ -4563,8 +4919,13 @@ fn isolated_hyprland_task_error(error: tokio::task::JoinError, acknowledged: boo
     )))
 }
 
+/// Starts plugin input to `target`, a (pid, window address), on a blocking
+/// worker. Refused before anything is sent when the person used the window
+/// after the agent's last read of it.
 fn spawn_isolated_hyprland(
     args: &Value,
+    target: (u32, u64),
+    foreground: bool,
     work: impl FnOnce(crate::wayland::hyprland_input::ActionCancellation) -> anyhow::Result<Value>
         + Send
         + 'static,
@@ -4576,14 +4937,29 @@ fn spawn_isolated_hyprland(
     ToolResult,
 > {
     use cua_driver_core::session;
+    let (pid, xid) = target;
+    if let Some(refusal) = cua_driver_core::snapshot_store::current_runtime_store::<
+        crate::atspi::snapshot::AtspiSnapshot,
+    >()
+    .and_then(|store| store.person_used_window(pid as i32, xid))
+    {
+        return Err(refusal);
+    }
+    let unadmitted = |detail: &str| {
+        if foreground {
+            foreground_hyprland_refusal("authenticated admitted lifecycle required")
+        } else {
+            isolated_hyprland_refusal(detail.to_owned())
+        }
+    };
     let owner = named_session_cursor_key(args)
-        .ok_or_else(|| isolated_hyprland_refusal("authenticated lifecycle required"))?;
+        .ok_or_else(|| unadmitted("authenticated lifecycle required"))?;
     let transport_owner = args
         .get("_transport_session_id")
         .and_then(Value::as_str)
         .unwrap_or(&owner);
     let snapshot = session::session_snapshot(&owner, transport_owner, std::time::Duration::ZERO)
-        .ok_or_else(|| isolated_hyprland_refusal("admitted lifecycle required"))?;
+        .ok_or_else(|| unadmitted("admitted lifecycle required"))?;
     // Retain admission before spawning: aborting the async caller must not
     // complete session teardown while its native worker still owns input.
     let lifecycle = session::begin_session_dispatch(
@@ -4594,7 +4970,7 @@ fn spawn_isolated_hyprland(
         snapshot.transport,
         snapshot.client_kind,
     )
-    .map_err(isolated_hyprland_refusal)?;
+    .map_err(unadmitted)?;
     let (guard, cancellation) = crate::wayland::hyprland_input::ActionCancellation::invocation();
     let dispatch = tokio::task::spawn_blocking(move || {
         let _lifecycle = lifecycle;
@@ -4610,12 +4986,13 @@ async fn isolated_hyprland_action(
     action: crate::wayland::hyprland_input::Action,
 ) -> ToolResult {
     let owner = named_session_cursor_key(args);
-    let (_cancellation, dispatch) = match spawn_isolated_hyprland(args, move |cancellation| {
-        crate::wayland::hyprland_input::execute(owner, pid, xid, action, cancellation)
-    }) {
-        Ok(dispatch) => dispatch,
-        Err(refusal) => return refusal,
-    };
+    let (_cancellation, dispatch) =
+        match spawn_isolated_hyprland(args, (pid, xid), false, move |cancellation| {
+            crate::wayland::hyprland_input::execute(owner, pid, xid, action, cancellation)
+        }) {
+            Ok(dispatch) => dispatch,
+            Err(refusal) => return refusal,
+        };
     match dispatch.await {
         Ok(result) => isolated_hyprland_result(result),
         Err(error) => isolated_hyprland_task_error(error, false),
@@ -4641,12 +5018,19 @@ async fn foreground_hyprland_action(
         return foreground_hyprland_refusal("production Hyprland input plugin is unavailable");
     }
     let owner = named_session_cursor_key(args);
-    let (_cancellation, dispatch) = match spawn_isolated_hyprland(args, move |cancellation| {
-        crate::wayland::hyprland_input::execute_foreground(owner, pid, xid, action, cancellation)
-    }) {
-        Ok(dispatch) => dispatch,
-        Err(_) => return foreground_hyprland_refusal("authenticated admitted lifecycle required"),
-    };
+    let (_cancellation, dispatch) =
+        match spawn_isolated_hyprland(args, (pid, xid), true, move |cancellation| {
+            crate::wayland::hyprland_input::execute_foreground(
+                owner,
+                pid,
+                xid,
+                action,
+                cancellation,
+            )
+        }) {
+            Ok(dispatch) => dispatch,
+            Err(refusal) => return refusal,
+        };
     hyprland_input_result(
         match dispatch.await {
             Ok(result) => result,
@@ -4669,18 +5053,19 @@ async fn foreground_hyprland_scroll(
         return foreground_hyprland_refusal("production Hyprland input plugin is unavailable");
     }
     let owner = named_session_cursor_key(args);
-    let (_cancellation, dispatch) = match spawn_isolated_hyprland(args, move |cancellation| {
-        crate::wayland::hyprland_input::execute_foreground_scroll(
-            owner,
-            pid,
-            xid,
-            actions,
-            cancellation,
-        )
-    }) {
-        Ok(dispatch) => dispatch,
-        Err(_) => return foreground_hyprland_refusal("authenticated admitted lifecycle required"),
-    };
+    let (_cancellation, dispatch) =
+        match spawn_isolated_hyprland(args, (pid, xid), true, move |cancellation| {
+            crate::wayland::hyprland_input::execute_foreground_scroll(
+                owner,
+                pid,
+                xid,
+                actions,
+                cancellation,
+            )
+        }) {
+            Ok(dispatch) => dispatch,
+            Err(refusal) => return refusal,
+        };
     hyprland_input_result(
         match dispatch.await {
             Ok(result) => result,
@@ -4763,6 +5148,29 @@ async fn focus_hyprland_foreground(
 }
 
 #[cfg(test)]
+#[test]
+fn input_to_a_window_the_person_used_is_refused_before_admission() {
+    cua_driver_core::tool::with_runtime_scope("person-used-input".into(), || {
+        let state = ToolState::new();
+        state
+            .snapshots
+            .publish(7, 9, crate::atspi::snapshot::AtspiSnapshot::from_nodes(&[]));
+        assert_eq!(state.snapshots.retire_person_window(9), 1);
+        for foreground in [false, true] {
+            let Err(refusal) =
+                spawn_isolated_hyprland(&json!({}), (7, 9), foreground, |_| Ok(json!({})))
+            else {
+                panic!("input to a window the person used was started");
+            };
+            assert_eq!(
+                refusal.structured_content.unwrap()["code"],
+                "person_used_window"
+            );
+        }
+    });
+}
+
+#[cfg(test)]
 #[tokio::test]
 async fn isolated_worker_retains_lifecycle_until_native_work_exits() {
     use cua_driver_core::session::{self, SessionClientKind, SessionTransport};
@@ -4781,6 +5189,8 @@ async fn isolated_worker_retains_lifecycle_until_native_work_exits() {
     let (release, released) = std::sync::mpsc::channel();
     let (cancellation, dispatch) = spawn_isolated_hyprland(
         &json!({"_session_id":sid,"_transport_session_id":owner}),
+        (1, 1),
+        false,
         move |_| {
             started.send(()).unwrap();
             released.recv().unwrap();
@@ -4902,6 +5312,32 @@ fn type_text_routes_isolated_background_before_generic_wayland_refusal() {
         "the plugin route must run before the generic focused-input refusal"
     );
     assert!(invoke.contains("execute_background_text"));
+}
+
+#[cfg(test)]
+#[test]
+fn isolated_pixel_click_goes_straight_to_the_plugin_pointer() {
+    // Structural, like the tests above: the branch needs a live plugin. An
+    // AT-SPI action in front of the pointer opened Ghostty's tab overview.
+    let source = include_str!("impl_.rs");
+    let pixel_path = source
+        .rsplit_once("impl Tool for ClickTool {")
+        .unwrap()
+        .1
+        .split_once("impl Tool for TypeTextTool {")
+        .unwrap()
+        .0
+        .split_once("// Coordinate-based path.")
+        .unwrap()
+        .1;
+    let before_plugin = pixel_path
+        .split_once("if isolated_background {")
+        .unwrap()
+        .1
+        .split_once("return isolated_hyprland_action(")
+        .expect("isolated pixel clicks must use the plugin pointer")
+        .0;
+    assert!(!before_plugin.contains("atspi"), "{before_plugin}");
 }
 
 #[cfg(test)]
@@ -5209,6 +5645,19 @@ fn isolated_hyprland_refused_partial_and_unknown_outcomes_stay_distinct() {
     assert_eq!(public.effect, cua_driver_contract::ActionEffect::Partial);
     assert_eq!(public.delivery.unwrap().delivered_count, Some(1));
 
+    // A type_text the person interrupts by entering the app keeps its count.
+    let interrupted = isolated_hyprland_result(Ok(
+        json!({"ok":false,"code":"primary_keyboard_busy","detail":"primary_keyboard_busy",
+        "effect":"partial","delivery":{"mode":"background","delivered_count":5}}),
+    ));
+    let content = interrupted.structured_content.as_ref().unwrap();
+    assert_eq!(content["reason"], "primary_keyboard_busy");
+    assert_eq!(content["effect"], "partial");
+    let public = interrupted.action_record.unwrap().public_result().unwrap();
+    public.validate_invariants().unwrap();
+    assert_eq!(public.effect, cua_driver_contract::ActionEffect::Partial);
+    assert_eq!(public.delivery.unwrap().delivered_count, Some(5));
+
     let unknown = isolated_hyprland_result(Err(anyhow::anyhow!("connection lost")));
     let public = unknown.action_record.unwrap().public_result().unwrap();
     assert_eq!(
@@ -5269,6 +5718,38 @@ fn experimental_dispatch_does_not_claim_application_success() {
     assert_eq!(value["effect"], "unverifiable");
     assert_eq!(value["route"], "synthetic_events");
     assert!(value.get("verified").is_none());
+}
+
+#[cfg(test)]
+#[test]
+fn hyprland_outside_point_keeps_the_cross_platform_refusal_code() {
+    // A multi-packet scroll reports its refusal with an empty delivery.
+    for (reply, foreground) in [
+        (
+            json!({"ok":false,"code":"point_outside_window","detail":"outside"}),
+            false,
+        ),
+        (
+            json!({"ok":false,"code":"point_outside_window","detail":"outside"}),
+            true,
+        ),
+        (
+            json!({"ok":false,"code":"point_outside_window","detail":"outside","effect":"none",
+                "delivery":{"mode":"background","delivered_count":0}}),
+            false,
+        ),
+    ] {
+        let result = hyprland_input_result(Ok(reply), foreground);
+        assert_eq!(result.is_error, Some(true));
+        let value = result.structured_content.as_ref().unwrap();
+        assert_eq!(value["code"], "point_outside_window");
+        assert_eq!(value["effect"], "refused");
+        assert!(value.get("delivery").is_none());
+        let public = result.action_record.unwrap().public_result().unwrap();
+        public.validate_invariants().unwrap();
+        assert_eq!(public.effect, cua_driver_contract::ActionEffect::Refused);
+        assert!(public.delivery.is_none());
+    }
 }
 
 #[cfg(test)]
@@ -6403,8 +6884,11 @@ impl Tool for ClickTool {
                 delivery first resolves the accessible under the point and fires its action \
                 (the result says `hit: <role> \"<name>\" action=...`; a file / list item is \
                 selected through its container: `selected: ...`), else presses the real \
-                virtual pointer there. A click that opens a popup menu names it (`popup: \
-                {window_id, bounds}`): pass that window_id to get_window_state to index its \
+                virtual pointer there. With the Hyprland input plugin, a pixel click is \
+                always a real pointer click on what the window draws there, its open menu \
+                included, even where that menu extends past the window. A click that opens \
+                a popup menu names it (`popup: {window_id, bounds}`): pass that window_id to \
+                get_window_state to index its \
                 items. The token is stale once the next get_window_state of the same \
                 window replaces its snapshot — \
                 re-snapshot every turn before clicking.\n\n\
@@ -6612,6 +7096,9 @@ impl Tool for ClickTool {
         }
 
         if let Some(idx) = elem_idx_resolved {
+            if let Some(refusal) = hyprland_session_refusal(delivery).await {
+                return refusal;
+            }
             // The observed element: its proven AT-SPI identity and the frame
             // the snapshot recorded. Every route below acts on that identity
             // (or its cached frame); the live ordinal `idx` is only an
@@ -6693,35 +7180,41 @@ impl Tool for ClickTool {
                     "an exact window_id or window-bound element token is required",
                 );
             }
-            // An AT-SPI action can open a menu or press a button, but it cannot
-            // give an entry / spin button / slider the widget focus a following
-            // type_text needs (GIMP spin scales, VS Code settings inputs). With
-            // the MPX real pointer available, click those like a user would.
             let needs_real_click = element_needs_real_click(&observed.role);
-            // A menu / menu item's `doAction` is declined or silently ignored
-            // by LibreOffice VCL (and opens GTK menus without the pointer
-            // grab a following item click expects): with a real pointer, press
-            // it like a user would and let the popup be listed. That holds
-            // for an entry that is on screen (SHOWING: a menubar entry, an
-            // item of an open GTK3 / VCL popup). A menu item that is not
-            // showing has no point to press: gail (GTK2, GIMP) never marks
-            // menu items SHOWING, open or closed, and an item of a closed
-            // menu is still reached through its AT-SPI `click` action (the
-            // same rule the foreground route applies), so those keep the
-            // action route.
-            let real_pointer = !delivery.is_foreground()
+            let pointer = if isolated_background {
+                Some(ElementPointer::HyprlandPlugin)
+            } else if !delivery.is_foreground()
                 && !crate::wayland::wayland_input_enabled()
-                && crate::input::real_pointer_input_available();
-            let menu_entry_on_screen = real_pointer && element_is_menu_role(&observed.role) && {
-                // A bounded D-Bus round-trip: off the runtime thread.
-                let observed_for_state = observed.clone();
-                let showing = tokio::task::spawn_blocking(move || {
-                    crate::atspi::element_showing_observed(&observed_for_state)
-                })
-                .await;
-                !matches!(showing, Ok(Ok(false)))
+                && crate::input::real_pointer_input_available()
+            {
+                Some(ElementPointer::Mpx)
+            } else {
+                None
             };
-            let real_click_role = real_pointer && (needs_real_click || menu_entry_on_screen);
+            let real_click_role = match element_press(pointer, &observed.role) {
+                ElementPress::Action => false,
+                ElementPress::Pointer => true,
+                ElementPress::PointerIfShowing => {
+                    // A bounded D-Bus round-trip: off the runtime thread.
+                    let observed_for_state = observed.clone();
+                    let showing = tokio::task::spawn_blocking(move || {
+                        crate::atspi::element_showing_observed(&observed_for_state)
+                    })
+                    .await;
+                    !matches!(showing, Ok(Ok(false)))
+                }
+                ElementPress::PointerIfHit => {
+                    // A press that may land on another widget is worse than
+                    // an action that leaves the focus where it was, so an
+                    // unanswered hit test keeps the action.
+                    let observed_for_hit = observed.clone();
+                    let hit = tokio::task::spawn_blocking(move || {
+                        crate::atspi::element_hit_at_centre_observed(&observed_for_hit)
+                    })
+                    .await;
+                    matches!(hit, Ok(Ok(true)))
+                }
+            };
             // Without a real pointer, an editable / table cell cannot take a
             // background click that gives it focus: refuse instead of firing
             // an AT-SPI action whose effect is not a click.
@@ -6864,8 +7357,11 @@ impl Tool for ClickTool {
                     );
                 };
                 let owner = named_session_cursor_key(&args);
-                let (_cancellation, dispatch) =
-                    match spawn_isolated_hyprland(&args, move |cancellation| {
+                let (_cancellation, dispatch) = match spawn_isolated_hyprland(
+                    &args,
+                    (pid, exact_xid),
+                    false,
+                    move |cancellation| {
                         let (_, x, y) = resolve_element_local_coords(pid, idx, Some(exact_xid))?;
                         crate::wayland::hyprland_input::execute(
                             owner,
@@ -6879,10 +7375,11 @@ impl Tool for ClickTool {
                             },
                             cancellation,
                         )
-                    }) {
-                        Ok(dispatch) => dispatch,
-                        Err(refusal) => return refusal,
-                    };
+                    },
+                ) {
+                    Ok(dispatch) => dispatch,
+                    Err(refusal) => return refusal,
+                };
                 return match dispatch.await {
                     Ok(result) => isolated_hyprland_result(result),
                     Err(error) => isolated_hyprland_task_error(error, false),
@@ -7121,17 +7618,10 @@ impl Tool for ClickTool {
                     "modified clicks are unsupported by isolated input",
                 );
             }
-            if button == 1 && count == 1 {
-                let semantic = tokio::task::spawn_blocking(move || {
-                    crate::atspi::perform_action_at_screen_point(pid, xid, output_x, output_y)
-                })
-                .await;
-                if matches!(semantic, Ok(Ok(Some(_)))) {
-                    return ToolResult::text("Dispatched AT-SPI click.").with_structured(json!({
-                        "path": "wayland_atspi", "verified": false, "effect": "unverifiable"
-                    }));
-                }
-            }
+            // A pixel click is a pointer click here, as on macOS. Don't put the
+            // AT-SPI action under the point in front of it: that action is not
+            // a click. It opened Ghostty's tab overview from a full-window
+            // `overview.open` node, and left the caret where it was in Code.
             return isolated_hyprland_action(
                 &args,
                 pid,
@@ -7581,6 +8071,11 @@ impl Tool for TypeTextTool {
             }
         };
         let delivery = crate::input::delivery::DeliveryMode::from_args(&args);
+        if resolved_elem_idx.is_some() {
+            if let Some(refusal) = hyprland_session_refusal(delivery).await {
+                return refusal;
+            }
+        }
         if isolated_hyprland_background(delivery)
             && resolved_elem_idx.is_none()
             && args.get("x").is_none()
@@ -7600,7 +8095,7 @@ impl Tool for TypeTextTool {
                 .await;
             let owner = named_session_cursor_key(&args);
             let (_cancellation, dispatch) =
-                match spawn_isolated_hyprland(&args, move |cancellation| {
+                match spawn_isolated_hyprland(&args, (pid, xid), false, move |cancellation| {
                     crate::wayland::hyprland_input::execute_background_text(
                         owner,
                         pid,
@@ -7708,7 +8203,7 @@ impl Tool for TypeTextTool {
             }
             let owner = named_session_cursor_key(&args);
             let (_cancellation, dispatch) =
-                match spawn_isolated_hyprland(&args, move |cancellation| {
+                match spawn_isolated_hyprland(&args, (pid, xid), true, move |cancellation| {
                     crate::wayland::hyprland_input::execute_foreground_text(
                         owner,
                         pid,
@@ -7718,11 +8213,7 @@ impl Tool for TypeTextTool {
                     )
                 }) {
                     Ok(dispatch) => dispatch,
-                    Err(_) => {
-                        return foreground_hyprland_refusal(
-                            "authenticated admitted lifecycle required",
-                        )
-                    }
+                    Err(refusal) => return refusal,
                 };
             return hyprland_input_result(
                 match dispatch.await {
@@ -8533,6 +9024,11 @@ impl Tool for PressKeyTool {
         // background path (the focus-click already handled fronting when fg). Pass x,y
         // (no element_token) for Chromium/Electron surfaces the AX path can't focus.
         let delivery = crate::input::delivery::DeliveryMode::from_args(&args);
+        if resolved_element_index.is_some() {
+            if let Some(refusal) = hyprland_session_refusal(delivery).await {
+                return refusal;
+            }
+        }
         if isolated_hyprland_background(delivery) {
             if xid_opt.is_none() {
                 return isolated_hyprland_refusal(
@@ -8979,6 +9475,11 @@ impl Tool for HotkeyTool {
         let key_for_wayland = key.clone();
         let mods_for_wayland = mods.clone();
         let delivery = crate::input::delivery::DeliveryMode::from_args(&args);
+        if resolved_element_index.is_some() {
+            if let Some(refusal) = hyprland_session_refusal(delivery).await {
+                return refusal;
+            }
+        }
 
         if isolated_hyprland_background(delivery) {
             if xid_opt.is_none() {
@@ -9314,6 +9815,9 @@ impl Tool for SetValueTool {
         let value_for_task = value.clone();
         let xid_opt = Some(xid);
         let delivery = crate::input::delivery::DeliveryMode::from_args(&args);
+        if let Some(refusal) = hyprland_session_refusal(delivery).await {
+            return refusal;
+        }
         let cursor_id = resolve_cursor_key(&args);
         position_named_session_keyboard_cursor(&self.state, &args, pid, xid, Some(idx), None, true)
             .await;
@@ -9922,6 +10426,11 @@ impl Tool for ScrollTool {
                 "Pass either element_token (ax) or x,y (px) to scroll, not both.",
             );
         }
+        if resolved_element_index.is_some() {
+            if let Some(refusal) = hyprland_session_refusal(delivery).await {
+                return refusal;
+            }
+        }
 
         if named_session_cursor_key(&args).is_some() {
             let visual_target = tokio::task::spawn_blocking(move || {
@@ -10018,7 +10527,7 @@ impl Tool for ScrollTool {
             }
             let owner = named_session_cursor_key(&args);
             let (_cancellation, dispatch) =
-                match spawn_isolated_hyprland(&args, move |cancellation| {
+                match spawn_isolated_hyprland(&args, (pid, xid), false, move |cancellation| {
                     let point = if let Some(idx) = resolved_element_index {
                         let (_, x, y) = resolve_element_local_coords(pid, idx, Some(xid))?;
                         Some((x, y))
@@ -11124,7 +11633,7 @@ impl Tool for DragTool {
             );
             let (started, acknowledged) = tokio::sync::oneshot::channel();
             let (_cancellation, mut dispatch) =
-                match spawn_isolated_hyprland(&args, move |cancellation| {
+                match spawn_isolated_hyprland(&args, (pid, xid), true, move |cancellation| {
                     crate::wayland::hyprland_input::execute_foreground_with_started(
                         owner,
                         pid,
@@ -11139,11 +11648,7 @@ impl Tool for DragTool {
                     )
                 }) {
                     Ok(dispatch) => dispatch,
-                    Err(_) => {
-                        return foreground_hyprland_refusal(
-                            "authenticated admitted lifecycle required",
-                        )
-                    }
+                    Err(refusal) => return refusal,
                 };
             let acknowledged = acknowledged.await.is_ok();
             let result = if acknowledged {
@@ -11187,7 +11692,7 @@ impl Tool for DragTool {
             );
             let (started, acknowledged) = tokio::sync::oneshot::channel();
             let (_cancellation, mut dispatch) =
-                match spawn_isolated_hyprland(&args, move |cancellation| {
+                match spawn_isolated_hyprland(&args, (pid, xid), false, move |cancellation| {
                     crate::wayland::hyprland_input::execute_with_started(
                         owner,
                         pid,
@@ -12713,7 +13218,7 @@ impl Tool for GetDesktopStateTool {
             };
             // Which pid owns which window is what the agent needs before its
             // first click; without it the first action guesses `pid: 1`.
-            let mut windows = crate::wayland::list_windows_dispatch(None);
+            let (mut windows, identities) = crate::wayland::list_windows_with_identities(None);
             windows
                 .retain(|w| w.is_on_screen && w.pid.is_some_and(crate::proc_fs::is_process_live));
             if let Some(frame) = &hyprland_frame {
@@ -12733,6 +13238,7 @@ impl Tool for GetDesktopStateTool {
                 (shot_w, shot_h),
                 (screen_w, screen_h),
             )?;
+            identities.hand_out(&windows);
             Ok((
                 b64,
                 shot_w,
@@ -13524,10 +14030,17 @@ impl Tool for GetAccessibilityTreeTool {
     }
     async fn invoke(&self, _args: Value) -> ToolResult {
         let (procs, windows) = tokio::task::spawn_blocking(|| {
-            (
-                crate::proc_fs::list_processes(),
-                crate::x11::list_windows(None),
-            )
+            // Hyprland ids are compositor addresses. XIDs from X11 name XWayland
+            // windows that get_window_state and input cannot resolve there.
+            let windows = if crate::wayland::is_wayland() && crate::wayland::hyprland::is_session()
+            {
+                let (windows, identities) = crate::wayland::list_windows_with_identities(None);
+                identities.hand_out(&windows);
+                windows
+            } else {
+                crate::x11::list_windows(None)
+            };
+            (crate::proc_fs::list_processes(), windows)
         })
         .await
         .unwrap_or_default();
@@ -14088,6 +14601,9 @@ impl Tool for InvokeMenuTool {
         {
             return menu_refusal("invoke_menu: window_id does not belong to pid".into());
         }
+        if let Some(refusal) = hyprland_session_refusal(delivery).await {
+            return refusal;
+        }
 
         if !crate::wayland::is_wayland() && !delivery.is_foreground() {
             let outcome = tokio::task::spawn_blocking(move || {
@@ -14468,8 +14984,16 @@ pub fn build_registry_with_provider(
     provider: Option<std::sync::Arc<dyn cua_driver_core::consent::ProtectedConsentProvider>>,
 ) -> ToolRegistry {
     let mut r = ToolRegistry::new_with_protected_consent_provider(provider);
+    r.set_input_gate(|tool, args| {
+        global_input_gate(
+            tool,
+            args,
+            crate::wayland::hyprland_input::global_input_disabled,
+        )
+    });
     let state = ToolState::new_with_capture_service(r.capture_service());
     if crate::wayland::is_wayland() && crate::wayland::hyprland::is_session() {
+        crate::wayland::person_focus::start();
         let recording_state = Arc::downgrade(&state);
         r.recording
             .set_pixel_point_fn(move |args, window_id, pid, mut x, mut y| {

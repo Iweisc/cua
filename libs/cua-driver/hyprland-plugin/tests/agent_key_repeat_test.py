@@ -121,7 +121,7 @@ struct Lane {
     void finish_foreground() {}
     void retire_grant() {}
     // PRODUCTION_METHODS
-    void key_request(Client& c, const std::vector<std::string>& f, std::uint64_t cap) {
+    void key_request(Client& c, const std::vector<std::string>& f, std::uint64_t cap, bool xsend = false) {
         // PRODUCTION_KEY
         complete_action();
     }
@@ -183,6 +183,12 @@ int main() {
     check(keys == Log{"key 42 down", "key 30 down", "key 30 up", "key 42 up", "leave"},
           "KEY releases every key it pressed before leaving focus");
     check(lane.held_keys.empty(), "no key is held after the KEY request returns");
+
+    // Driver sends an XSEND_KEY to the X window itself, so the plugin sends nothing.
+    const auto before = typing.log.size();
+    lane.key_request(client, {"XSEND_KEY", "2", "token", "1", "30", "1"}, 2, true);
+    check(lane.responses.empty(), "XSEND_KEY was refused");
+    check(typing.log.size() == before, "XSEND_KEY sends no key event and no focus change");
     std::cout << "agent key repeat tests passed\n";
 }
 '''
@@ -202,8 +208,8 @@ def production_fixture(source):
     methods = '\n'.join(method(source, name) for name in (
         'sync_key_repeat', 'add_keyboard', 'keyboard_enter', 'key', 'leave_keyboard', 'complete_action'))
     # The independent-route KEY branch of request(), not the foreground one.
-    branch = re.search(r'            foreground_request\(c, f, cap\);\n            return;\n        }\n'
-                       r'        if \(command == "KEY"\) \{\n(.*?)^        } else \{', source, re.M | re.S)
+    branch = re.search(r'            primary_background_request\(c, f, cap\);\n            return;\n        }\n'
+                       r'        if \(command == "KEY" \|\| xsend\) \{\n(.*?)^        } else \{', source, re.M | re.S)
     if not branch:
         raise AssertionError('production independent KEY branch not found')
     return (FIXTURE.replace('// PRODUCTION_STATE', state.group().strip())
@@ -217,7 +223,7 @@ class AgentKeyRepeatTest(unittest.TestCase):
         # Fail if the tested pieces are disconnected from the production paths.
         self.assertIn('sync_key_repeat(keyboard);', method(source, 'sync_keymap'))
         self.assertIn('leave_keyboard();', method(source, 'complete_action'))
-        self.assertRegex(source, r'\+\+dispatches;\n[^\n]*\n        if \(kProduction\) complete_action\(\);\n'
+        self.assertRegex(source, r'\+\+dispatches;\n(?:[^\n]*\n){1,2}        if \(kProduction\) complete_action\(\);\n'
                                  r'        send\(c, kDelivered\);')
         compiler = shlex.split(os.environ.get('CXX', '')) or [
             shutil.which('clang++-18') or shutil.which('clang++') or 'c++']

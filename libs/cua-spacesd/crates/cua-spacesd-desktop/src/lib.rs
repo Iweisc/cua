@@ -301,29 +301,6 @@ impl TargetCatalog {
     }
 }
 
-/// A background session reaches a Hyprland window only through the
-/// cua-hyprland-plugin's isolated seats, which admit qualified clients only.
-/// Any other window is refused when the session opens, as X11 refuses a
-/// toolkit that drops synthetic events, instead of acknowledging every
-/// batch as undelivered.
-#[cfg(target_os = "linux")]
-fn hyprland_background_admission(native: NativeTarget) -> Result<(), ProviderError> {
-    use platform_linux::wayland::hyprland_input;
-    if !hyprland_input::enabled() {
-        return Ok(());
-    }
-    let pid = u32::try_from(native.pid).unwrap_or(0);
-    hyprland_input::background_admission(pid).map_err(|reason| {
-        ProviderError::new(
-            ProviderErrorCode::WouldRequireActivation,
-            format!(
-                "Hyprland background input does not reach this window ({reason}); \
-                 open the session with allow_activation"
-            ),
-        )
-    })
-}
-
 /// [`tool_input::GestureTools`] over the embedded cua-driver registry, in
 /// native pixels. A human viewer's input runs in its own human-origin driver
 /// session ([`human_input_session`]): no agent cursor in the guest, and none
@@ -1087,9 +1064,6 @@ impl InteractiveInputProvider for CuaInteractiveInputProvider {
                     delivery_mode,
                     |target| {
                         let native = inner.native(target)?;
-                        if delivery_mode == cua_driver_core::interactive_input::InteractiveDeliveryMode::Background {
-                            hyprland_background_admission(native)?;
-                        }
                         let descriptor = inner
                             .catalog
                             .lock()

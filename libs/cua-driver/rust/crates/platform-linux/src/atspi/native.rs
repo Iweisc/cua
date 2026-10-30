@@ -3755,6 +3755,65 @@ pub fn element_showing_ref(object_ref: &ObjectRef) -> Result<bool> {
     )
 }
 
+/// Whether the toolkit's own hit test at the centre of a snapshot-cached
+/// element comes back to that element, so a pointer press there lands on it.
+/// GTK4 keeps an entry scrolled out of its pane SHOWING, and its centre then
+/// lies over whatever is below the pane. Both the centre and the hit test
+/// are in the toolkit's `Window` coordinates, from the element's own frame.
+pub fn element_hit_at_centre_ref(identity: &AtspiIdentity, object_ref: &ObjectRef) -> Result<bool> {
+    bounded_for(
+        INPUT_QUERY_BUDGET,
+        async {
+            let conn = shared_connection().await?;
+            let (acc, _) = live_accessible(conn, object_ref).await?;
+            let Some(Ok(proxies)) = call(acc.proxies()).await else {
+                return Err(anyhow!("cached element did not answer in time"));
+            };
+            let Some(Ok(component)) = call(proxies.component()).await else {
+                return Err(anyhow!("cached element has no Component interface"));
+            };
+            let Some(Ok((x, y, w, h))) = call(component.get_extents(CoordType::Window)).await
+            else {
+                return Err(anyhow!("cached element reports no extents"));
+            };
+            if w <= 0 || h <= 0 {
+                return Ok(false);
+            }
+            let frame = RawObjectRef {
+                name: identity.frame_bus_name.clone(),
+                path: identity.frame_path.clone(),
+            };
+            let target = raw_ref(object_ref);
+            let chain = descend_at_point(conn, frame.clone(), x + w / 2, y + h / 2).await;
+            // GTK4 and Firefox answer with the deepest node at once, such as
+            // the text inside a GTK4 entry, so look for the element above it.
+            let Some(mut node) = chain.into_iter().last() else {
+                return Ok(false);
+            };
+            for _ in 0..64 {
+                if node.oref == target {
+                    return Ok(true);
+                }
+                if node.oref == frame {
+                    break;
+                }
+                let Some(Ok(parent)) = call(node.acc.parent()).await else {
+                    break;
+                };
+                let Some(parent) = RawObjectRef::from_atspi(&parent) else {
+                    break;
+                };
+                let Some(Ok(acc)) = call(accessible_for(conn, &parent)).await else {
+                    break;
+                };
+                node = HitNode { acc, oref: parent };
+            }
+            Ok(false)
+        },
+        || Err(anyhow!("element hit test timed out")),
+    )
+}
+
 /// [`focus_element`] on a snapshot-cached element identity.
 pub fn focus_element_ref(object_ref: &ObjectRef) -> Result<bool> {
     bounded_for(
@@ -5148,13 +5207,15 @@ pub fn perform_action_at_screen_point(
 /// AT-SPI roles whose `activate`/`press` action does not move the widget
 /// focus into them (Chromium and GTK entries, spin buttons, sliders, table
 /// cells), so a following keystroke would land elsewhere; a real pointer
-/// click at the point is what a user does.
+/// click at the point is what a user does. GTK4 names its entries and text
+/// views `text box`.
 pub fn is_focus_taking_role(role: &str) -> bool {
     matches!(
         role.trim().to_ascii_lowercase().as_str(),
         "table cell"
             | "spin button"
             | "text"
+            | "text box"
             | "entry"
             | "password text"
             | "slider"

@@ -29,6 +29,17 @@ that the chosen background route is unavailable or ineffective. Target-specific
 activation and restoration depend on the compositor adapter. If activation
 cannot be proven, accept the refusal instead of sending keys to whatever is focused.
 
+**Hyprland with the input plugin: window targets only.** Act on a window
+target (`pid`, `window_id`) in the background. That reaches any window,
+including X windows and windows on hidden or other workspaces, without touching
+the user's pointer or focus. Never use desktop-scope input there. Desktop-scope
+input, `delivery_mode:"foreground"`, `bring_to_front`, and `mouse_button_down`
+would take over the user's keyboard or mouse, so they refuse with
+`global_input_disabled` and `effect:"refused"`, and nothing is sent. Only the
+user can allow them, with `"allow_global_input": true` in
+`~/.cua-driver/config.json`. See
+[Hyprland input v3](#hyprland-input-v3-source-candidate).
+
 The overlay is separate from the physical pointer; cursor-bearing and
 keyboard actions re-show it automatically. Distinct overlays do not isolate
 desktop input. Keep one controller for a global-input workflow.
@@ -52,6 +63,8 @@ attested window capture.
    Use `get_desktop_state`, then
    `target:{"kind":"desktop","display_id":"primary"}` on input, and verify
    through another desktop snapshot. See [the desktop loop](WORKFLOW.md#desktop-loop).
+   On Hyprland with the input plugin, desktop input refuses with
+   `global_input_disabled`: keep acting on the window target instead.
 4. If desktop scope is not admitted, report the limitation and stop that route.
 
 A capture request may be waiting for an OS/portal permission dialog. Inspect
@@ -259,7 +272,7 @@ driver selects a backend from compositor capabilities:
   wlr-screencopy, virtual pointer, and virtual keyboard protocols.
 - Hyprland has separate discovery and capture adapters. Its optional plugin
   defaults to discovery-only; the opt-in input v3 source candidate has the
-  qualification and validation limits below. Do not inherit Sway coverage.
+  validation limits below. Do not inherit Sway coverage.
 - GNOME/Mutter uses the bundled WinRects Shell helper for target geometry and
   activation, plus portal/libei for foreground raw input.
 - KDE/KWin uses AT-SPI and portal facilities where available. Target-specific
@@ -279,7 +292,7 @@ control. Other focus-bound background pointer and keyboard shapes return an
 exact `background_unavailable` result. They do not report success after a
 silent drop.
 
-Outside an explicitly enabled, qualified compositor-owned background route,
+Outside an explicitly enabled compositor-owned background route,
 raw Wayland input requires explicitly authorized `delivery_mode:"foreground"`.
 The driver activates the selected target through a verified compositor adapter
 before dispatch. If
@@ -303,27 +316,206 @@ toolchain; v3 uses `CUA_HYPRLAND_INPUT=ON`, separate from the historical
 Driver admits each action through its normal shared permission, resource, and
 lifecycle policy. There is no additional Omarchy approval panel or external
 signer. The plugin accepts the trusted desktop account over same-user local
-sockets; this does not sandbox native code running as that user. Application
-qualification is a compatibility check, not authorization.
+sockets; this does not sandbox native code running as that user.
 
-The initial native qualification scope is Calc from `libreoffice-fresh 26.2.5-3`
-and Inkscape `1.4.4-6`, subject to per-operation native evidence. Before each
-action, Driver matches `/proc/<pid>/exe` to the canonical executable path
-(`/usr/lib/libreoffice/program/soffice.bin` or `/usr/bin/inkscape`), checks the
-exact package name and version in the local pacman database and its executable
-file listing, and rechecks process identity. Unknown or unavailable package
-identity refuses. Package eligibility does not certify every LibreOffice
-application or operation.
+Background input reaches any app, as on macOS. There is no app list. Cua's
+recorded native evidence covers Calc from `libreoffice-fresh 26.2.5-3` and
+Inkscape `1.4.4-6`; for every app, verify the effect from fresh state.
+
+The plugin exists so agents never interrupt the user, so while it is active
+Driver refuses every route that would drive the user's own seat. That covers
+desktop-scope input (`scope:"desktop"` or a desktop `target`: click, double
+and right click, scroll, drag, `type_text`, `press_key`, `hotkey`, and
+`move_cursor`), `delivery_mode:"foreground"` on any window, `bring_to_front`,
+and `mouse_button_down`. Each refuses with `global_input_disabled` and
+`effect:"refused"` before anything is sent. Any other path that would use the
+virtual pointer or keyboard on the user's seat fails with the same code before
+it creates the device. This holds whenever a live Hyprland instance of the
+user has the plugin's sockets, even when Driver was started without
+`HYPRLAND_INSTANCE_SIGNATURE` or without its Wayland backend. Work on window
+targets in the background instead: `list_windows` lists windows on every
+workspace, and clicks, scrolls, drags, and keys reach them there. The person
+running Driver can allow those routes with `"allow_global_input": true` in
+`~/.cua-driver/config.json`, which Driver reads on each call. `set_config`
+refuses the key. Without the plugin, and on other compositors, these routes are
+unchanged.
+
+A Hyprland `window_id` is the window's compositor address, and Hyprland gives
+a closed window's address to the next window, usually at once. Driver
+remembers which window each id named when `list_windows`, `get_desktop_state`,
+`get_accessibility_tree`, `launch_app`, `list_apps`, or `get_window_state`
+returned it. Once that window
+closes, actions and `get_window_state` with its id refuse with
+`window_id_not_found`, even when a new window, native or X, holds the address.
+Call `list_windows` to get the new window's id. An id Driver never returned,
+for example after Driver restarts, names whichever window holds the address
+when it is first used.
+
+Driver finds Hyprland through `HYPRLAND_INSTANCE_SIGNATURE`, or, when a
+service or shell started it without that variable, through the live instance
+serving its `WAYLAND_DISPLAY`. With neither, it treats the desktop as generic
+Wayland: X windows get X11 ids, which per-window capture refuses with
+`surface_identity_unproven`.
 
 The plugin separately binds the exact live native surface and checks geometry,
-desktop availability, and primary-client and other-lane conflicts. Each
+desktop availability, and other-lane conflicts. A click, scroll, or drag at a
+point outside that window, including the end of a drag, is refused with
+`point_outside_window` before any input is sent. A click or scroll on the part
+of the window's own open menu that extends past the window is not outside it.
+The agent seat has its own pointer, so an agent can click, scroll, and drag in
+a native app you are using, including another window of it, without taking your
+focus. Keys are different:
+while your keyboard focus is in the target's app, `type_text`, `press_key`, and
+`hotkey` refuse with reason `primary_keyboard_busy`, and a running `type_text`
+stops at the next key after you click into that app, reporting the keys it had
+already sent as a partial result. Firefox and Qt keep one keyboard focus per
+app, so an agent key in one of their windows takes your typing away from yours,
+and in any app agent keys in your window mix with your typing. Ghostty, foot,
+and GTK keep keyboard focus per seat and could type into another window
+correctly, but they are refused too: there are no per-app exceptions. Element
+actions such as `set_value` still work there. Ghostty ignores agent left clicks
+and drags unless your keyboard focus is on that window: it takes a left press
+on a window without keyboard focus as focus-only. They are only reported as
+unverifiable. Right clicks, scrolling, keys, and element actions work there. Each
 background lane publishes a private canonical `evdev`/`pc105`/`us` keymap, so
 user options such as Caps Lock remapped to Ctrl or Super do not alter agent key
 semantics. A physical keymap transition cancels existing authority; use a fresh
 action afterward. Multiple agent layout groups, Unicode, IME input, arbitrary
 held-key streams, and modified pointer gestures remain outside this scope.
-Chromium, Electron, and XWayland raw background input are outside this scope.
-AT-SPI routes retain their separate behavior.
+Chromium/Ozone and Electron bind only the first `wl_seat`, so they never see
+the agent seats. When the plugin reports that, Driver delivers through the
+target's own primary-seat resources instead, still without moving your focus or
+cursor. The result route remains `synthetic_events`. It refuses while your pointer or
+keyboard focus is on that app, and during a grab, drag-and-drop, or pointer
+constraint, which includes a game that holds your pointer. These apps take
+keyboard focus as being the active window, so from the agent's first click or
+key until its session ends or goes idle for a minute, the app behaves as the
+active window: Discord, for example, treats the open channel as read. That is
+what lets a field in a Discord dialog keep the focus a click gives it.
+
+You can check on a window an agent is driving. When your focus lands on it, or
+leaves it, Driver retires what the agent last read of that window, because you
+may have clicked, typed, or scrolled there. The agent's next pixel, element, or
+key action on the window refuses with `person_used_window` before anything is
+sent, and `run_steps` attaches a fresh screenshot. Reading the window again lets
+the agent carry on from what it shows. Driver learns this from Hyprland's focus
+events, so a scroll over a window that never takes focus goes unnoticed.
+
+The plugin also withholds popup grabs and cancels drag starts that
+an app makes in reaction to agent input, even in the app you are using, so a
+dropdown or drag cannot take your keyboard or pointer. GTK menus and combo
+boxes still open without the grab, and agent keys such as Down and Return
+choose an item. GTK and Qt send every key of an app to its open menu, so a menu
+the agent opens closes as soon as your keyboard is in that app. Your own menus
+and drags work as usual. A window or dialog an app opens in reaction to agent
+input opens on the workspace of the window it belongs to, even a hidden or
+special one, without taking your focus. In an app you are also using, a new
+window with no parent is the agent's when the agent acted in that app after
+your last click or Ctrl, Alt or Super shortcut there, so your own Ctrl+N still
+focuses its window while typing elsewhere in the app does not claim the
+agent's. An app that replaces its window after an agent click, as a login or
+splash screen does, opens the new one where the old one was. In an app you are
+not using, a window with no parent that opens up to 30 seconds after the
+agent's last input there is the agent's, so a slow app's next window stays off
+your workspace. A window of that app you open yourself from outside it, such
+as from a launcher, in those 30 seconds opens on the agent's workspace too.
+Such a window never ends your fullscreen or maximized window, and on a
+workspace you can see it floats, so it never splits or resizes your tile.
+Moving your pointer over it does not focus it, because Hyprland draws floating
+windows over tiled ones and it may open under your pointer. Click it to type
+into it. On your workspace it stacks under your window, though it can still
+cover part of a tiled one. A dialog of your own window still opens on your
+workspace and takes your focus. Close such windows in the same task. An app
+that asks to go fullscreen or maximized in reaction to agent input, through
+F11, a page's fullscreen button, a title-bar double-click, or a drag on its tab
+strip, never changes size on a workspace you can see, and never ends your
+fullscreen or maximized window or takes your focus. A native Wayland app is
+told it is fullscreen and draws that inside its own window: F11 hides a
+browser's toolbars, Chromium shows a page's fullscreen video in the window, and
+Firefox reports the page's fullscreen request as failed. The agent's F11 or
+Escape there ends it. On a hidden workspace without another fullscreen or
+maximized window, the app goes fullscreen there and stays on that workspace.
+Your own F11, double-click, and fullscreen buttons work as usual. An agent
+drag on a title bar or tab strip never moves or resizes the window, on any
+route. With `misc:focus_on_activate` enabled, an app that asks to be
+activated in reaction to agent input can still take your focus. It is off by
+default. An agent click or scroll at `x`/`y` goes to what the window draws
+there, as your pointer would: its open menu, popover, or dropdown list when one
+covers the point. Toolkits ignore a click on the window behind their open menu,
+so click the item itself. A drag must start on the window, not on its menu or
+an embedded surface, and refuses with reason `popup_target` or
+`subsurface_target`. A menu you opened yourself stays yours: a click on it
+refuses with reason `primary_grab`. A click at `x`/`y` is
+always a pointer click, as on macOS, so it places the caret and focuses the
+entry under it. It never fires the accessibility action at that point. A click
+by `element_token` fires that element's AT-SPI action, except on a text field,
+text view, spin button, slider, combo box, or table cell. Their action does not
+focus them, so, as on X11, Driver clicks them with the pointer at their center
+when the toolkit's own hit test finds them there. That works in a covered window
+and on a hidden workspace. An element scrolled out of view, or one whose toolkit
+does not answer the hit test, keeps its AT-SPI action. A window you act on keeps
+drawing on a hidden workspace until your session ends, so its animations finish
+and its screenshots are current. In X apps built on stock Qt 5, such as DaVinci
+Resolve, type capitals and symbols with `type_text`: `press_key` with Shift
+types the unshifted character there.
+
+While the screen is locked or the display is off, every agent action on the
+window refuses with reason `session_unavailable` and `effect:"refused"`, and
+nothing reaches the app. Element actions, `set_value`, and `invoke_menu` use
+AT-SPI rather than the plugin, so Driver reads the plugin's session state
+before each one, and refuses also when it cannot read that state. Neither a
+retry nor the foreground route helps until the user is back. Reads still work:
+`list_windows` and the accessibility tree are unchanged, a window screenshot
+shows the window as the app last drew it, and a desktop screenshot shows the
+lock screen, or black while the display is off. Without the plugin, or on
+another compositor, AT-SPI actions still run while the screen is locked. macOS
+has no such refusal.
+
+With the input plugin, the agent cursor sits directly above the window it acts
+on, as on macOS. Windows above that window cover it, and it is not drawn while
+that window is on a hidden workspace. When the window closes, the cursor fades
+out with it, and when the window moves or shrinks, the cursor hides. Either way
+it stays hidden until the agent acts again, and then appears at the new point.
+A menu, popover, or dropdown list the agent opens is drawn the same way,
+directly above its window and over the agent cursor, while you work in another
+app. `get_window_state`'s screenshot shows the part of it inside
+the window. A part past the window's edge shows only in
+`get_desktop_state`'s screenshot.
+On other Wayland compositors, and
+on Hyprland once the plugin is unloaded or its input disabled, the cursor stays
+above every window.
+
+XWayland windows (SDL games, Wine, Java, Steam, and other apps with no
+accessibility tree) use the same tools with screenshot coordinates and stock
+XWayland. XWayland attaches every Wayland seat's devices to your X core pointer
+and keyboard, so before each action Driver gives the agent seat its own
+XInput2 master pair, focuses that keyboard on the target, and points the
+target app's X client pointer at it. The app's own grabs and focus changes then
+land on agent devices, not yours, and Driver hands the app back after it
+settles. If Driver dies before then, the next `cua-driver serve` hands the app
+back when it starts. Apps that wait for the window manager to offer focus
+(Wine, Java) get that offer before typing.
+
+- An agent cannot use an X app while you are in it, and refuses with
+  `primary_target_busy`. The app has one X client pointer for all its windows,
+  so its reactions to agent input, such as moving its own focus, would reach
+  your keyboard.
+- Pointer actions refuse with `xwayland_target_covered` when another X window
+  covers the target at that point, including another window of the same app.
+  A menu the app opened over the target does not count. X sends pointer input
+  by X stacking, and Hyprland keeps windows on hidden workspaces mapped, so
+  this is common.
+  Keyboard actions still work there. The optional Xwayland build in
+  `libs/cua-driver/xwayland` keeps agent pointers inside the target window, and
+  Driver then allows these actions.
+- While your pointer is locked or confined, as in a game, X drags refuse with
+  `primary_constraint`, because every X raw-input listener sees their motion.
+  Clicks, scrolls, and keys send no motion and still work.
+- Qt and Chromium grab every X pointer while one of their menus is open, so a
+  menu the agent opens there captures your pointer over X windows until it
+  closes.
+- Java needs `_JAVA_AWT_WM_NONREPARENTING=1` under Hyprland, or its windows stay
+  blank.
 
 Two compositor seats, `Cua-Agent` and `Cua-Agent-2`, persist across configuration
 disable/re-enable. Each connection claims one lane, and each admitted action
@@ -335,10 +527,11 @@ application effect from fresh state. Do not replay canceled, partial, or unknown
 actions.
 
 The candidate also adds an explicitly requested foreground route, advertised
-by the plugin as `foreground_target:true`. It binds the exact native top-level
+by the plugin as `foreground_target:true`. Driver uses it only with
+`allow_global_input` set, as described above. It binds the exact native top-level
 surface on the compositor thread and intentionally changes primary focus and,
 for pointer actions, cursor position. It does not restore the previous focus or
-cursor. This route has no Calc/Inkscape background package gate. The canonical
+cursor. The canonical
 native harness covers defined GTK3, Electron, and Tauri foreground cases. It refuses
 held physical input, grabs, constraints, drag-and-drop, ambiguous primary seat
 bindings, and non-neutral keyboard modifiers. Background refusal never selects
@@ -403,7 +596,7 @@ ask the user.
 | ----------------------- | ------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | X11/Openbox             | AT-SPI trees and actions, foreground pointer and keyboard input, window and desktop capture, and video                         | Raw background delivery remains toolkit-specific; unsupported shapes refuse                                                                                                                                    |
 | Sway/wlroots            | AT-SPI, native discovery, full-display and cropped-window screencopy, foreground input, semantic background actions, and video | Raw background pointer and keyboard input remains focus-bound                                                                                                                                                  |
-| Hyprland/Omarchy        | Experimental source candidate with separate discovery-foundation and bounded two-seat app evidence                             | Default plugin is discovery-only; raw background v3 qualification is limited to the exact native Calc/Inkscape packages and a private agent US keymap; user Caps-to-Ctrl/Super remaps do not alter agent semantics; complete native harness and release acceptance are separate gates |
+| Hyprland/Omarchy        | Experimental source candidate with separate discovery-foundation and bounded two-seat app evidence                             | Default plugin is discovery-only; raw background v3 uses a private agent US keymap and has recorded native app evidence for Calc and Inkscape only; user Caps-to-Ctrl/Super remaps do not alter agent semantics; complete native harness and release acceptance are separate gates |
 | GNOME/Mutter            | AT-SPI, WinRects geometry and activation, capture, and portal/libei foreground input                                           | Requires the helper and portal grant; portal video parity remains open                                                                                                                                         |
 | KDE/KWin                | AT-SPI and generic discovery where exposed                                                                                     | Target-specific activation and behavioral coverage remain experimental                                                                                                                                         |
 | Nested `cua-compositor` | Versioned direct per-surface input, native GTK 31/31, capture/scope 5/5, and partial Electron coverage                         | The complete shared matrix remains experimental; do not infer standard-Wayland support                                                                                                                         |

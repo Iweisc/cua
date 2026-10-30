@@ -6,8 +6,8 @@ primary-seat foreground route. It is not native certification or a release
 announcement. The default plugin build remains discovery-only, and discovery
 protocol v2 is unchanged.
 
-Driver completes common permission, resource, lifecycle, and application
-compatibility checks before each action. The plugin trusts the desktop account
+Driver completes common permission, resource, and lifecycle checks before
+each action. The plugin trusts the desktop account
 under a local trust model. Same-UID transport checks prevent accidental
 cross-account use; they do not authenticate human consent or contain hostile
 code running as that user. There is no external signer, `APPROVE` command,
@@ -25,7 +25,7 @@ Packets contain printable ASCII fields separated by exactly one space, with
 no newline. The maximum packet size is 2048 bytes. Responses are JSON packets.
 Unknown commands, extra fields, integer overflow, nonfinite coordinates, and
 out-of-range values refuse. Decimal integers are unsigned; the target address,
-epoch, and target token are hexadecimal. Epochs and tokens contain 32 lowercase
+window stable id, epoch, and target token are hexadecimal. Epochs and tokens contain 32 lowercase
 hexadecimal characters.
 
 Each socket accepts at most eight connections. A connection must send `HELLO`
@@ -46,9 +46,12 @@ its original seat names.
 The request sequence for every Driver-admitted action is:
 
 1. Send `HELLO` once per connection. The response is
-   `{"ok":true,"protocol":3,"epoch":"<epoch>","foreground_target":true}`
-   for a production plugin implementing the foreground extension. Driver must
-   require that explicit capability before using the foreground route.
+   `{"ok":true,"protocol":3,"epoch":"<epoch>","foreground_target":true,"primary_background":true,"xwayland_target":true,"stable_id":true,"popup_input":true,"xsend_key":true}`
+   for a production plugin implementing the foreground, primary-background,
+   and XWayland extensions, the stable-id target field,
+   [pointer targets](#pointer-targets) on the window's popups, and `XSEND_KEY`
+   on X windows. Driver must
+   require each explicit capability before using its route or field.
 2. Send `CLAIM`. The response is `{"ok":true,"lane":0}` or lane `1`.
 3. For background input, send `TARGET <pid> <hex-address> <capability>`.
    For foreground input, send
@@ -56,6 +59,14 @@ The request sequence for every Driver-admitted action is:
    one of `1` (click), `2` (key), `4` (scroll), or `8` (drag); foreground selection
    also permits `16` (activate). Combined masks refuse.
    The response includes `ok`, `target`, `revision`, `width`, and `height`.
+   A `TARGET` response also includes `agent_bound`, which is `false` when the
+   target client holds no pointer or keyboard on this lane's agent seat. Such a
+   client can only be reached through `PRIMARY_TARGET`, described below.
+   `TARGET` refuses X windows with `stale_target`; they need `XWAYLAND_TARGET`.
+   Every target request may end with one more field, the window's hex stable
+   id (`stableId` in `hyprctl -j clients`), for example
+   `TARGET 811 5d12f9b62540 2 18000004`. See
+   [Window identity](#window-identity).
 4. Send the one matching bounded operation using that token and revision.
    A subsequent action requires fresh route-specific target selection, even on
    a cached connection. The binding fixes the route; an operation cannot turn
@@ -63,8 +74,11 @@ The request sequence for every Driver-admitted action is:
 
 `TARGET` binds the exact live native top-level surface, generates a fresh token,
 and grants at most five seconds of steady-clock technical lifetime. It first
-retires any unused previous grant. It refuses unavailable desktops, primary
-focus on the target's Wayland client, and another lane targeting that client.
+retires any unused previous grant. It refuses unavailable desktops and another
+lane targeting the target's Wayland client. Human focus on that client does
+not refuse pointer actions, because the agent seat has its own pointer. Keys
+refuse while the human's keyboard focus is on that client, as described in
+[Keys in the person's app](#keys-in-the-persons-app).
 Background seats always publish a private canonical `evdev`/`pc105`/`us`
 keymap, so user layout options and remaps do not alter agent key semantics.
 They advertise the user seat's key repeat rate and delay, falling back to
@@ -74,6 +88,20 @@ agent key is held long enough to repeat. A discovered address is an input to
 attestation, not a surface lifetime token.
 Surface unmap, destruction, or replacement invalidates the binding. Geometry
 changes increment the revision and refuse stale actions.
+
+### Window identity
+
+Hyprland gives a closed window's address to the next window it creates,
+usually at once and across apps, X windows included. An address therefore
+names whichever window holds it now, not the window Driver discovered. The
+optional last field of `TARGET`, `PRIMARY_TARGET`, `FOREGROUND_TARGET`, and
+`XWAYLAND_TARGET` is the stable id Driver read with that address, which
+Hyprland never reuses within a compositor run. When the window at the address
+carries another stable id, the request refuses with `stale_target` and binds
+nothing. A malformed id refuses with `invalid_request`. Without the field,
+target selection binds by address alone. Driver sends the field only when
+`HELLO` reports `stable_id`, and checks the id itself before connecting; the
+plugin check covers a window that takes the address between the two.
 
 The complete operation requests are:
 
@@ -85,10 +113,35 @@ The complete operation requests are:
 | `SCROLL <sequence> <target> <revision> <x> <y> <axis> <value>` | Axis 0=vertical, 1=horizontal; nonzero value in [-1000,1000]. |
 | `DRAG <sequence> <target> <revision> <x1> <y1> <x2> <y2> <duration_ms>` | Left button; duration 50-2000 ms; the grant must cover the duration plus 50 ms. |
 
-Coordinates are finite logical surface-local values, with `0 <= x < width`
-and `0 <= y < height`. Subsurface hits refuse. Sequence numbers increase
+Coordinates are finite logical values relative to the window's top-left
+corner. A point outside `0 <= x < width` and `0 <= y < height`, the end of a
+drag included, refuses with `point_outside_window`, except a `CLICK` or
+`SCROLL` point on one of the window's popups; see
+[Pointer targets](#pointer-targets). Sequence numbers increase
 strictly across the connection, including fresh target selections. Repeated
 or lower sequences return `replay`; no operation is replayed automatically.
+
+### Pointer targets
+
+A background pointer action goes to the window's topmost mapped `xdg_popup`
+whose input region holds its point, else to the window's surface or the
+subsurface of it that takes input there, in that order, as with Hyprland's own
+pointer. The plugin sends the point in that surface's coordinates. Popups are
+not in the window's surface tree, so testing that tree alone would press the
+widget under an open menu. A popup may extend past the window, and a `CLICK` or `SCROLL` there is
+not outside it. Driver sends such a point only when `HELLO` reports
+`popup_input`, and only on `TARGET` and `PRIMARY_TARGET` bindings. A `CLICK`
+or `SCROLL` on a popup that the human's popup grab holds refuses with
+`primary_grab`: that menu is the human's.
+
+A `DRAG` starts only on the window's own surface. It refuses with
+`popup_target` on a popup and with `subsurface_target` on a subsurface. Its
+motion stays on that surface while it runs, popups drawn over it included, and
+it ends when the point crosses a subsurface. `FOREGROUND_TARGET` focuses the
+window's own surface for every pointer action, so it refuses a point on a
+popup or subsurface with `primary_target_busy` and detail
+`foreground_pointer_target` before activation. X windows have no
+`xdg_popup`; their menus are X windows, which XWayland hit-tests itself.
 
 The plugin repeats target, geometry, desktop, keymap, and conflict checks on
 the compositor thread at
@@ -100,7 +153,8 @@ fresh authority returns `action_not_admitted`. Malformed or refused requests
 never imply application rollback.
 
 Background pointer focus has a separate lifetime. After a successful background pointer operation,
-the lane keeps passive pointer focus on that exact live surface. This internal
+the lane keeps passive pointer focus on the exact live surface it entered: the
+window's own, one of its subsurfaces, or one of its popups. This internal
 state is separate from the visible Driver overlay, whose idle fade and
 session-end removal remain unchanged. Fresh
 `TARGET` admission on the same surface and unchanged geometry preserves this
@@ -111,7 +165,7 @@ after drag release; some clients coalesce motion and requeue the release.
 There is no fixed completion delay or trace-only timing behavior.
 
 Passive focus has no held input or authority, but still participates in
-primary-client and inter-lane conflicts. Owner cancellation, EOF, and the
+inter-lane conflicts. Owner cancellation, EOF, and the
 connection's idle timeout release held buttons and all keyboard state and
 revoke authority without requiring pointer leave. Passive target references
 are weak and independent of the transport owner; a disconnected owner retains
@@ -130,8 +184,10 @@ cause `agent_target_busy`; ordinary dispatch and conflict checks never evict
 them. This permits opposite-order reuse when both new connections reserve
 their lanes before either selects a target, without retrying any input.
 
-Target replacement, unmap, destruction, geometry change, primary-client
-conflict, and desktop/keymap/configuration transitions clear passive focus.
+Target replacement, unmap, destruction, and geometry change clear passive
+focus, and so does unmapping the popup or subsurface that holds it. Desktop, keymap, and configuration transitions revoke authority and
+release held input, but keep passive focus on an unchanged live target, as
+after normal completion.
 An observed physical keymap transition cancels existing authority, but fresh
 background admission after that transition uses the unchanged private agent
 keymap.
@@ -157,11 +213,322 @@ final reply preserves that count but sets `delivery.mode:unknown`; later input
 may have landed without acknowledgement. A missing initial reply has unknown
 delivery with no count. Neither case permits replay.
 
+Driver sends text and multi-packet scrolls as a sequence of `KEY` or `SCROLL`
+actions, one key per character. A refusal or a lost connection after some of
+them were acknowledged maps to `effect:partial` with that many in
+`delivery.delivered_count`, on either route.
+
 Refusals use `{"ok":false,"code":"<code>","detail":"<code>"}`. Codes
 include `lane_busy`, `lane_not_claimed`, `stale_target`, `stale_geometry`,
 `session_unavailable`, `unsupported_layout`, `primary_target_busy`,
-`agent_target_busy`, `lease_expired`, `action_not_admitted`, `lease_busy`,
-`client_not_bound`, `replay`, `unsupported`, and `invalid_request`.
+`primary_keyboard_busy`, `agent_target_busy`, `lease_expired`,
+`action_not_admitted`, `lease_busy`, `client_not_bound`, `replay`,
+`point_outside_window`, `popup_target`, `subsurface_target`, `primary_grab`,
+`unsupported`, and `invalid_request`.
+
+### Keys in the person's app
+
+On a native `TARGET` binding, capability 2 and every `KEY` refuse with
+`primary_keyboard_busy` while the human's keyboard focus is on any surface of
+the target's Wayland client, the target itself included. Click, scroll, and
+drag are unaffected. The check runs on the compositor thread before the agent
+seat's `wl_keyboard.enter`, and a `KEY` enters, types, and leaves within one
+dispatch, so no agent key reaches the client after the human's keyboard focus
+does. Driver sends each key of a text as its own `TARGET` and `KEY`, so a text
+stops at the first key after the human enters the app. Driver reports the
+keys already acknowledged as a partial result with `delivery.delivered_count`.
+
+Each `KEY` sends a keyboard enter on the agent seat. Firefox and Qt keep one
+keyboard focus for the whole process, so that enter takes focus from the
+human's window in the same app. Firefox then routes the human's typing into
+the agent's window until the human clicks their own, and Qt deactivates the
+human's window and drops its shortcuts. In every toolkit, agent keys sent to
+the window the human is typing in mix with the human's own keys. Ghostty, foot,
+GTK3, and GTK4 keep keyboard focus per seat and could take agent keys in one
+window while the human types in another, but they are refused too. This is a
+deliberate limit with no per-app or per-toolkit exception: a client's keyboard
+model is not visible to the compositor.
+
+Agent pointer actions carry no keyboard focus. Ghostty treats a left press on a
+window without keyboard focus as a focus-only click, so it drops agent left
+clicks and drags unless the human's keyboard focus is on that window. They are
+acknowledged as `unverifiable`. Its right clicks and scrolls still arrive.
+Entering the agent seat's keyboard around the press fixes Ghostty, but the
+leave that has to follow in the same dispatch closes menus the click opens:
+Firefox's `<select>` list closes, and the next click presses the page under it.
+
+## Primary-seat background extension
+
+Chromium/Ozone and Electron bind only the first `wl_seat`, so they never see
+the agent seats and `TARGET` reports `agent_bound:false`. `PRIMARY_TARGET
+<pid> <hex-address> <capability>` binds the same exact live surface to
+`primary_background`. Click, key, scroll, and drag are delivered to the target
+client's own primary-seat pointer and keyboard resources without changing the
+compositor's pointer focus, keyboard focus, or cursor position. `ACTIVATE`
+refuses with `unsupported`. Driver chooses this route explicitly after
+`agent_bound:false`; the plugin never changes route on its own. A connection
+may alternate `TARGET` and `PRIMARY_TARGET`, but never either with
+`FOREGROUND_TARGET`.
+
+Admission and every dispatch refuse with these codes:
+
+- `primary_binding`: the client does not hold exactly one primary seat binding.
+- `primary_target_busy`: human pointer or keyboard focus is on that client.
+- `agent_target_busy`: another lane targets that client.
+- `primary_grab`, `primary_dnd`, `primary_constraint`: a seat grab, layout
+  drag, drag-and-drop, or pointer constraint is active.
+- `subsurface_target`: a drag starts on a subsurface, or no surface of the
+  window takes input at the point. Clicks and scrolls reach popups and
+  subsurfaces as described in [Pointer targets](#pointer-targets).
+- `unsupported_layout`: a key chord means something different under the human's
+  keymap than on a neutral US keyboard. Keys are sent with neutral modifiers, so
+  the human's Num Lock does not refuse.
+
+The borrowed pointer is left and released after each action. The borrowed
+keyboard is entered at the first `CLICK` or `KEY` and held across later actions,
+because Chromium takes keyboard focus as window activation and some apps move
+focus when activated: Discord's dialogs pull it back to the dialog, so a key
+that entered again would land there instead of in the field the click focused.
+A `CLICK` enters it before the press, as a person's activation precedes their
+click. The plugin leaves it on any revoke, when the connection binds another
+window, and when the lane's reservation ends, including the connection's idle
+timeout. Human keyboard focus reaching that client ends the hold without a
+leave, and neither resource is left once human focus has reached the client:
+Hyprland has already moved them to the human's surface. Human focus reaching
+the target cancels the lease
+synchronously, as on the agent-seat route. An agent button press clears the
+seat's pointer-button serial at once, so the client cannot use it to start an
+interactive move or resize that would follow the human's pointer. See
+[Reactions to background input](#reactions-to-background-input).
+
+Successful dispatch returns
+`{"ok":true,"effect":"unverifiable","route":"primary_background"}`.
+
+## Reactions to background input
+
+Hyprland accepts `xdg_popup.grab` and `wl_data_device.start_drag` without
+checking which seat the serial came from. A client reacting to agent input on
+either background route could therefore take the human's keyboard focus or tie
+a drop to the human's next button release. The plugin withholds the popup grab,
+leaving the popup mapped, and cancels the drag source when the request reacts
+to agent input. Hyprland drops the seat and serial that both requests quote,
+so the plugin reads them with a libwayland protocol logger, which sees each
+request just before Hyprland handles it. A request quoting a serial an agent
+seat sent is the agent's even while the human uses another window of the same
+app. Next, a request from a window the human clicked, or gave a Ctrl, Alt or
+Super chord, after the agent's latest input there is theirs. Only then does a
+request quoting an agent seat count as the agent's, because GTK3 quotes the
+seat its menu last grabbed with, so the human's own menu can quote one.
+Otherwise a request from the human's focused window is theirs, one from a
+window a lane leases or delivered to in the last two seconds is the agent's,
+and one from an app such a lane drives is the agent's when the human's focus
+is not in that app. Borrowed primary-seat resources take
+their serials from Hyprland, but they only act in apps the human's focus is
+not in. GTK and Qt send every key of an app to its open menu, wherever the
+compositor sends the key, so a popup whose grab was withheld gets
+`xdg_popup.popup_done` as soon as the human's keyboard is in its app, and when
+the human presses a key or button there. Otherwise GTK still maps such a menu
+and handles agent keys in it, and agent clicks and scrolls reach it as
+described in [Pointer targets](#pointer-targets). `hyprctl -j cua:status`
+reports `input.primary_background`, `input.refused_popup_grabs`, and
+`input.refused_drag_starts`.
+
+Hyprland also opens every new top-level window on the human's workspace,
+gives it keyboard focus, raises a new floating window over the others and over
+a fullscreen window, ends a fullscreen or maximized window when a new tiled
+window opens on its workspace, and makes a new tiled window the visible tab of
+the human's focused group. A new window is a reaction to agent input when the
+nearest window in its parent chain that is either the human's focused window
+or a window a lane leases or delivered to in the last two seconds is the
+lane's. With neither in its parent chain, it is a reaction when it comes from
+the process of a window a lane leases or delivered to, either in the last 30
+seconds while the human's pointer and keyboard focus are not in that process,
+or in the last two seconds and after the human's last click or Ctrl, Alt or
+Super chord there. The longer bound is for slow apps: DaVinci Resolve opens its
+main window only once the project a click created has loaded. Plain typing is
+no command, so the human typing on in one window does not claim a window the
+agent opened from another, while their own Ctrl+N does. When that lane window
+has closed, as when a login or splash flow replaces its window after a click,
+a window with no parent from that window's process counts the same way and
+opens on the workspace that window had at dispatch, which the plugin makes
+again if it closed with the window. The rule compares processes,
+not clients, because Electron shows its GTK dialogs over a second Wayland
+connection. So a dialog of the agent's window is a reaction even while the
+human uses another window of the same app, and a dialog of the human's own
+window never is. A reaction window opens on the workspace of its parent, or
+with no parent, of the lane window in its app, as Hyprland's
+`workspace N silent` rule would place it. That workspace may be hidden or
+special. The plugin then sends `movewindow` and `movewindowv2`, because
+Hyprland has already sent `openwindow` naming the human's workspace. The
+window opens without initial focus, stays out of the human's group, and floats
+when its workspace is visible or has a fullscreen or maximized window, so it
+never splits or resizes the human's tile. On a visible workspace it also gets
+`nofollowmouse` at `setprop` priority: Hyprland draws and hit-tests floating
+windows above tiled ones, so it may open under the human's pointer, and with
+`follow_mouse` moving the pointer would hand it their keyboard. A click still
+focuses it. On the human's workspace it stacks directly under the human's
+window, also when that window is fullscreen. `input.withheld_initial_focus`
+counts these windows.
+
+Hyprland sends frame callbacks only to the windows it draws, and clients run
+their animations and present their changes on them. A window on a hidden
+workspace stops mid-animation, so a Chromium dialog that fades in never takes
+the click that follows it. While a lane is claimed, every window it delivered
+to gets what Hyprland's `render_unfocused` window rule would give it whenever
+Hyprland does not draw it: frame callbacks and discarded presentation feedback
+for its surfaces and popups, at `misc:render_unfocused_fps`, and none when that
+is 0. The list ends with the claim. Chromium keeps drawing on its own after
+that once it has had these callbacks.
+
+A client can also ask to change its own state. Hyprland applies
+`xdg_toplevel.set_fullscreen`, `unset_fullscreen`, `set_maximized`, and
+`unset_maximized`, and an X window's `_NET_WM_STATE` fullscreen and maximize
+messages, by replacing the workspace's fullscreen or maximized window. That
+ends the human's fullscreen or maximized window, drops their keyboard focus,
+and covers their window. Hyprland 0.56.2 also toggles maximize on either
+maximize request, so the `unset_maximized` Firefox sends when a drag starts on
+its tab strip maximizes the window. Such a request is a reaction to agent input
+when the human's keyboard focus is not on its window, and a lane leases or
+delivered to that window in the last two seconds or its process reacts to the
+agent as it does for a new window, above. On a workspace shown on any output,
+and on any workspace where another window is fullscreen or maximized, the
+plugin keeps Hyprland from applying a reaction. Firefox waits for the
+fullscreen it asked for and then ignores every later F11, the human's too, so
+an xdg-shell client still gets the fullscreen flag it asked for in a configure
+at its current size, and draws its fullscreen inside its window. The flag of a
+window Hyprland made fullscreen stays set. The next fullscreen request Hyprland
+handles for that window sets the flag back to Hyprland's own state. An X
+window's `_NET_WM_STATE` stays as it was. On a hidden workspace a reaction
+applies, but the plugin drops the output a fullscreen request names, because
+Hyprland would move the window to that output's active workspace. The human's
+own requests, such as their F11, title-bar double-click, or a page's fullscreen
+button, apply as usual. `input.refused_state_requests` counts the reactions
+Hyprland did not apply. Hyprland ignores `xdg_toplevel.set_minimized` and
+`WM_CHANGE_STATE`.
+
+Hyprland starts an interactive move or resize for `xdg_toplevel.move` or
+`resize` only when the request names a seat Hyprland made and a button press
+serial it recorded on that seat, and the move then follows the human's pointer
+until their next button release. A request naming an agent seat fails the first
+check. The primary-seat and foreground routes press buttons through the
+client's primary seat, so the plugin removes each agent press from that seat's
+recorded serials as it sends it, and a request carrying that serial fails the
+second check. Hyprland 0.56.2 does not handle `_NET_WM_MOVERESIZE`, so X
+windows cannot start one.
+
+## Agent cursor stacking
+
+Driver draws its agent cursors in full-output `zwlr_layer_shell_v1` overlay
+layers. When the plugin's input sockets exist, cursors pinned to a window go
+in a layer per window and output named `cua-agent-cursor@<hex window address>`,
+followed by `.<hex stable id>` when Driver knows which window it returned that
+address for. While that window is mapped, the plugin leaves the layer out of Hyprland's
+layer pass and draws it right after the window's main pass, at the window's
+workspace offset. Windows stacked above the target and the target's own
+popups cover the cursor, and a hidden workspace hides it. Single-window
+captures never include it. Hyprland snapshots a window only to animate its
+close, and that snapshot includes the cursor, so it fades out with the window.
+A pinned layer is never drawn above every window. The plain
+`cua-agent-cursor` layer stays above every window.
+
+The window's own popups follow the same stacking: the plugin draws them right
+after the window and its cursors, so windows above the window cover them and a
+hidden workspace hides them. Hyprland gives tiled windows a separate popup
+pass after all of them, but only the focused one, because a popup normally
+closes when its window loses focus. A popup an agent opens in another window
+stays open while the human's keyboard is outside its app, since its grab is
+withheld (see [Reactions to background input](#reactions-to-background-input)),
+and would never be drawn, so the plugin draws the popups of every other tiled
+window right after that window. The focused window's popups keep Hyprland's own pass.
+Popups take their own fade, not the window's, as in Hyprland. A single-window
+capture (`hyprland_toplevel_export`) includes the popups inside the window's
+box and cuts off any part past its edge.
+
+Hyprland reuses a freed window's address for the next window it creates, so
+the plugin binds each pinned layer to the window at its address when the
+layer maps, and draws it only after that window. A layer whose name carries a
+stable id binds only to a window with that id. A layer that maps after its
+target closed, even once another window took the address, binds to no window,
+and the plugin sends it `zwlr_layer_surface_v1.closed` at once, so Driver's
+next action opens a layer named for the window it then has at that address.
+Driver places the cursor
+relative to the window's top-left corner from the box it read when it acted,
+and does not see the window move, so the plugin also records that box. When
+the window is destroyed, even on a hidden workspace, or its corner moves or
+it shrinks (a move, layout reflow, swap, or fullscreen, float, or group
+toggle), the plugin sends the layer `zwlr_layer_surface_v1.closed`. Driver
+then stops drawing the cursors pinned to that address and opens no layer for
+them until an action places them again. Such a cursor then appears at its new
+point instead of gliding in from where its window was. A cursor therefore
+never moves onto a window that took its target's address, and never stays at
+a point its moved target left. The cursor fades with the window's fade alpha, including a special
+workspace fading in or out, but not with its opacity rules.
+
+Without the plugin's hooks Hyprland would draw a pinned layer above every
+window. When the plugin unloads, it hides every pinned layer and sends it
+`closed`. Driver checks that the input sockets exist on each pin and each
+closed pinned layer. Once they are gone, after an unload or a config disable,
+it hides the cursors pinned to a window until their next action, and draws
+them in the plain layer from then on. A config disable keeps the hooks, so
+pinned layers stay correctly stacked until Driver drops them. After a
+re-enable, the next action opens window layers again.
+
+## XWayland extension
+
+XWayland binds every Wayland seat, the agent seats included, and attaches each
+seat's X input devices to the human's core pointer and keyboard. Agent input to
+an X window would then move the human's X pointer and type into the human's X
+focus. `XWAYLAND_TARGET <pid> <hex-address> <capability>` binds an X window
+through this lane's agent seat. Driver sends it only after moving the seat's
+XWayland devices onto their own XInput2 master pair. The plugin cannot see X
+device state and relies on Driver for that step, which is why plain `TARGET`
+keeps refusing X windows.
+
+The response adds `"route":"xwayland"`, `seat`, and `xid`. `seat` is the agent
+seat's Wayland global name, which XWayland uses in its device names
+(`xwayland-pointer:<seat>`). `xid` is the X window. `client_not_bound` refuses
+when XWayland has not bound this lane's seat. Actions acknowledge with
+`"route":"synthetic_events"`.
+
+These rules differ from native targets:
+
+- Human focus on the target's X process refuses with `primary_target_busy`.
+  An X app has one client pointer for all its windows, so its reactions to
+  agent input would reach the human's keyboard. Conflicts compare X processes,
+  because XWayland is one Wayland client for every X app, so human focus on
+  another X app does not refuse.
+- Pointer actions enter the target at the action point and send no motion.
+  XWayland turns motion into XI2 raw motion, which every raw listener
+  receives, including a relative-mouse game the human is playing. Drags still
+  move while the button is held.
+- Scroll sends an empty axis event before the real one. XI2 clients take the
+  first scroll after an enter as their baseline.
+- Pointer actions refuse with `xwayland_focus_changed` when the human's keyboard
+  focus changed after `XWAYLAND_TARGET`. Hyprland restacks X windows on focus,
+  and X stacking decides which window a pointer event reaches. Driver checks
+  that the target is uncovered at the action point after admission, unless the
+  server carries the optional patch in
+  [`../../xwayland`](../../xwayland/README.md), which keeps agent pointers
+  inside the window they entered.
+- Drags refuse with `primary_constraint` while the human's pointer is locked or
+  confined. Every XI2 raw listener sees agent pointer motion, and a game
+  holding such a constraint usually reads it. Clicks and scrolls send no
+  motion and proceed.
+- Pointer coordinates are scaled by the window's X surface scale, as Hyprland
+  does for the human's pointer under `xwayland:force_zero_scaling`.
+- X apps show menus and dialogs as new windows. A menu or dialog that reacts
+  to agent input opens as [Reactions to background input](#reactions-to-background-input)
+  describes, without initial focus.
+- `XSEND_KEY` takes the fields of `KEY` and is admitted, refused, and recorded
+  exactly as `KEY` is, but sends nothing: after its acknowledgement Driver sends
+  the key to the X window as an X event whose state carries its modifiers.
+  Stock Qt 5, which apps such as DaVinci Resolve bundle, builds text with the
+  modifier state of the keyboard it found at startup, the human's, which the
+  agent seat's X keyboard never changes, so it would type every shifted
+  character unshifted. It uses the state of a key event another client sent.
+  Driver sends the keys of a text this way to an X window whose process loads
+  Qt 5's X backend, and looks each character up in the X server's keyboard map,
+  which is the one Qt translates with. Other keys and other apps use `KEY`.
 
 ## Exact-target foreground extension
 
@@ -171,7 +538,9 @@ surface lifetime, geometry revision, and route at admission and dispatch on the
 compositor thread. `ACTIVATE` intentionally activates that target. Foreground
 click, key, scroll, and drag use the same bounded operation shapes with a
 foreground binding; primary focus and cursor position may change. This route
-makes no promise to restore focus or cursor position after delivery.
+makes no promise to restore focus or cursor position after delivery. As on the
+primary-seat route, an agent button press never leaves a serial the target can
+start an interactive move or resize with.
 
 Before taking over primary input, the plugin must refuse held physical keys or
 buttons, active grabs, pointer constraints, and drag-and-drop. It requires a
@@ -217,6 +586,40 @@ establish exact-target delivery and is not a fallback. Background refusal never
 escalates to foreground. Both routes use Driver's existing permission and
 lifecycle admission, without a separate approval UI.
 
+Driver sends `FOREGROUND_TARGET` only when the person running it set
+`"allow_global_input": true` in `~/.cua-driver/config.json`. Otherwise every
+`delivery_mode:"foreground"` call and `bring_to_front` refuse in Driver with
+`global_input_disabled` and `effect:"refused"`, before any packet reaches the
+plugin. The same setting gates Driver's desktop-scope input and every other
+route that injects through the person's seat, such as the virtual pointer and
+virtual keyboard, so agents use only window targets in the background.
+
+## Locked and display-off sessions
+
+Target selection and every operation refuse with `session_unavailable` while
+the session is locked (`ext-session-lock`), the display is off (DPMS), the
+session is inactive, or Hyprland is shutting down. `hyprctl -j cua:status`
+reports the same state as `input.session_available`.
+
+Driver's AT-SPI actions reach the app without a lane. On a desktop with the
+input sockets, Driver reads `input.session_available` once before each element
+action (`click`, `double_click`, `right_click`, `type_text`, `press_key`,
+`hotkey`, or `scroll` with `element_token` or `element_index`), `set_value`,
+and `invoke_menu`. While it is false, the action refuses before any AT-SPI call
+with code `background_unavailable` (`foreground_unavailable` for a foreground
+request), reason `session_unavailable`, and `effect:refused`. A status that
+cannot be read within the IPC query bound (one second per attempt, three in
+all), or that has no `session_available` field, refuses the same way. Pixel
+actions skip the read, because the plugin refuses them itself. The read is one
+attested IPC round trip, about 0.1 ms on an idle desktop. Without the input
+sockets, or on another compositor, Driver reads nothing and AT-SPI actions
+still run while the screen is locked. macOS defines no equivalent refusal.
+
+Reads still answer. `list_windows` and the accessibility tree are unchanged. A
+window screenshot (`get_window_state`, `zoom`) shows the window as the app
+last drew it. A desktop screenshot shows the lock surface while locked, and is
+black while the display is off.
+
 ## Cancellation and recovery
 
 `CANCEL` and `STOP` both require the connection's lane claim. They revoke only
@@ -236,9 +639,11 @@ for the separate cancellation paths and transport limits.
 EOF cancels only the departing connection's work and frees its reservation.
 Lock/unlock, DPMS, session activity, and monitor transitions revoke authority.
 Keymap/layout changes revoke authority, including synchronous layout and
-active-keyboard keymap notifications. For background bindings, changing primary
-focus to a target client cancels that lane synchronously. Dispatch and timer checks supplement
-these listeners. None of these paths wake the display or unlock the session.
+active-keyboard keymap notifications. For `PRIMARY_TARGET` and X bindings,
+changing primary focus to a target client cancels that lane synchronously. A
+native `TARGET` grant stays, and its next `KEY` refuses with
+`primary_keyboard_busy`. Dispatch and timer checks supplement these listeners.
+None of these paths wake the display or unlock the session.
 
 Config disable closes input transports but preserves client-owned seats and
 resources. Re-enable opens fresh transports with new epochs. Each later
@@ -253,21 +658,20 @@ of bounded cleanup latency.
 
 ## Compatibility and build gates
 
-For background `TARGET`, Driver restricts app/package/version/operation
-eligibility before connecting. Its qualification scope remains native Calc and
-Inkscape. Foreground `FOREGROUND_TARGET` has no Calc/Inkscape package gate; its
-scope is ordinary native top-level surfaces. Native GTK3, Electron, and Tauri
+Background `TARGET`, `PRIMARY_TARGET`, and `XWAYLAND_TARGET` have no app or
+package gate, as on macOS. Recorded native app evidence covers Calc and
+Inkscape. Foreground `FOREGROUND_TARGET` covers ordinary native top-level
+surfaces. Native GTK3, Electron, and Tauri
 foreground coverage is planned and still requires certification. The plugin checks
 native surface identity, geometry, client conflicts, and exact compiled XKB
 content against the default `evdev`/`pc105`/`us` keymap. Variants, options,
-remaps, multiple groups, missing keyboards, XWayland, Unicode, IME input,
+remaps, multiple groups, missing keyboards, Unicode, IME input,
 arbitrary held-key streams, and modified pointer gestures are outside this
 candidate. Layout names alone never establish eligibility. Existing semantic
 Driver routes retain their own behavior.
 
 Driver expands bounded ASCII text into complete key operations under the exact
-US keymap. The protocol adds no text or IME stream. Background application
-qualification is unchanged by this foreground extension.
+US keymap. The protocol adds no text or IME stream.
 
 Build against the exact Hyprland 0.56.2 ABI with `CUA_HYPRLAND_INPUT=ON`.
 This option defaults to `OFF` and is mutually exclusive with

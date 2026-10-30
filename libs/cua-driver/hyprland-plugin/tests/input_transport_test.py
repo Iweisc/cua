@@ -136,11 +136,14 @@ def run_live(path, pid, address, x, y, grant_input=sys.stdin, output=sys.stdout)
                 for bad in (
                     f"CLICK 2 {token} {revision} nan {y} 272 1",
                     f"CLICK 3 {token} {revision} {x} inf 272 1",
+                ):
+                    refused(exchange(client, bad), "invalid_request")
+                for outside in (
                     f"CLICK 4 {token} {revision} -1 {y} 272 1",
                     f"CLICK 5 {token} {revision} {target['width']} {y} 272 1",
                     f"CLICK 6 {token} {revision} {x} {target['height']} 272 1",
                 ):
-                    refused(exchange(client, bad), "invalid_request")
+                    refused(exchange(client, outside), "point_outside_window")
                 accepted(exchange(client, click))
                 refused(exchange(client, click), "replay")
             finally:
@@ -169,7 +172,7 @@ class TransportTest(unittest.TestCase):
         refusal = lambda code: {"ok": False, "code": code, "detail": "synthetic refusal"}
         responses = [target, refusal("pending_operator_approval"), refusal("invalid_request"),
                      refusal("invalid_grant"), {"ok": True}, refusal("lease_busy")]
-        responses += [refusal("invalid_request")] * 5
+        responses += [refusal("invalid_request")] * 2 + [refusal("point_outside_window")] * 3
         if fail_click:
             responses += [refusal("primary_target_busy"), {"ok": True}]
         else:

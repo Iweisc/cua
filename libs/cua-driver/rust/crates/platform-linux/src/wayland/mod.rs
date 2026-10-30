@@ -13,17 +13,18 @@ pub mod ext_screencopy;
 pub mod ext_toplevel;
 pub mod hyprland;
 pub mod hyprland_capture;
-mod hyprland_compatibility;
 pub mod hyprland_input;
 pub mod kwin_helper;
 pub mod overlay;
 pub mod persistent_vptr;
+pub(crate) mod person_focus;
 pub(crate) mod portal;
 pub mod portal_screenshot;
 mod primary_seat;
 pub mod shell_helper;
 pub mod sway_ipc;
 mod virtual_keyboard;
+pub(crate) mod xwayland_seat;
 // RemoteDesktop/libei input is portable and ships in release binaries.
 // PipeWire ScreenCast capture remains separately gated for modern/Nix builds.
 #[cfg(feature = "portal-input")]
@@ -112,13 +113,15 @@ pub const ENABLE_WAYLAND_ENV: &str = "CUA_DRIVER_RS_ENABLE_WAYLAND";
 /// `CUA_DRIVER_RS_ENABLE_WAYLAND=1`. Any value other than empty / `0` /
 /// `false` enables it.
 pub fn wayland_enabled() -> bool {
-    match std::env::var(ENABLE_WAYLAND_ENV) {
-        Ok(v) => {
-            let v = v.trim();
-            !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
-        }
-        Err(_) => false,
-    }
+    wayland_flag(std::env::var(ENABLE_WAYLAND_ENV).ok().as_deref())
+}
+
+/// Whether a value of [`ENABLE_WAYLAND_ENV`] enables the backend.
+pub fn wayland_flag(value: Option<&str>) -> bool {
+    value.is_some_and(|v| {
+        let v = v.trim();
+        !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
+    })
 }
 
 /// True when this is an opted-in Wayland desktop session.
@@ -1502,6 +1505,8 @@ fn open_vptr_session_in(
     activate_window_id: Option<u64>,
     snapshot: Option<&hyprland::DesktopSnapshot>,
 ) -> anyhow::Result<VptrSession> {
+    // The virtual pointer moves the person's own pointer.
+    hyprland_input::ensure_global_input_allowed()?;
     let conn = Connection::connect_to_env()?;
     let mut queue = conn.new_event_queue::<State>();
     let qh = queue.handle();
@@ -2246,6 +2251,8 @@ pub fn type_text(window_id: u64, text: &str) -> anyhow::Result<()> {
     if text.is_empty() {
         return Ok(());
     }
+    // wtype and the virtual keyboard type through the person's own seat.
+    hyprland_input::ensure_global_input_allowed()?;
     activate_window_for_input(window_id)?;
     // Lead with a no-op Shift_L tap: on a freshly-focused window under a headless
     // seat (notably sway), the compositor needs the first virtual-keyboard event
@@ -2280,6 +2287,7 @@ pub fn type_text_focused(text: &str) -> anyhow::Result<()> {
     if text.is_empty() {
         return Ok(());
     }
+    hyprland_input::ensure_global_input_allowed()?;
     let result = std::process::Command::new("wtype")
         .args(["-k", "Shift_L", "--"])
         .arg(text)
@@ -2301,6 +2309,7 @@ pub fn type_text_focused(text: &str) -> anyhow::Result<()> {
 /// headless wlroots seat dropping the first event from a second `wtype`
 /// process after the text has landed.
 pub fn type_text_then_key_focused(text: &str, key: &str) -> anyhow::Result<()> {
+    hyprland_input::ensure_global_input_allowed()?;
     let keysym = key_to_keysym(key);
     let result = std::process::Command::new("wtype")
         .args(["-k", "Shift_L", "-s", "30"])
@@ -2322,6 +2331,7 @@ pub fn type_text_then_key_focused(text: &str, key: &str) -> anyhow::Result<()> {
 
 /// Press a single named key into the focused Wayland surface via `wtype -k`.
 pub fn press_key(window_id: u64, key: &str) -> anyhow::Result<()> {
+    hyprland_input::ensure_global_input_allowed()?;
     activate_window_for_input(window_id)?;
     let keysym = key_to_keysym(key);
     // Keep the sacrificial modifier and requested key in one virtual-keyboard
@@ -2345,6 +2355,7 @@ pub fn press_key(window_id: u64, key: &str) -> anyhow::Result<()> {
 
 /// Press one key while an outer exact-container focus guard is active.
 pub fn press_key_focused(key: &str) -> anyhow::Result<()> {
+    hyprland_input::ensure_global_input_allowed()?;
     if is_inject_mode() {
         let (pid, window_id) = inject_focused_target()?;
         return inject_press_key(pid, window_id, key);
@@ -2371,6 +2382,7 @@ pub fn press_key_focused(key: &str) -> anyhow::Result<()> {
 /// straight to wtype's `-k` so single-character keys and X keysym names work
 /// as-is. This is the Wayland equivalent of the X11 `send_key` modifier mask.
 pub fn hotkey(window_id: u64, keys: &[String]) -> anyhow::Result<()> {
+    hyprland_input::ensure_global_input_allowed()?;
     activate_window_for_input(window_id)?;
     let (mods, final_key) = partition_modifiers(keys)?;
     if let Ok(()) = virtual_keyboard::hotkey(&mods, &final_key) {
@@ -2408,6 +2420,7 @@ pub fn hotkey(window_id: u64, keys: &[String]) -> anyhow::Result<()> {
 
 /// Send a chord while an outer exact-container focus guard is active.
 pub fn hotkey_focused(keys: &[String]) -> anyhow::Result<()> {
+    hyprland_input::ensure_global_input_allowed()?;
     if is_inject_mode() {
         let (pid, window_id) = inject_focused_target()?;
         return inject_hotkey(pid, window_id, keys);
@@ -3480,36 +3493,57 @@ fn apply_pid_filter(mut windows: Vec<WindowInfo>, filter_pid: Option<u32>) -> Ve
     windows
 }
 
+/// [`list_windows_dispatch`] for windows a tool returns to its caller. On
+/// Hyprland, pass the windows it returns to [`hyprland::Identities::hand_out`]
+/// so a later call can tell them from windows that reuse their addresses.
+pub fn list_windows_with_identities(
+    filter_pid: Option<u32>,
+) -> (Vec<WindowInfo>, hyprland::Identities) {
+    if is_wayland() && hyprland::is_session() {
+        hyprland_windows(filter_pid)
+    } else {
+        (list_windows_dispatch(filter_pid), Default::default())
+    }
+}
+
+fn hyprland_windows(filter_pid: Option<u32>) -> (Vec<WindowInfo>, hyprland::Identities) {
+    // Hyprland IPC already attests PID and full native identity. A
+    // foreign-toplevel title join only makes that identity weaker.
+    match hyprland::list_windows() {
+        Ok(windows) => {
+            let identities = hyprland::Identities::of(&windows);
+            let windows = windows
+                .into_iter()
+                .map(|w| WindowInfo {
+                    xid: w.address,
+                    pid: Some(w.pid),
+                    app_name: w.app_id,
+                    title: w.title,
+                    is_on_screen: w.visible,
+                    z_index: None,
+                    x: w.x,
+                    y: w.y,
+                    width: w.width,
+                    height: w.height,
+                })
+                .collect();
+            (
+                listed_windows(apply_pid_filter(windows, filter_pid)),
+                identities,
+            )
+        }
+        Err(error) => {
+            tracing::warn!("Hyprland window enumeration unavailable: {error:#}");
+            Default::default()
+        }
+    }
+}
+
 /// Window-enumeration dispatcher: native Wayland when available, else X11.
 pub fn list_windows_dispatch(filter_pid: Option<u32>) -> Vec<WindowInfo> {
     if wayland_enabled() && std::env::var_os("WAYLAND_DISPLAY").is_some() {
         if hyprland::is_session() {
-            // Hyprland IPC already attests PID and full native identity. A
-            // foreign-toplevel title join only makes that identity weaker.
-            return match hyprland::list_windows() {
-                Ok(windows) => listed_windows(apply_pid_filter(
-                    windows
-                        .into_iter()
-                        .map(|w| WindowInfo {
-                            xid: w.address,
-                            pid: Some(w.pid),
-                            app_name: w.app_id,
-                            title: w.title,
-                            is_on_screen: w.visible,
-                            z_index: None,
-                            x: w.x,
-                            y: w.y,
-                            width: w.width,
-                            height: w.height,
-                        })
-                        .collect(),
-                    filter_pid,
-                )),
-                Err(error) => {
-                    tracing::warn!("Hyprland window enumeration unavailable: {error:#}");
-                    Vec::new()
-                }
-            };
+            return hyprland_windows(filter_pid).0;
         }
         // A verified GNOME helper already supplies exact IDs and ownership.
         // Do not probe unrelated compositor protocols for every preview frame.

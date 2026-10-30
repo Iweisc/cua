@@ -90,7 +90,7 @@ They appear on three kinds of result:
 | --- | --- |
 | An error result (`isError: true`) with a `code` | next to `code` in `structuredContent` |
 | A browser refusal (`status: "refused"`, `refusal.code`) | next to `refusal` in `structuredContent` |
-| An `ActionResult` with `effect` `unverifiable`, `suspected_noop` or `refused` | `hint` and `next_call` on the `ActionResult` |
+| An `ActionResult` with `effect` `unverifiable`, `suspected_noop`, `partial` or `refused` | `hint` and `next_call` on the `ActionResult` |
 
 For example, a background drag that macOS cannot drop returns:
 
@@ -102,6 +102,10 @@ For example, a background drag that macOS cannot drop returns:
   "next_call": {"tool": "get_window_state", "arguments": {"pid": 811, "window_id": 659}}
 }
 ```
+
+A result with `effect: partial` stopped after part of it landed. Its hint says
+how much landed, when the count is exact, and never suggests repeating the
+whole action, even when its `code` names a refusal.
 
 A producer that already sets `hint` or `next_call` keeps its own value. In
 `run_steps`, a failed step's report carries the same `hint` and `next_call`; in
@@ -126,6 +130,13 @@ candidate, and retry with its explicit `window_id`.
 A PID with no eligible windows fails with `code: "window_target_not_found"`.
 Explicit `window_id` targets and `element_token` targets retain their exact
 resolution semantics; the guard does not replace or reinterpret them.
+
+A `window_id` names one window for that window's lifetime. Hyprland reuses
+ids: its window id is a compositor address, which goes to the next window once
+the window closes. There, an explicit `window_id` whose window has closed fails
+before sending input with `code: "window_id_not_found"` and
+`effect: "refused"`, even when another window now holds the same id. Call
+`list_windows` and act on the id it returns.
 
 An action that reached an actuator but lacks a trusted readback is
 `unverifiable`, not `confirmed`. Screenshot change, native API acceptance,

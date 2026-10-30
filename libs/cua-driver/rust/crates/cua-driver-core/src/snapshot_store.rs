@@ -139,6 +139,28 @@ fn screenshot_context_refusal(
     }))
 }
 
+/// Refusal code for acting on a window the person used after the agent's last
+/// read of it.
+pub const PERSON_USED_WINDOW: &str = "person_used_window";
+
+fn person_used_refusal(pid: Option<i32>, window_id: u64) -> ToolResult {
+    let read = match pid {
+        Some(pid) => format!("get_window_state(pid:{pid}, window_id:{window_id})"),
+        None => format!("get_window_state(pid, window_id:{window_id})"),
+    };
+    let message = format!(
+        "The person used window {window_id} after your last read of it, so what you saw may have \
+         changed. Call {read} and act on what it shows now."
+    );
+    ToolResult::error(message.clone()).with_structured(serde_json::json!({
+        "status": "refused",
+        "refusal": { "code": PERSON_USED_WINDOW, "message": message },
+        "code": PERSON_USED_WINDOW,
+        "pid": pid,
+        "window_id": window_id,
+    }))
+}
+
 fn stale_token_refusal<S>(pid: i32, lane: &[Snapshot<S>]) -> ToolResult {
     let current: Vec<_> = lane
         .iter()
@@ -260,6 +282,10 @@ fn out_of_range_refusal<S: SnapshotPayload>(snapshot: &Snapshot<S>, row: usize) 
 pub struct SnapshotStore<S: SnapshotPayload> {
     runtime_scope: String,
     inner: Mutex<HashMap<i32, Vec<Snapshot<S>>>>,
+    /// Windows the person used after an agent read them, with the (pid,
+    /// snapshot id) of each read that retired, until the window is read again.
+    /// Never lock `inner` while holding this.
+    person_used: Mutex<HashMap<u64, Vec<(i32, u32)>>>,
 }
 
 impl<S: SnapshotPayload> SnapshotStore<S> {
@@ -267,6 +293,7 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
         Self {
             runtime_scope: current_runtime_scope(),
             inner: Mutex::new(HashMap::new()),
+            person_used: Mutex::new(HashMap::new()),
         }
     }
 
@@ -433,9 +460,69 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
             });
             (id, retired)
         };
+        self.person_used.lock().unwrap().remove(&window_id);
         let invalidated = retired.iter().map(|snapshot| snapshot.id).collect();
         drop(retired);
         Some((id, invalidated))
+    }
+
+    /// Retire every read of `window_id` because the person used that window:
+    /// what an agent saw there may no longer hold, so acting on the window is
+    /// refused until it is read again. Returns how many reads retired; a
+    /// window no agent has read needs nothing.
+    pub fn retire_person_window(&self, window_id: u64) -> usize {
+        let retired = {
+            let mut inner = self.inner.lock().unwrap();
+            let mut retired = Vec::new();
+            for (pid, lane) in inner.iter_mut() {
+                while let Some(position) = lane.iter().position(|s| s.window_id == window_id) {
+                    retired.push((*pid, lane.remove(position)));
+                }
+            }
+            inner.retain(|_, lane| !lane.is_empty());
+            retired
+        };
+        if retired.is_empty() {
+            return 0;
+        }
+        self.person_used
+            .lock()
+            .unwrap()
+            .entry(window_id)
+            .or_default()
+            .extend(retired.iter().map(|(pid, snapshot)| (*pid, snapshot.id)));
+        let count = retired.len();
+        drop(retired);
+        count
+    }
+
+    /// The refusal for acting on a window the person used after this
+    /// process's last read of it, until the next read.
+    pub fn person_used_window(&self, pid: i32, window_id: u64) -> Option<ToolResult> {
+        self.person_used_by(pid, window_id)
+            .then(|| person_used_refusal(Some(pid), window_id))
+    }
+
+    fn person_used_by(&self, pid: i32, window_id: u64) -> bool {
+        self.person_used
+            .lock()
+            .unwrap()
+            .get(&window_id)
+            .is_some_and(|reads| reads.iter().any(|(owner, _)| *owner == pid))
+    }
+
+    /// The window of a read the person retired, by its pid and snapshot id.
+    fn person_window_of(&self, pid: i32, snapshot_id: Option<u32>) -> Option<u64> {
+        self.person_used
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(_, reads)| {
+                reads.iter().any(|(owner, id)| {
+                    *owner == pid && snapshot_id.is_none_or(|snapshot_id| *id == snapshot_id)
+                })
+            })
+            .map(|(window_id, _)| *window_id)
     }
 
     /// Resolve the screenshot transform from the same authoritative latest
@@ -455,6 +542,9 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
                     .iter()
                     .find(|snapshot| snapshot.window_id == window_id)
                     .ok_or_else(|| {
+                        if self.person_used_by(pid, window_id) {
+                            return person_used_refusal(Some(pid), window_id);
+                        }
                         screenshot_context_refusal(
                             Some(pid),
                             Some(window_id),
@@ -471,6 +561,11 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
                 })
             }
             None => {
+                if lane.is_empty() {
+                    if let Some(window_id) = self.person_window_of(pid, None) {
+                        return Err(person_used_refusal(Some(pid), window_id));
+                    }
+                }
                 let mut contexts = lane.iter().map(|snapshot| snapshot.screenshot(session));
                 let why = match lane {
                     [] => MissingFrame::WindowNeverRead,
@@ -532,6 +627,9 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
         });
         match (matches.next(), matches.next()) {
             (Some(found), None) => Ok(found),
+            _ if self.person_used.lock().unwrap().contains_key(&window_id) => {
+                Err(person_used_refusal(None, window_id))
+            }
             _ => Err(screenshot_context_refusal(
                 None,
                 Some(window_id),
@@ -661,7 +759,10 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
         let (snapshot, element_index) = match parse_token(token) {
             Some((snapshot_id, element_index)) => {
                 let Some(snapshot) = lane.iter().find(|snapshot| snapshot.id == snapshot_id) else {
-                    return Err(stale_token_refusal(pid, lane));
+                    return Err(self.person_window_of(pid, Some(snapshot_id)).map_or_else(
+                        || stale_token_refusal(pid, lane),
+                        |window_id| person_used_refusal(Some(pid), window_id),
+                    ));
                 };
                 (snapshot, element_index)
             }
@@ -703,6 +804,7 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
 
     pub fn clear(&self) -> usize {
         let retired = std::mem::take(&mut *self.inner.lock().unwrap());
+        self.person_used.lock().unwrap().clear();
         let count = retired.len();
         drop(retired);
         count
@@ -732,12 +834,32 @@ impl<S: SnapshotPayload> Default for SnapshotStore<S> {
 
 trait RuntimeStore: Any + Send + Sync {
     fn clear(&self) -> usize;
+    fn retire_person_window(&self, window_id: u64) -> usize;
 }
 
 impl<S: SnapshotPayload> RuntimeStore for SnapshotStore<S> {
     fn clear(&self) -> usize {
         self.clear()
     }
+
+    fn retire_person_window(&self, window_id: u64) -> usize {
+        self.retire_person_window(window_id)
+    }
+}
+
+/// [`SnapshotStore::retire_person_window`] in every runtime, for a platform
+/// that learns of the person's input outside any one dispatch.
+pub fn retire_person_window_everywhere(window_id: u64) -> usize {
+    let stores: Vec<_> = runtime_stores()
+        .lock()
+        .unwrap()
+        .values()
+        .filter_map(Weak::upgrade)
+        .collect();
+    stores
+        .iter()
+        .map(|store| store.retire_person_window(window_id))
+        .sum()
 }
 
 fn runtime_stores() -> &'static Mutex<HashMap<String, Weak<dyn RuntimeStore>>> {
@@ -906,6 +1028,37 @@ mod tests {
             token_refusal(&cache, 200, &token_for(first, 0))["refusal"]["code"],
             "stale_element_token"
         );
+    }
+
+    #[test]
+    fn a_window_the_person_used_refuses_until_it_is_read_again() {
+        let cache = SnapshotStore::new();
+        let (id, _) = cache
+            .publish_for_session(10, 20, Payload(vec![1, 2]), Some("a"), Some(2.0))
+            .unwrap();
+        cache.publish_for_session(10, 30, Payload(vec![1]), Some("a"), Some(2.0));
+        assert_eq!(cache.retire_person_window(20), 1);
+
+        let pixels = cache
+            .screenshot_context(10, Some(20), Some("a"))
+            .unwrap_err();
+        assert_eq!(refusal_code(pixels), PERSON_USED_WINDOW);
+        let only_window = cache.screenshot_context_for_zoom(None, 20, Some("a"));
+        assert_eq!(refusal_code(only_window.unwrap_err()), PERSON_USED_WINDOW);
+        assert_eq!(
+            token_refusal(&cache, 10, &token_for(id, 1))["code"],
+            PERSON_USED_WINDOW
+        );
+        assert!(cache.person_used_window(10, 20).is_some());
+
+        assert!(cache.screenshot_context(10, Some(30), Some("a")).is_ok());
+        assert!(cache.person_used_window(11, 20).is_none());
+        assert_eq!(cache.retire_person_window(40), 0);
+        assert!(cache.person_used_window(10, 40).is_none());
+
+        cache.publish_for_session(10, 20, Payload(vec![1]), Some("a"), Some(2.0));
+        assert!(cache.person_used_window(10, 20).is_none());
+        assert!(cache.screenshot_context(10, Some(20), Some("a")).is_ok());
     }
 
     #[test]

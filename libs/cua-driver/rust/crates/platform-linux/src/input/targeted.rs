@@ -112,8 +112,6 @@ pub(crate) fn gone() -> TargetedInputError {
 /// Detection reads `/proc/<pid>/maps` (bounded) for the toolkit's shared
 /// library, and `/proc/<pid>/exe` for Chromium/Electron binaries.
 pub fn synthetic_input_ignored_by(pid: u32) -> Option<&'static str> {
-    use std::io::Read;
-    const MAX_MAPS: u64 = 8 << 20;
     let exe = std::fs::read_link(format!("/proc/{pid}/exe"))
         .ok()
         .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase()))
@@ -124,13 +122,24 @@ pub fn synthetic_input_ignored_by(pid: u32) -> Option<&'static str> {
     {
         return Some("Chromium");
     }
+    toolkit_from_maps(&process_maps(pid)?)
+}
+
+/// Whether `pid` runs Qt 5's X backend.
+pub fn uses_qt5_xcb(pid: u32) -> bool {
+    process_maps(pid).is_some_and(|maps| maps.contains("libQt5XcbQpa.so"))
+}
+
+fn process_maps(pid: u32) -> Option<String> {
+    use std::io::Read;
+    const MAX_MAPS: u64 = 8 << 20;
     let mut maps = String::new();
     std::fs::File::open(format!("/proc/{pid}/maps"))
         .ok()?
         .take(MAX_MAPS)
         .read_to_string(&mut maps)
         .ok()?;
-    toolkit_from_maps(&maps)
+    Some(maps)
 }
 
 fn toolkit_from_maps(maps: &str) -> Option<&'static str> {

@@ -72,6 +72,14 @@ fn every_hint_variant_stays_within_the_length_limit() {
             json!({"code": "background_unavailable", "reason": "windowserver_connection_invalid"}),
         ),
         (
+            "type_text",
+            json!({"code": "background_unavailable", "reason": "primary_keyboard_busy"}),
+        ),
+        (
+            "click",
+            json!({"code": "background_unavailable", "reason": "primary_target_busy"}),
+        ),
+        (
             "click",
             json!({"code": "background_unavailable", "window": {"pid": 1, "window_id": 2}}),
         ),
@@ -168,6 +176,7 @@ fn the_table_covers_every_code_agents_hit_most() {
         "popup_keyboard_grab",
         "lane_busy",
         "primary_target_busy",
+        "person_used_window",
         "invalid_arguments",
     ] {
         assert!(covered.contains(&code), "no hint for {code}");
@@ -207,6 +216,79 @@ fn a_drag_refused_by_macos_drag_and_drop_names_a_non_drag_route_and_the_foregrou
 }
 
 #[test]
+fn input_refused_while_the_user_is_on_the_app_waits_for_them() {
+    let hint = hint_for(
+        "click",
+        &window_seed(),
+        true,
+        json!({"code": "background_unavailable", "reason": "primary_target_busy"}),
+    );
+    assert_eq!(
+        hint.hint,
+        "The user is on this app right now, so nothing was sent. Wait a few seconds, then read the \
+         window again before retrying, since they may have changed it. Do not switch to foreground."
+    );
+    assert_eq!(
+        call_value(&hint),
+        json!({
+            "tool": "get_window_state",
+            "arguments": {"pid": 4242, "window_id": 17, "session": "run-1"},
+        })
+    );
+}
+
+#[test]
+fn keys_refused_in_the_users_app_keep_pointer_and_element_routes_open() {
+    let hint = hint_for(
+        "type_text",
+        &window_seed(),
+        true,
+        json!({
+            "code": "background_unavailable",
+            "reason": "primary_keyboard_busy",
+            "effect": "partial",
+            "delivery": {"mode": "background", "delivered_count": 5},
+        }),
+    );
+    assert_eq!(
+        hint.hint,
+        "The user is typing in this app, so keys are refused: they could reach the user's window. \
+         Clicks, scrolls and element actions (set_value) still work. Send any remaining keys after \
+         the user leaves the app."
+    );
+    assert_eq!(
+        call_value(&hint),
+        json!({
+            "tool": "get_window_state",
+            "arguments": {"pid": 4242, "window_id": 17, "session": "run-1"},
+        })
+    );
+}
+
+#[test]
+fn a_locked_or_dark_screen_asks_to_wait_whatever_the_tool_or_route() {
+    // Scroll and invoke_menu have their own background hints; the lock wins.
+    for tool in ["click", "set_value", "scroll", "invoke_menu"] {
+        for code in ["background_unavailable", "foreground_unavailable"] {
+            let hint = hint_for(
+                tool,
+                &window_seed(),
+                true,
+                json!({"code": code, "reason": "session_unavailable", "effect": "refused"}),
+            );
+            assert!(
+                hint.hint
+                    .starts_with("The user's screen is locked or the display is off"),
+                "{tool} {code}: {}",
+                hint.hint
+            );
+            assert!(hint.hint.chars().count() <= MAX_HINT_CHARS);
+            assert_eq!(hint.next_call, None, "{tool} {code}");
+        }
+    }
+}
+
+#[test]
 fn a_next_call_never_asks_for_the_foreground() {
     let seed = window_seed();
     for (tool, value) in [
@@ -229,6 +311,34 @@ fn a_next_call_never_asks_for_the_foreground() {
             assert!(call.arguments.get("delivery_mode").is_none(), "{tool}");
         }
     }
+}
+
+#[test]
+fn refused_global_input_points_at_window_targets() {
+    let desktop = hint_for(
+        "hotkey",
+        &seed(json!({"scope": "desktop", "keys": ["super", "1"]})),
+        true,
+        json!({"code": "global_input_disabled", "effect": "refused"}),
+    );
+    assert!(desktop.hint.contains("even on another workspace"));
+    assert_eq!(
+        call_value(&desktop),
+        json!({"tool": "list_windows", "arguments": {}})
+    );
+    let window = hint_for(
+        "click",
+        &window_seed(),
+        true,
+        json!({"code": "global_input_disabled", "effect": "refused"}),
+    );
+    assert_eq!(
+        call_value(&window),
+        json!({
+            "tool": "get_window_state",
+            "arguments": {"pid": 4242, "window_id": 17, "session": "run-1"},
+        })
+    );
 }
 
 #[test]
@@ -434,6 +544,62 @@ fn an_incomplete_type_text_names_how_much_landed() {
             "arguments": {"pid": 4242, "window_id": 17, "session": "run-1", "since": "latest"},
         })
     );
+}
+
+#[test]
+fn a_partial_action_never_gets_retry_advice() {
+    let seed = window_seed();
+    let read_changes = json!({
+        "tool": "get_window_state",
+        "arguments": {"pid": 4242, "window_id": 17, "session": "run-1", "since": "latest"},
+    });
+    // Hyprland reports the delivered prefix under its route refusal code.
+    let interrupted = |mode: &str| {
+        json!({"code": "background_unavailable", "reason": "text_interrupted", "effect": "partial",
+            "delivery": {"mode": mode, "delivered_count": 71}})
+    };
+    let typed = hint_for("type_text", &seed, true, interrupted("background"));
+    assert_eq!(
+        typed.hint,
+        "Only the first 71 characters landed. Read the field to confirm, then type only the missing \
+         rest; do not resend it all."
+    );
+    assert_eq!(call_value(&typed), read_changes);
+    // Unknown delivery may have landed more than the acknowledged count.
+    let unknown = hint_for("type_text", &seed, true, interrupted("unknown"));
+    assert!(unknown.hint.starts_with("Read the field to confirm"));
+    // macOS names the same prefix in characters.
+    let macos = hint_for(
+        "type_text",
+        &seed,
+        true,
+        json!({"code": "type_text_incomplete", "effect": "partial", "delivered_chars": 12}),
+    );
+    assert!(macos
+        .hint
+        .starts_with("Only the first 12 characters landed."));
+    for (tool, value) in [
+        (
+            "scroll",
+            json!({"code": "background_unavailable", "effect": "partial",
+                "delivery": {"mode": "background", "delivered_count": 2}}),
+        ),
+        (
+            "drag",
+            json!({"code": "foreground_unavailable", "effect": "partial",
+                "delivery": {"mode": "foreground", "delivered_count": 1}}),
+        ),
+        ("click", json!({"effect": "partial"})),
+    ] {
+        let hint = hint_for(tool, &seed, true, value);
+        assert_eq!(
+            hint.hint,
+            "The action stopped partway, so part of it already landed. Read what changed and finish \
+             only what is missing; do not repeat it whole.",
+            "{tool}"
+        );
+        assert_eq!(call_value(&hint), read_changes, "{tool}");
+    }
 }
 
 #[test]
@@ -657,13 +823,6 @@ fn confirmed_results_and_other_tools_get_no_hint() {
         &seed,
         false,
         &structured(json!({"effect": "confirmed"}))
-    )
-    .is_none());
-    assert!(recovery_for(
-        "click",
-        &seed,
-        false,
-        &structured(json!({"effect": "partial"}))
     )
     .is_none());
     // Not an action tool: its `effect` field means something else.

@@ -32,13 +32,15 @@ connection. These checks prevent cross-account access and accidental routing
 to another compositor; they do not prove human consent or sandbox arbitrary
 native code running as the same user.
 
-The Linux adapter checks the qualified application package on every action
-before allocating or using a lane. Eligibility is a compatibility check, not
-an authorization boundary. The initial candidate scope is native Calc
-`libreoffice-fresh 26.2.5-3` and Inkscape `1.4.4-6`, subject to per-operation
-native qualification. Unknown packages refuse. The plugin separately checks
-the live native surface, geometry, primary/other-agent conflicts, desktop
-availability, and canonical US keymap.
+The Linux adapter has no application package gate, as on macOS. Recorded
+native evidence covers Calc `libreoffice-fresh 26.2.5-3` and Inkscape
+`1.4.4-6`. The plugin checks the live native surface, geometry, other-agent
+conflicts, desktop availability, and canonical US keymap. It refuses every
+action while the human is in the target's app for X windows and the
+primary-seat background route, where the app's reactions can reach the human's
+own input. On native agent-seat targets it refuses only keys, while the human's
+keyboard focus is on the target's app; see
+[keys in the person's app](cua-input-v3.md#keys-in-the-persons-app).
 
 Production [input v3](cua-input-v3.md) has separate endpoints from discovery v2
 and signed experiment 0. Each private connection claims one compositor-owned

@@ -1,0 +1,66 @@
+--- a/hw/xwayland/xwayland-input.c
++++ b/hw/xwayland/xwayland-input.c
+@@ -3237,11 +3237,41 @@
+     return !pointer_crossing;
+ }
+ 
++/* A seat whose devices sit on an XInput2 master other than the core pointer
++ * is a separate input user. Its Wayland focus already names the window it is
++ * over, so X stacking must not hand its events to a window stacked above that
++ * one, which can be a window the compositor is not showing. The core pointer
++ * never takes this path.
++ */
++static WindowPtr
++xwl_isolated_focus_toplevel(SpritePtr sprite)
++{
++    DeviceIntPtr device, master;
++    struct xwl_seat *xwl_seat;
++
++    for (device = inputInfo.devices; device; device = device->next) {
++        if (device->deviceProc == xwl_pointer_proc &&
++            device->spriteInfo->sprite == sprite)
++            break;
++    }
++
++    if (!device)
++        return NULL;
++
++    master = GetMaster(device, MASTER_POINTER);
++    xwl_seat = device->public.devicePrivate;
++    if (!master || master == inputInfo.pointer ||
++        !xwl_seat || !xwl_seat->focus_window)
++        return NULL;
++
++    return xwl_seat->focus_window->toplevel;
++}
++
+ static WindowPtr
+ xwl_xy_to_window(ScreenPtr screen, SpritePtr sprite, int x, int y)
+ {
+     struct xwl_screen *xwl_screen;
+-    WindowPtr ret;
++    WindowPtr ret, toplevel;
+ 
+     xwl_screen = xwl_screen_get(screen);
+ 
+@@ -3261,6 +3291,20 @@
+         return sprite->spriteTrace[0];
+     }
+ 
++    toplevel = xwl_isolated_focus_toplevel(sprite);
++    if (toplevel && ret != toplevel && !IsParent(toplevel, ret)) {
++        /* An unexpected window layout gets the root window, never another
++         * window. */
++        if (!toplevel->realized || toplevel->parent != screen->root ||
++            sprite->spriteTraceSize < 2) {
++            sprite->spriteTraceGood = 1;
++            return sprite->spriteTrace[0];
++        }
++        sprite->spriteTrace[1] = toplevel;
++        sprite->spriteTraceGood = 2;
++        return miSpriteTrace(sprite, x, y);
++    }
++
+     return ret;
+ }
+ 

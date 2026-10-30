@@ -109,6 +109,36 @@ if(BUILD_TESTING)
     target_compile_options(cua_hyprland_drag_geometry_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
     add_test(NAME cua_hyprland_drag_geometry_test COMMAND cua_hyprland_drag_geometry_test)
 
+    add_executable(cua_hyprland_pointer_hit_test tests/pointer_hit_test.cpp)
+    target_compile_features(cua_hyprland_pointer_hit_test PRIVATE cxx_std_26)
+    target_include_directories(cua_hyprland_pointer_hit_test PRIVATE src)
+    target_compile_options(cua_hyprland_pointer_hit_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    add_test(NAME cua_hyprland_pointer_hit_test COMMAND cua_hyprland_pointer_hit_test)
+
+    add_executable(cua_hyprland_target_identity_test tests/target_identity_test.cpp)
+    target_compile_features(cua_hyprland_target_identity_test PRIVATE cxx_std_26)
+    target_include_directories(cua_hyprland_target_identity_test PRIVATE src)
+    target_compile_options(cua_hyprland_target_identity_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    add_test(NAME cua_hyprland_target_identity_test COMMAND cua_hyprland_target_identity_test)
+
+    add_executable(cua_hyprland_cursor_layer_test tests/cursor_layer_test.cpp)
+    target_compile_features(cua_hyprland_cursor_layer_test PRIVATE cxx_std_26)
+    target_include_directories(cua_hyprland_cursor_layer_test PRIVATE src)
+    target_compile_options(cua_hyprland_cursor_layer_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    add_test(NAME cua_hyprland_cursor_layer_test COMMAND cua_hyprland_cursor_layer_test)
+
+    add_executable(cua_hyprland_reaction_window_test tests/reaction_window_test.cpp)
+    target_compile_features(cua_hyprland_reaction_window_test PRIVATE cxx_std_26)
+    target_include_directories(cua_hyprland_reaction_window_test PRIVATE src)
+    target_compile_options(cua_hyprland_reaction_window_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    add_test(NAME cua_hyprland_reaction_window_test COMMAND cua_hyprland_reaction_window_test)
+
+    add_executable(cua_hyprland_state_request_test tests/state_request_test.cpp)
+    target_compile_features(cua_hyprland_state_request_test PRIVATE cxx_std_26)
+    target_include_directories(cua_hyprland_state_request_test PRIVATE src)
+    target_compile_options(cua_hyprland_state_request_test PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    add_test(NAME cua_hyprland_state_request_test COMMAND cua_hyprland_state_request_test)
+
     add_test(NAME cua_hyprland_cmake_api_test
         COMMAND ${CMAKE_COMMAND}
             -S ${CMAKE_CURRENT_SOURCE_DIR}/tests/cmake-api
@@ -188,6 +218,16 @@ if(UNIX)
             -Wall -Wextra -Wpedantic -Werror -Wno-return-type-c-linkage)
         target_link_libraries(cua_hyprland_plugin_v3_lifetime_test PRIVATE cua_hyprland_transport)
         add_test(NAME cua_hyprland_plugin_v3_lifetime_test COMMAND cua_hyprland_plugin_v3_lifetime_test)
+        add_executable(cua_hyprland_plugin_input_failure_test
+            tests/plugin_input_failure_test.cpp src/plugin.cpp)
+        target_compile_features(cua_hyprland_plugin_input_failure_test PRIVATE cxx_std_26)
+        target_include_directories(cua_hyprland_plugin_input_failure_test PRIVATE tests tests/mock-hyprland include src)
+        target_compile_definitions(cua_hyprland_plugin_input_failure_test PRIVATE
+            CUA_HYPRLAND_PLUGIN_VERSION="${PROJECT_VERSION}" CUA_HYPRLAND_SOCKET1_API=0 CUA_HYPRLAND_INPUT=1)
+        target_compile_options(cua_hyprland_plugin_input_failure_test PRIVATE
+            -Wall -Wextra -Wpedantic -Werror -Wno-return-type-c-linkage)
+        target_link_libraries(cua_hyprland_plugin_input_failure_test PRIVATE cua_hyprland_transport)
+        add_test(NAME cua_hyprland_plugin_input_failure_test COMMAND cua_hyprland_plugin_input_failure_test)
 
         add_executable(cua_hyprland_transport_test tests/transport_test.cpp)
         target_compile_options(cua_hyprland_transport_test PRIVATE -Wall -Wextra -Wpedantic -Werror)

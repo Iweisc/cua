@@ -321,6 +321,17 @@ pub fn element_showing_observed(element: &cache::CachedElement) -> Result<bool> 
     native::element_showing_ref(object_ref)
 }
 
+/// Whether a pointer press at the centre of the exact object a snapshot
+/// observed lands on it, by the toolkit's own hit test. Never re-walks.
+pub fn element_hit_at_centre_observed(element: &cache::CachedElement) -> Result<bool> {
+    let Some(object_ref) = element.object_ref.as_ref() else {
+        return Err(
+            native::CachedElementGone("observed element has no D-Bus address".into()).into(),
+        );
+    };
+    native::element_hit_at_centre_ref(&element.identity, object_ref)
+}
+
 /// Give an indexed AT-SPI element keyboard focus without activating its window.
 pub fn focus_element(pid: u32, idx: usize) -> Result<bool> {
     if let Some(object_ref) = cache::cached_element(pid, None, idx).and_then(|e| e.object_ref) {

@@ -35,17 +35,36 @@ testing, packaging, and release requirements.
 Bounded instrumented app proof and an uninstrumented smoke are retained from
 source `f180e8828b8f31cc153e3c44eaa89a9c13c5bc68`, with an unchanged plugin
 tree and uninstrumented module hash at
-`1133a06e4f205cf80188a7ac9e41102f37611fea`. Raw background qualification is
-limited to native Calc from `libreoffice-fresh 26.2.5-3`, Inkscape `1.4.4-6`,
-the plain compiled `evdev`/`pc105`/`us` keymap, and the two seats `Cua-Agent`
-and `Cua-Agent-2`. The proof covers the recorded actions and observation
-intervals. Chromium, Electron, and XWayland raw background input remain
-unqualified; semantic AT-SPI actions are separate.
+`1133a06e4f205cf80188a7ac9e41102f37611fea`. That proof covers native Calc from
+`libreoffice-fresh 26.2.5-3`, Inkscape `1.4.4-6`, the plain compiled
+`evdev`/`pc105`/`us` keymap, and the two seats `Cua-Agent` and `Cua-Agent-2`,
+for the recorded actions and observation intervals. Background input has no
+app gate, as on macOS. Chromium and Electron reach background input through
+the `PRIMARY_TARGET` route described in
+[the protocol](protocol/cua-input-v3.md#primary-seat-background-extension).
+X windows reach background input through `XWAYLAND_TARGET` on stock
+XWayland, after Driver moves the agent seat onto its own X master pair; see
+[the protocol](protocol/cua-input-v3.md#xwayland-extension). Semantic AT-SPI
+actions are separate. Driver uses them for clicks by element, except on text
+fields and the other controls their action does not focus, and sends those and
+every click at window coordinates through this plugin.
 
 The exact-target foreground route intentionally changes primary focus and,
 for pointer actions, cursor position, without restoration. The canonical native
 harness covers defined GTK3, Electron, and Tauri foreground cases. A background
 refusal never authorizes a hidden foreground fallback.
+
+While the plugin is active, Driver keeps agents off your own keyboard and
+pointer. Agents act on window targets in the background, which reaches any
+window, including windows on other workspaces. Desktop-scope input
+(`scope:"desktop"` or a desktop `target`), `delivery_mode:"foreground"`,
+`bring_to_front`, and `mouse_button_down` refuse with `global_input_disabled`
+and `effect:"refused"` before anything is sent, and any other route that would
+inject through your seat fails with the same code. This holds whenever the
+plugin's sockets exist in your live Hyprland, however Driver was started. To
+let agents use your keyboard and pointer, set
+`"allow_global_input": true` in `~/.cua-driver/config.json`. Driver reads it on
+each call. `set_config` cannot change it, so an agent cannot turn it on.
 
 This branch also contains a separate, opt-in
 [isolated-input compatibility experiment](protocol/input-experiment.md).
@@ -151,6 +170,13 @@ Do not add a `plugin =` line to Hyprland configuration until the ABI match and
 status output have been checked in a disposable session. A mismatched module
 may be refused by Hyprland or fail during load. If load fails after a Hyprland
 upgrade, leave it unloaded, rebuild against the new exact package, and retry.
+
+Never write a new build into the module file a running Hyprland has loaded,
+for example by copying it onto the same path. Truncating a mapped module
+discards even its relocated pages, and Hyprland crashes the next time it runs
+plugin code. Install a replacement as a
+new file (a package upgrade does this, as does copying to a temporary name and
+renaming it over the old one), then restart the desktop before loading it.
 The portable driver remains available without this plugin.
 
 `hyprctl -j cua:status` is the authoritative runtime status surface. Consumers
@@ -193,7 +219,11 @@ it to false in the configuration and reload. Unloading the plugin also closes
 the socket and every connection immediately.
 
 For the default discovery build, this enables status and liveness only. For
-the opt-in v3 build, it also opens the two input endpoints. Enabling v3 is a
+the opt-in v3 build, it also opens the two input endpoints. If input cannot
+start in this Hyprland, for example because a hook target is missing, the
+plugin adds no seats, reports the reason in `hyprctl -j cua:status` under
+`transport.last_error`, and does not retry on later reloads until Hyprland
+restarts. Enabling v3 is a
 trusted-local desktop configuration choice; Driver still checks each call
 under its normal permission policy. The candidate refuses clients, layouts,
 and operations outside its qualification scope.
@@ -301,6 +331,6 @@ that isolated background input ships in stable `0.23.2` or nightly. The plugin
 remains discovery-only in its normal build. The separate physical run has explicit foreground
 activation observation, GTK3, GTK4, Qt6, LibreOffice, Chromium/Ozone, Electron,
 DPMS-off refusal, and one-shot and long-lived graphical-session client rows;
-see `tests/README.md` for the required evidence. Those broader application rows
-do not widen the raw-background qualification beyond the exact Calc/Inkscape
+see `tests/README.md` for the required evidence. Background input has no app
+gate, but its recorded native evidence stays limited to the exact Calc/Inkscape
 packages, plain US keymap, and two seats documented in the input v3 contract.

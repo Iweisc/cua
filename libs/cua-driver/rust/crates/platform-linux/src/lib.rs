@@ -252,6 +252,10 @@ pub fn register_tools_with_cursor_and_provider(
 #[cfg(target_os = "linux")]
 pub fn recover_orphaned_mpx_devices() {
     input::reap_orphaned_master_pointers();
+    if wayland::wayland_input_enabled() && wayland::hyprland::is_session() {
+        // A hung XWayland must not hold up the daemon.
+        std::thread::spawn(wayland::xwayland_seat::recover);
+    }
 }
 
 #[cfg(test)]

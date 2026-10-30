@@ -83,6 +83,9 @@ are capabilities, not one uniform API.
 PX background left-click rows may resolve the screen point to an actionable
 AT-SPI node. Such a pass proves the public PX-addressed behavior and its desktop
 side effects, but it does not prove raw pixel delivery to canvases or games.
+On Hyprland with the input plugin, a PX click is always a plugin pointer click.
+So is an AX click on a text field, spin button, slider, combo box, or table cell
+that the toolkit's hit test finds at its center.
 
 The [accepted Hyprland foreground extension](https://github.com/trycua/cua/issues/3550#issuecomment-5564996417)
 is planned support, not an empirical pass in this table. Production protocol v3
@@ -95,9 +98,8 @@ coverage still requires the complete canonical Linux suite in native Hyprland.
 Foreground delivery may activate the target and move the primary cursor, with
 no restoration promise. Held keys/buttons, grabs, constraints, and drag-and-drop
 must refuse before takeover; foreground drag interruption still requires review
-and native verification. This route has no Calc/Inkscape package gate. Background
-`TARGET` retains its Calc/Inkscape qualification and never escalates to
-foreground. Observation followed by global `wtype` input is not an exact-target
+and native verification. Background `TARGET` never escalates to foreground.
+Observation followed by global `wtype` input is not an exact-target
 fallback. Both routes retain the common permission and lifecycle contract.
 
 ## Maintenance rule

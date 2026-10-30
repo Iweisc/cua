@@ -5,11 +5,12 @@
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 const QUERY_TIMEOUT: Duration = Duration::from_secs(1);
@@ -41,6 +42,9 @@ struct Client {
     /// 0 is the focused client; larger is longer ago. Absent on old builds.
     #[serde(rename = "focusHistoryID", default)]
     focus_history: i64,
+    /// Hex. Never reused within a compositor run, unlike the address.
+    #[serde(rename = "stableId", default)]
+    stable_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -204,17 +208,72 @@ pub struct Window {
     /// Focus recency (0 = focused); the closest thing to z-order Hyprland
     /// exposes.
     pub focus_order: i64,
+    /// `None` when the compositor does not report one.
+    pub stable_id: Option<u64>,
 }
 
 pub fn is_session() -> bool {
-    !super::is_inject_mode()
-        && std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some_and(|s| !s.is_empty())
+    !super::is_inject_mode() && instance_signature().is_some()
+}
+
+/// Hyprland exports its signature to the programs it starts, but a driver
+/// started any other way may only have WAYLAND_DISPLAY. Without the signature
+/// the driver falls to the generic Wayland path, where X windows get XIDs no
+/// capture can attest and input goes global. Each instance names its Wayland
+/// socket in `hypr/<signature>/hyprland.lock`, the file `hyprctl instances`
+/// reads.
+pub(super) fn instance_signature() -> Option<String> {
+    if let Some(signature) = std::env::var("HYPRLAND_INSTANCE_SIGNATURE")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
+        return Some(signature);
+    }
+    let runtime = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR")?);
+    signature_for_socket(&runtime, &wayland_socket_path().ok()?)
+}
+
+/// The one live instance serving `display`. A crashed Hyprland leaves its lock
+/// behind, and the next instance usually takes the same socket name.
+fn signature_for_socket(runtime: &Path, display: &Path) -> Option<String> {
+    let mut serving = live_instances(runtime)
+        .into_iter()
+        .filter(|(_, socket)| runtime.join(socket) == display);
+    let (dir, _) = serving.next()?;
+    if serving.next().is_some() {
+        return None;
+    }
+    dir.file_name()?.to_str().map(str::to_owned)
+}
+
+/// Each live Hyprland instance under `runtime`: its `hypr/<signature>`
+/// directory and the Wayland socket its lock names.
+pub(super) fn live_instances(runtime: &Path) -> Vec<(PathBuf, String)> {
+    let Ok(entries) = std::fs::read_dir(runtime.join("hypr")) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| {
+            let lock = std::fs::read_to_string(entry.path().join("hyprland.lock")).ok()?;
+            let mut lines = lock.lines();
+            let (pid, socket) = (lines.next()?, lines.next()?);
+            pid.parse::<u32>()
+                .is_ok_and(|pid| pid > 0 && Path::new(&format!("/proc/{pid}")).exists())
+                .then(|| (entry.path(), socket.to_owned()))
+        })
+        .collect()
+}
+
+/// `hyprctl -j cua:status` from the attested compositor. `Err` when the plugin
+/// is not loaded, since Hyprland then reports an unknown request.
+pub fn plugin_status() -> Result<serde_json::Value> {
+    query("j/cua:status")
 }
 
 fn ipc_path() -> Result<PathBuf> {
     let runtime = std::env::var_os("XDG_RUNTIME_DIR").context("missing XDG_RUNTIME_DIR")?;
-    let signature = std::env::var("HYPRLAND_INSTANCE_SIGNATURE")
-        .context("missing HYPRLAND_INSTANCE_SIGNATURE")?;
+    let signature = instance_signature().context("missing HYPRLAND_INSTANCE_SIGNATURE")?;
     if signature.is_empty()
         || !signature
             .bytes()
@@ -227,6 +286,11 @@ fn ipc_path() -> Result<PathBuf> {
         bail!("XDG_RUNTIME_DIR must be absolute");
     }
     Ok(runtime.join("hypr").join(signature).join(".socket.sock"))
+}
+
+/// The socket Hyprland announces events on, focus changes among them.
+pub(super) fn event_socket_path() -> Result<PathBuf> {
+    Ok(ipc_path()?.with_file_name(".socket2.sock"))
 }
 
 pub(super) fn peer_pid(fd: RawFd) -> Result<libc::pid_t> {
@@ -272,32 +336,44 @@ fn wayland_connection_with_timeout(timeout: Duration) -> Result<wayland_client::
     if std::env::var_os("WAYLAND_SOCKET").is_some() {
         bail!("Hyprland observation requires a named WAYLAND_DISPLAY socket");
     }
+    let socket = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)?;
+    socket.connect_timeout(&socket2::SockAddr::unix(wayland_socket_path()?)?, timeout)?;
+    wayland_client::Connection::from_socket(socket.into()).context("Wayland connection failed")
+}
+
+fn wayland_socket_path() -> Result<PathBuf> {
     let display =
         PathBuf::from(std::env::var_os("WAYLAND_DISPLAY").context("missing WAYLAND_DISPLAY")?);
-    let path = if display.is_absolute() {
-        display
-    } else {
-        if display.components().count() != 1 {
-            bail!("invalid WAYLAND_DISPLAY socket name");
-        }
-        let runtime =
-            PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").context("missing XDG_RUNTIME_DIR")?);
-        if !runtime.is_absolute() {
-            bail!("XDG_RUNTIME_DIR must be absolute");
-        }
-        runtime.join(display)
-    };
-    let socket = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)?;
-    socket.connect_timeout(&socket2::SockAddr::unix(path)?, timeout)?;
-    wayland_client::Connection::from_socket(socket.into()).context("Wayland connection failed")
+    if display.is_absolute() {
+        return Ok(display);
+    }
+    if display.components().count() != 1 {
+        bail!("invalid WAYLAND_DISPLAY socket name");
+    }
+    let runtime =
+        PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").context("missing XDG_RUNTIME_DIR")?);
+    if !runtime.is_absolute() {
+        bail!("XDG_RUNTIME_DIR must be absolute");
+    }
+    Ok(runtime.join(display))
 }
 
 /// Bind the Wayland connection to the IPC compositor before accepting pixels.
 pub(super) fn verify_capture_peer(connection: &wayland_client::Connection) -> Result<()> {
-    let ipc = ipc_connection()?;
-    if peer_pid(ipc.as_raw_fd())? != peer_pid(connection.backend().poll_fd().as_raw_fd())? {
+    attest_capture_peer(
+        ipc_connection()?,
+        connection.backend().poll_fd().as_raw_fd(),
+    )
+}
+
+fn attest_capture_peer(mut ipc: UnixStream, wayland: RawFd) -> Result<()> {
+    if peer_pid(ipc.as_raw_fd())? != peer_pid(wayland)? {
         bail!("Hyprland IPC and WAYLAND_DISPLAY name different compositor processes");
     }
+    // Hyprland replies to every connection, even one that sent nothing, and
+    // logs an error when the reply hits a closed socket. That ran on every
+    // capture and input connection, so ask for something tiny and read it.
+    read_reply(&mut ipc, b"j/cursorpos", QUERY_TIMEOUT)?;
     Ok(())
 }
 
@@ -357,7 +433,7 @@ fn query_with<T: serde::de::DeserializeOwned>(
     // dispatch commands. JSON output does not imply a read-only operation.
     let read_only = matches!(
         command,
-        "j/monitors" | "j/clients" | "j/activewindow" | "j/cursorpos"
+        "j/monitors" | "j/clients" | "j/activewindow" | "j/cursorpos" | "j/cua:status"
     );
     for attempt in 1..=QUERY_MAX_ATTEMPTS {
         query_time_remaining(deadline)?;
@@ -449,6 +525,7 @@ fn windows_from_clients(clients: Vec<Client>, active: &HashSet<i64>) -> Result<V
             xwayland: c.xwayland,
             hidden: c.hidden,
             focus_order: c.focus_history,
+            stable_id: c.stable_id.and_then(|id| u64::from_str_radix(&id, 16).ok()),
         });
     }
     Ok(windows)
@@ -840,6 +917,94 @@ pub fn window_for_address(address: u64) -> Option<Window> {
         .find(|w| w.address == address)
 }
 
+/// The stable id of the window each address named when Driver returned that
+/// address to a caller as a window_id. Hyprland gives a closed window's
+/// address to the next window, usually at once, so the address alone can name
+/// a window the caller never saw. Entries outlive their windows on purpose;
+/// addresses are recycled, so the map stays small.
+fn handed_out() -> &'static Mutex<HashMap<u64, u64>> {
+    static HANDED_OUT: OnceLock<Mutex<HashMap<u64, u64>>> = OnceLock::new();
+    HANDED_OUT.get_or_init(Default::default)
+}
+
+fn lock_handed_out() -> MutexGuard<'static, HashMap<u64, u64>> {
+    handed_out().lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The stable id of each window from one enumeration, by address.
+#[derive(Default)]
+pub struct Identities(HashMap<u64, u64>);
+
+impl Identities {
+    pub fn of(windows: &[Window]) -> Self {
+        Self(
+            windows
+                .iter()
+                .filter_map(|w| Some((w.address, w.stable_id?)))
+                .collect(),
+        )
+    }
+
+    /// Record that these windows from the same enumeration were returned to a
+    /// caller, replacing whatever their addresses named before.
+    pub fn hand_out<'a>(&self, windows: impl IntoIterator<Item = &'a crate::x11::WindowInfo>) {
+        let mut handed = lock_handed_out();
+        for window in windows {
+            if let Some(id) = self.0.get(&window.xid) {
+                handed.insert(window.xid, *id);
+            }
+        }
+    }
+
+    pub fn confirm(&self, address: u64) -> Result<Option<u64>, WindowReplaced> {
+        confirm_identity(address, self.0.get(&address).copied())
+    }
+}
+
+/// The window at an address is not the one Driver returned for it.
+#[derive(Debug, PartialEq, Eq)]
+pub struct WindowReplaced;
+
+/// The stable id an action or read on `address` must find, given the stable id
+/// of the window there now (`None` when there is none). Refuses when that is
+/// not the window Driver returned for the address. An address Driver never
+/// returned (the caller found it elsewhere, or Driver restarted since) is
+/// pinned to the window there now.
+pub fn confirm_identity(address: u64, current: Option<u64>) -> Result<Option<u64>, WindowReplaced> {
+    confirm_in(&mut lock_handed_out(), address, current)
+}
+
+fn confirm_in(
+    handed: &mut HashMap<u64, u64>,
+    address: u64,
+    current: Option<u64>,
+) -> Result<Option<u64>, WindowReplaced> {
+    let Some(current) = current else {
+        // Nothing to compare: the missing-window checks refuse on their own.
+        // Keep expecting the old window, so one that maps here before the
+        // plugin binds the target still refuses there.
+        return Ok(handed.get(&address).copied());
+    };
+    if *handed.entry(address).or_insert(current) == current {
+        Ok(Some(current))
+    } else {
+        Err(WindowReplaced)
+    }
+}
+
+/// The stable id of the window Driver returned or pinned `address` for.
+pub fn handed_out_identity(address: u64) -> Option<u64> {
+    lock_handed_out().get(&address).copied()
+}
+
+/// [`confirm_identity`] against the window at `address` now.
+pub fn window_identity(address: u64) -> Result<Option<u64>, WindowReplaced> {
+    confirm_identity(
+        address,
+        window_for_address(address).and_then(|w| w.stable_id),
+    )
+}
+
 /// AT-SPI has no native Hyprland handle. Correlate only when the title is
 /// unique among this PID's mapped compositor clients, as well as AX roots.
 pub fn accessibility_window(address: u64, pid: u32) -> Option<Window> {
@@ -958,7 +1123,88 @@ mod tests {
             xwayland: Some(false),
             hidden: false,
             focus_order: 0,
+            stable_id: None,
         }
+    }
+
+    fn listed(address: u64) -> crate::x11::WindowInfo {
+        crate::x11::WindowInfo {
+            xid: address,
+            pid: Some(42),
+            app_name: "fixture".into(),
+            title: "Fixture".into(),
+            is_on_screen: true,
+            z_index: None,
+            x: 0,
+            y: 0,
+            width: 800,
+            height: 600,
+        }
+    }
+
+    #[test]
+    fn a_window_id_names_only_the_window_it_was_returned_for() {
+        // Unique to this test: the record is process-wide.
+        const ADDRESS: u64 = 0x7e57_0000_1d00;
+        let (a, b) = (0x1800_0002, 0x1800_0003);
+        let enumerated = |stable_id| {
+            let mut w = window(ADDRESS, 42);
+            w.stable_id = Some(stable_id);
+            Identities::of(&[w])
+        };
+        enumerated(a).hand_out([&listed(ADDRESS)]);
+        assert_eq!(confirm_identity(ADDRESS, Some(a)), Ok(Some(a)));
+        // A closed, and B mapped at its address.
+        assert_eq!(confirm_identity(ADDRESS, None), Ok(Some(a)));
+        assert_eq!(confirm_identity(ADDRESS, Some(b)), Err(WindowReplaced));
+        assert_eq!(enumerated(b).confirm(ADDRESS), Err(WindowReplaced));
+        // Listing B hands its id out again.
+        enumerated(b).hand_out([&listed(ADDRESS)]);
+        assert_eq!(confirm_identity(ADDRESS, Some(b)), Ok(Some(b)));
+        assert_eq!(confirm_identity(ADDRESS, Some(a)), Err(WindowReplaced));
+    }
+
+    #[test]
+    fn without_the_signature_the_live_instance_on_wayland_display_is_used() {
+        let runtime = tempfile::tempdir().unwrap();
+        let instance = |signature: &str, lock: String| {
+            let dir = runtime.path().join("hypr").join(signature);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("hyprland.lock"), lock).unwrap();
+        };
+        let live = std::process::id();
+        let display = runtime.path().join("wayland-1");
+        // No pid gets this high, so the crashed instance is dead.
+        instance("crashed", format!("{}\nwayland-1\n", u32::MAX));
+        instance("other", format!("{live}\nwayland-2\n"));
+        instance("truncated", format!("{live}\n"));
+        assert_eq!(signature_for_socket(runtime.path(), &display), None);
+        instance("current", format!("{live}\nwayland-1\n"));
+        assert_eq!(
+            signature_for_socket(runtime.path(), &display).as_deref(),
+            Some("current")
+        );
+        instance("twin", format!("{live}\nwayland-1\n"));
+        assert_eq!(signature_for_socket(runtime.path(), &display), None);
+    }
+
+    #[test]
+    fn an_address_never_returned_is_pinned_at_first_use() {
+        let mut handed = HashMap::new();
+        assert_eq!(confirm_in(&mut handed, 0x10, None), Ok(None));
+        assert!(handed.is_empty());
+        assert_eq!(confirm_in(&mut handed, 0x10, Some(7)), Ok(Some(7)));
+        assert_eq!(confirm_in(&mut handed, 0x10, Some(8)), Err(WindowReplaced));
+    }
+
+    #[test]
+    fn client_stable_id_is_hex_and_optional() {
+        let active = HashSet::from([1]);
+        let mut c = client("0x10", 42, [800, 600]);
+        c.stable_id = Some("1800074b".into());
+        let windows = windows_from_clients(vec![c, client("0x20", 42, [800, 600])], &active);
+        let ids: Vec<_> = windows.unwrap().iter().map(|w| w.stable_id).collect();
+        assert_eq!(ids, [Some(0x1800_074b), None]);
     }
 
     #[test]
@@ -1039,6 +1285,26 @@ mod tests {
         let start = Instant::now();
         assert!(read_reply(&mut client, b"j/clients", Duration::from_millis(30)).is_err());
         assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn capture_attestation_reads_the_reply_hyprland_always_writes() {
+        let (ipc, mut server) = UnixStream::pair().unwrap();
+        let (wayland, _compositor) = UnixStream::pair().unwrap();
+        // Like Hyprland: read whatever arrives, even nothing, then reply.
+        let hyprland = std::thread::spawn(move || {
+            let mut request = [0; 128];
+            let count = server.read(&mut request).unwrap();
+            let written = server.write_all(br#"{"x": 1.0,"y": 2.0}"#);
+            (
+                request[..count].to_vec(),
+                written.map_err(|error| error.kind()),
+            )
+        });
+        attest_capture_peer(ipc, wayland.as_raw_fd()).unwrap();
+        let (request, written) = hyprland.join().unwrap();
+        assert_eq!(request, b"j/cursorpos");
+        assert_eq!(written, Ok(()));
     }
 
     fn replying_ipc(bytes: Vec<u8>, delay: Duration) -> UnixStream {

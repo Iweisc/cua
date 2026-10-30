@@ -20,10 +20,11 @@
 //! level so agents read one place.
 //!
 //! Everything lives in one table ([`RULES`]) plus the unverifiable-action
-//! rules ([`effect_hint`]). [`annotate`] runs once, at the dispatch seam in
-//! `ToolRegistry`, so every platform, every tool and every nested
-//! `run_steps`/`run_script` call is covered. A producer that already set
-//! `hint` or `next_call` keeps its own value.
+//! rules ([`effect_hint`]) and the partial-action rules ([`partial_hint`]).
+//! [`annotate`] runs once, at the dispatch seam in `ToolRegistry`, so every
+//! platform, every tool and every nested `run_steps`/`run_script` call is
+//! covered. A producer that already set `hint` or `next_call` keeps its own
+//! value.
 
 use serde_json::{json, Map, Value};
 
@@ -78,6 +79,8 @@ pub struct Seed {
     target_id: Option<String>,
     tab_id: Option<String>,
     desktop_target: bool,
+    /// The platform would refuse this call with foreground delivery.
+    foreground_off: bool,
 }
 
 impl Seed {
@@ -104,7 +107,13 @@ impl Seed {
             desktop_target: target
                 .is_some_and(|t| t.get("kind").and_then(Value::as_str) == Some("desktop"))
                 || args.get("scope").and_then(Value::as_str) == Some("desktop"),
+            foreground_off: false,
         }
+    }
+
+    pub fn with_foreground_off(mut self, off: bool) -> Self {
+        self.foreground_off = off;
+        self
     }
 }
 
@@ -139,6 +148,19 @@ impl<'a> Ctx<'a> {
 
     fn reason(&self) -> Option<&str> {
         self.structured.get("reason").and_then(Value::as_str)
+    }
+
+    /// How much of a partial action landed. With an unknown delivery mode more
+    /// may have landed than was acknowledged, so there is no exact count.
+    fn delivered(&self) -> Option<u64> {
+        if let Some(chars) = self.structured.get("delivered_chars") {
+            return chars.as_u64();
+        }
+        let delivery = self.structured.get("delivery")?;
+        if delivery.get("mode").and_then(Value::as_str) == Some("unknown") {
+            return None;
+        }
+        delivery.get("delivered_count").and_then(Value::as_u64)
     }
 
     /// `detail` of a browser refusal, when there is one.
@@ -259,6 +281,8 @@ struct Rule {
 }
 
 const FOREGROUND_CONDITION: &str = "only if the user allows the window to come forward";
+const FOREGROUND_OFF: &str =
+    "Foreground delivery is off here, and the user must not be asked to move windows.";
 
 /// Every refusal code that carries a hint, with the hint. Add a row here to
 /// cover a new code; the coverage test checks each row.
@@ -271,11 +295,31 @@ static RULES: &[Rule] = &[
     Rule {
         codes: &["foreground_unavailable"],
         build: |c| {
+            if c.reason() == Some("session_unavailable") {
+                return session_unavailable();
+            }
             RecoveryHint::new(
                 "The window could not be brought forward, so nothing was sent. List the app's windows, \
                  check the window still exists, then retry or act by element instead.",
             )
             .call(c.list_windows())
+        },
+    },
+    // Hyprland with the input plugin: desktop and foreground input are off.
+    Rule {
+        codes: &["global_input_disabled"],
+        build: |c| {
+            RecoveryHint::new(
+                "This would take over the user's keyboard or mouse, so nothing was sent. Target the \
+                 window (pid, window_id) in the background, even on another workspace. If that is \
+                 refused, report the step as blocked. Never ask the user to move windows.",
+            )
+            .call(c.read_window().or_else(|| {
+                Some(NextCall {
+                    tool: "list_windows",
+                    arguments: Map::new(),
+                })
+            }))
         },
     },
     Rule {
@@ -503,18 +547,7 @@ static RULES: &[Rule] = &[
     // Typing and values.
     Rule {
         codes: &["type_text_incomplete"],
-        build: |c| {
-            let delivered = c
-                .structured
-                .get("delivered_chars")
-                .and_then(Value::as_u64)
-                .map(|n| format!("Only the first {n} characters landed. "))
-                .unwrap_or_default();
-            RecoveryHint::new(format!(
-                "{delivered}Read the field to confirm, then type only the missing rest; do not resend it all."
-            ))
-            .call(c.read_changes())
-        },
+        build: type_text_incomplete,
     },
     Rule {
         codes: &["write_not_applied", "set_value_unavailable"],
@@ -587,12 +620,27 @@ static RULES: &[Rule] = &[
         },
     },
     Rule {
-        codes: &["lane_busy", "primary_target_busy"],
+        codes: &["lane_busy"],
         build: |_| {
             RecoveryHint::new(
                 "Another action is using this window's input. Wait a moment and retry once; do not fire \
                  parallel actions at one window.",
             )
+        },
+    },
+    Rule {
+        codes: &["primary_target_busy"],
+        build: person_on_app,
+    },
+    Rule {
+        codes: &[crate::snapshot_store::PERSON_USED_WINDOW],
+        build: |c| {
+            RecoveryHint::new(
+                "The user used this window after your last read, so nothing was sent. Read it again and \
+                 continue from what it shows now: your earlier pixels, element tokens and focus no \
+                 longer apply.",
+            )
+            .call(c.read_window())
         },
     },
     Rule {
@@ -757,8 +805,12 @@ pub fn covered_codes() -> impl Iterator<Item = &'static str> {
 
 fn background_unavailable(c: &Ctx) -> RecoveryHint {
     // A refusal with a working background route leads with it, then names the
-    // foreground retry with its condition.
-    let foreground = format!("Retry with delivery_mode:\"foreground\" {FOREGROUND_CONDITION}.");
+    // foreground retry with its condition, unless that retry would be refused.
+    let foreground = if c.seed.foreground_off {
+        FOREGROUND_OFF.to_owned()
+    } else {
+        format!("Retry with delivery_mode:\"foreground\" {FOREGROUND_CONDITION}.")
+    };
     match (c.tool, c.reason()) {
         _ if c.structured.get("window").is_some() => RecoveryHint::new(
             "That desktop point is over a background app, so the action would use the user's pointer. \
@@ -786,6 +838,21 @@ fn background_unavailable(c: &Ctx) -> RecoveryHint {
             "This app's toolkit reads the real pointer, so background pixel clicks miss. Act by element \
              (get_window_state, then element_token) or invoke_menu. {foreground}"
         ))
+        .call(c.read_window()),
+        (_, Some("session_unavailable")) => session_unavailable(),
+        // Hyprland: X routes the agent's pointer by X stacking.
+        (_, Some("xwayland_target_covered")) => RecoveryHint::new(format!(
+            "An X window above this point would take the click. Keys still reach this window: use \
+             Tab, Return or shortcuts. {foreground} Otherwise report the step as blocked."
+        ))
+        .call(c.read_window()),
+        (_, Some("primary_target_busy")) => person_on_app(c),
+        // Hyprland: the person's keyboard focus is in the target's app.
+        (_, Some("primary_keyboard_busy")) => RecoveryHint::new(
+            "The user is typing in this app, so keys are refused: they could reach the user's window. \
+             Clicks, scrolls and element actions (set_value) still work. Send any remaining keys after \
+             the user leaves the app.",
+        )
         .call(c.read_window()),
         (_, Some("windowserver_connection_invalid")) => RecoveryHint::new(
             "The daemon has no valid WindowServer connection. Run the app-bundle daemon (not a bare \
@@ -821,6 +888,51 @@ fn background_unavailable(c: &Ctx) -> RecoveryHint {
              browser tools first. {foreground} Otherwise report the step as blocked."
         ))
         .call(c.read_window()),
+    }
+}
+
+/// Hyprland: the person's pointer or keyboard is on the target's app, so input
+/// routed through their own seat waits for them to leave.
+fn person_on_app(c: &Ctx) -> RecoveryHint {
+    RecoveryHint::new(
+        "The user is on this app right now, so nothing was sent. Wait a few seconds, then read the \
+         window again before retrying, since they may have changed it. Do not switch to foreground.",
+    )
+    .call(c.read_window())
+}
+
+/// Hyprland: the screen is locked or the display is off. There is no next call
+/// that moves the task until the user is back.
+fn session_unavailable() -> RecoveryHint {
+    RecoveryHint::new(
+        "The user's screen is locked or the display is off, so nothing was sent. Neither a retry \
+         nor foreground delivery helps until the user is back. Then read the window again and retry.",
+    )
+}
+
+fn type_text_incomplete(c: &Ctx) -> RecoveryHint {
+    let delivered = c
+        .delivered()
+        .map(|n| format!("Only the first {n} characters landed. "))
+        .unwrap_or_default();
+    RecoveryHint::new(format!(
+        "{delivered}Read the field to confirm, then type only the missing rest; do not resend it all."
+    ))
+    .call(c.read_changes())
+}
+
+/// The hint for an action that stopped partway. Its code may name a refusal
+/// that suggests a retry, but a retry would repeat what already landed.
+fn partial_hint(c: &Ctx) -> RecoveryHint {
+    match (c.tool, c.reason()) {
+        // That hint already says to send only the remaining keys, and when.
+        (_, Some("primary_keyboard_busy")) => background_unavailable(c),
+        ("type_text" | "type_text_chars", _) => type_text_incomplete(c),
+        _ => RecoveryHint::new(
+            "The action stopped partway, so part of it already landed. Read what changed and finish \
+             only what is missing; do not repeat it whole.",
+        )
+        .call(c.read_changes()),
     }
 }
 
@@ -991,6 +1103,9 @@ pub fn recovery_for(
 ) -> Option<RecoveryHint> {
     let ctx = Ctx::new(tool, seed, structured);
     let effect = structured.get("effect").and_then(Value::as_str);
+    if effect == Some("partial") && ACTION_TOOLS.contains(&tool) {
+        return Some(partial_hint(&ctx));
+    }
     let refused = is_error
         || effect == Some("refused")
         || structured.get("status").and_then(Value::as_str) == Some("refused");
